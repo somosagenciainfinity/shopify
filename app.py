@@ -147,7 +147,22 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
     
     # Verificar se o horário já passou
     scheduled_for = data.get("scheduled_for", datetime.now().isoformat())
-    scheduled_time = datetime.fromisoformat(scheduled_for)
+    
+    # CORREÇÃO: Tratar timezone - remover 'Z' e converter para timezone-naive
+    if scheduled_for.endswith('Z'):
+        scheduled_for_clean = scheduled_for[:-1] + '+00:00'
+    else:
+        scheduled_for_clean = scheduled_for
+    
+    try:
+        scheduled_time = datetime.fromisoformat(scheduled_for_clean)
+        # Remover timezone info para comparação com datetime.now()
+        if scheduled_time.tzinfo is not None:
+            scheduled_time = scheduled_time.replace(tzinfo=None)
+    except:
+        # Fallback para formato sem timezone
+        scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+    
     now = datetime.now()
     
     # Se já passou, executar imediatamente
@@ -504,7 +519,23 @@ async def update_task(task_id: str, data: Dict[str, Any], background_tasks: Back
     
     # IMPORTANTE: Se atualizou o scheduled_for e já passou, executar IMEDIATAMENTE
     if "scheduled_for" in data and task["status"] == "scheduled":
-        scheduled_time = datetime.fromisoformat(data["scheduled_for"])
+        scheduled_for = data["scheduled_for"]
+        
+        # CORREÇÃO: Tratar timezone
+        if scheduled_for.endswith('Z'):
+            scheduled_for_clean = scheduled_for[:-1] + '+00:00'
+        else:
+            scheduled_for_clean = scheduled_for
+        
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_for_clean)
+            # Remover timezone info para comparação
+            if scheduled_time.tzinfo is not None:
+                scheduled_time = scheduled_time.replace(tzinfo=None)
+        except:
+            # Fallback
+            scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+        
         now = datetime.now()
         
         if scheduled_time <= now:
@@ -767,7 +798,22 @@ async def check_and_execute_scheduled_tasks():
             
             for task_id, task in list(tasks_db.items()):
                 if task["status"] == "scheduled":
-                    scheduled_time = datetime.fromisoformat(task["scheduled_for"])
+                    scheduled_for = task["scheduled_for"]
+                    
+                    # CORREÇÃO: Tratar timezone
+                    if scheduled_for.endswith('Z'):
+                        scheduled_for_clean = scheduled_for[:-1] + '+00:00'
+                    else:
+                        scheduled_for_clean = scheduled_for
+                    
+                    try:
+                        scheduled_time = datetime.fromisoformat(scheduled_for_clean)
+                        # Remover timezone info para comparação
+                        if scheduled_time.tzinfo is not None:
+                            scheduled_time = scheduled_time.replace(tzinfo=None)
+                    except:
+                        # Fallback
+                        scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
                     
                     # Se já passou do horário, executar imediatamente
                     if scheduled_time <= now:
