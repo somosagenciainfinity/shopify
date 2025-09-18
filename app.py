@@ -6,7 +6,7 @@ import httpx
 import asyncio
 import json
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import uvicorn
 import logging
 
@@ -145,36 +145,46 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
     logger.info(f"📋 Recebendo agendamento: {data.get('name')}")
     logger.info(f"⏰ Para executar em: {data.get('scheduled_for')}")
     
-    # Verificar se o horário já passou
     scheduled_for = data.get("scheduled_for", datetime.now().isoformat())
     
-    # CORREÇÃO: Tratar timezone - remover 'Z' e converter para timezone-naive
+    # CORREÇÃO DE TIMEZONE - Assumir que o horário vem em UTC se tiver 'Z'
     if scheduled_for.endswith('Z'):
-        scheduled_for_clean = scheduled_for[:-1] + '+00:00'
+        # Remove o 'Z' e adiciona timezone UTC
+        scheduled_for_clean = scheduled_for[:-1]
+        scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+        # Converter para horário local do servidor
+        scheduled_time_local = scheduled_time.astimezone()
+        # Remover timezone para comparação
+        scheduled_time_naive = scheduled_time_local.replace(tzinfo=None)
     else:
-        scheduled_for_clean = scheduled_for
-    
-    try:
-        scheduled_time = datetime.fromisoformat(scheduled_for_clean)
-        # Remover timezone info para comparação com datetime.now()
-        if scheduled_time.tzinfo is not None:
-            scheduled_time = scheduled_time.replace(tzinfo=None)
-    except:
-        # Fallback para formato sem timezone
-        scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+        # Se não tem 'Z', assumir que é horário local
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_for)
+            if scheduled_time.tzinfo is not None:
+                scheduled_time_naive = scheduled_time.replace(tzinfo=None)
+            else:
+                scheduled_time_naive = scheduled_time
+        except:
+            scheduled_time_naive = datetime.fromisoformat(scheduled_for.replace('Z', ''))
     
     now = datetime.now()
     
+    # LOG do horário convertido
+    logger.info(f"📅 Horário original: {scheduled_for}")
+    logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
+    logger.info(f"📅 Horário atual do servidor: {now}")
+    
     # Se já passou, executar imediatamente
-    if scheduled_time <= now:
+    if scheduled_time_naive <= now:
         logger.info(f"📅 Tarefa {task_id} agendada para horário passado, executando imediatamente!")
         
         task = {
             "id": task_id,
             "name": data.get("name", "Tarefa Agendada"),
             "task_type": data.get("task_type", "bulk_edit"),
-            "status": "processing",  # Já inicia processando
+            "status": "processing",
             "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),  # Adicionar horário local
             "started_at": now.isoformat(),
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
@@ -212,6 +222,7 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
             "task_type": data.get("task_type", "bulk_edit"),
             "status": "scheduled",
             "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),  # Adicionar horário local
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
             "config": data.get("config", {}),
@@ -227,11 +238,11 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
         }
         
         tasks_db[task_id] = task
-        logger.info(f"📅 Tarefa {task_id} agendada para {scheduled_for}")
+        logger.info(f"📅 Tarefa {task_id} agendada para {scheduled_time_naive} (horário local)")
         
         # LOG ADICIONAL
-        diff = (scheduled_time - now).total_seconds()
-        logger.info(f"⏱️ Tarefa será executada em {diff:.0f} segundos")
+        diff = (scheduled_time_naive - now).total_seconds()
+        logger.info(f"⏱️ Tarefa será executada em {diff:.0f} segundos ({diff/60:.1f} minutos)")
     
     return {
         "success": True,
@@ -540,20 +551,21 @@ async def update_task(task_id: str, data: Dict[str, Any], background_tasks: Back
     if "scheduled_for" in data and task["status"] == "scheduled":
         scheduled_for = data["scheduled_for"]
         
-        # CORREÇÃO: Tratar timezone
+        # CORREÇÃO DE TIMEZONE
         if scheduled_for.endswith('Z'):
-            scheduled_for_clean = scheduled_for[:-1] + '+00:00'
+            scheduled_for_clean = scheduled_for[:-1]
+            scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+            scheduled_time = scheduled_time.astimezone().replace(tzinfo=None)
         else:
-            scheduled_for_clean = scheduled_for
+            try:
+                scheduled_time = datetime.fromisoformat(scheduled_for)
+                if scheduled_time.tzinfo is not None:
+                    scheduled_time = scheduled_time.replace(tzinfo=None)
+            except:
+                scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
         
-        try:
-            scheduled_time = datetime.fromisoformat(scheduled_for_clean)
-            # Remover timezone info para comparação
-            if scheduled_time.tzinfo is not None:
-                scheduled_time = scheduled_time.replace(tzinfo=None)
-        except:
-            # Fallback
-            scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+        # Também atualizar o scheduled_for_local
+        task["scheduled_for_local"] = scheduled_time.isoformat()
         
         now = datetime.now()
         
@@ -840,26 +852,27 @@ async def check_and_execute_scheduled_tasks():
             
             for task_id, task in list(tasks_db.items()):
                 if task["status"] == "scheduled":
-                    scheduled_for = task["scheduled_for"]
+                    # Usar scheduled_for_local se disponível, senão usar scheduled_for
+                    scheduled_for = task.get("scheduled_for_local") or task["scheduled_for"]
                     
-                    # CORREÇÃO: Tratar timezone
+                    # Processar o horário
                     if scheduled_for.endswith('Z'):
-                        scheduled_for_clean = scheduled_for[:-1] + '+00:00'
+                        scheduled_for_clean = scheduled_for[:-1]
+                        scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+                        scheduled_time = scheduled_time.astimezone().replace(tzinfo=None)
                     else:
-                        scheduled_for_clean = scheduled_for
+                        try:
+                            scheduled_time = datetime.fromisoformat(scheduled_for)
+                            if scheduled_time.tzinfo is not None:
+                                scheduled_time = scheduled_time.replace(tzinfo=None)
+                        except:
+                            scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
                     
-                    try:
-                        scheduled_time = datetime.fromisoformat(scheduled_for_clean)
-                        # Remover timezone info para comparação
-                        if scheduled_time.tzinfo is not None:
-                            scheduled_time = scheduled_time.replace(tzinfo=None)
-                    except:
-                        # Fallback
-                        scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
-                    
-                    # Se já passou do horário, executar imediatamente
+                    # Se já passou do horário, executar
                     if scheduled_time <= now:
                         logger.info(f"⏰ Executando tarefa agendada {task_id}")
+                        logger.info(f"   Agendada para: {scheduled_time}")
+                        logger.info(f"   Horário atual: {now}")
                         
                         # Mudar status e processar
                         task["status"] = "processing"
