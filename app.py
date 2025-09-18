@@ -137,32 +137,86 @@ async def process_task(task: TaskRequest, background_tasks: BackgroundTasks):
 # ==================== AGENDAMENTO DE TAREFAS ====================
 
 @app.post("/api/tasks/schedule")
-async def schedule_task(data: Dict[str, Any]):
+async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks):
     """Criar nova tarefa agendada"""
     task_id = data.get("id") or f"task_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
     
-    task = {
-        "id": task_id,
-        "name": data.get("name", "Tarefa Agendada"),
-        "task_type": data.get("task_type", "bulk_edit"),
-        "status": "scheduled",
-        "scheduled_for": data.get("scheduled_for", datetime.now().isoformat()),
-        "priority": data.get("priority", "medium"),
-        "description": data.get("description", ""),
-        "config": data.get("config", {}),
-        "created_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat(),
-        "progress": {
-            "processed": 0,
-            "total": data.get("config", {}).get("itemCount", 0),
-            "successful": 0,
-            "failed": 0,
-            "percentage": 0
-        }
-    }
+    # LOG PARA DEBUG
+    logger.info(f"📋 Recebendo agendamento: {data.get('name')}")
+    logger.info(f"⏰ Para executar em: {data.get('scheduled_for')}")
     
-    tasks_db[task_id] = task
-    logger.info(f"📅 Tarefa {task_id} agendada para {task['scheduled_for']}")
+    # Verificar se o horário já passou
+    scheduled_for = data.get("scheduled_for", datetime.now().isoformat())
+    scheduled_time = datetime.fromisoformat(scheduled_for)
+    now = datetime.now()
+    
+    # Se já passou, executar imediatamente
+    if scheduled_time <= now:
+        logger.info(f"📅 Tarefa {task_id} agendada para horário passado, executando imediatamente!")
+        
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Tarefa Agendada"),
+            "task_type": data.get("task_type", "bulk_edit"),
+            "status": "processing",  # Já inicia processando
+            "scheduled_for": scheduled_for,
+            "started_at": now.isoformat(),
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": data.get("config", {}),
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0
+            }
+        }
+        
+        tasks_db[task_id] = task
+        
+        # Processar imediatamente
+        config = task.get("config", {})
+        background_tasks.add_task(
+            process_products_background,
+            task_id,
+            config.get("productIds", []),
+            config.get("operations", []),
+            config.get("storeName", ""),
+            config.get("accessToken", "")
+        )
+        
+        logger.info(f"▶️ Tarefa {task_id} iniciada imediatamente")
+    else:
+        # Agendar normalmente
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Tarefa Agendada"),
+            "task_type": data.get("task_type", "bulk_edit"),
+            "status": "scheduled",
+            "scheduled_for": scheduled_for,
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": data.get("config", {}),
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0
+            }
+        }
+        
+        tasks_db[task_id] = task
+        logger.info(f"📅 Tarefa {task_id} agendada para {scheduled_for}")
+        
+        # LOG ADICIONAL
+        diff = (scheduled_time - now).total_seconds()
+        logger.info(f"⏱️ Tarefa será executada em {diff:.0f} segundos")
     
     return {
         "success": True,
@@ -424,13 +478,21 @@ async def get_task_status(task_id: str):
     return task
 
 @app.put("/api/tasks/update/{task_id}")
-async def update_task(task_id: str, data: Dict[str, Any]):
+async def update_task(task_id: str, data: Dict[str, Any], background_tasks: BackgroundTasks):
     """Atualizar qualquer tarefa"""
     
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
     
     task = tasks_db[task_id]
+    
+    # LOG PARA DEBUG
+    if "scheduled_for" in data:
+        old_time = task.get("scheduled_for")
+        new_time = data["scheduled_for"]
+        logger.info(f"📅 Mudando horário da tarefa {task_id}")
+        logger.info(f"   De: {old_time}")
+        logger.info(f"   Para: {new_time}")
     
     # Atualizar campos permitidos
     updatable_fields = ["name", "scheduled_for", "priority", "description", "status"]
@@ -440,7 +502,33 @@ async def update_task(task_id: str, data: Dict[str, Any]):
     
     task["updated_at"] = datetime.now().isoformat()
     
-    logger.info(f"📝 Tarefa {task_id} atualizada")
+    # IMPORTANTE: Se atualizou o scheduled_for e já passou, executar IMEDIATAMENTE
+    if "scheduled_for" in data and task["status"] == "scheduled":
+        scheduled_time = datetime.fromisoformat(data["scheduled_for"])
+        now = datetime.now()
+        
+        if scheduled_time <= now:
+            logger.info(f"📝 Tarefa {task_id} atualizada para horário passado, executando imediatamente!")
+            
+            # Mudar status e processar
+            task["status"] = "processing"
+            task["started_at"] = now.isoformat()
+            
+            config = task.get("config", {})
+            
+            # Processar em background
+            background_tasks.add_task(
+                process_products_background,
+                task_id,
+                config.get("productIds", []),
+                config.get("operations", []),
+                config.get("storeName", ""),
+                config.get("accessToken", "")
+            )
+            
+            logger.info(f"▶️ Tarefa {task_id} iniciada após edição")
+    else:
+        logger.info(f"📝 Tarefa {task_id} atualizada")
     
     return {
         "success": True,
@@ -681,6 +769,7 @@ async def check_and_execute_scheduled_tasks():
                 if task["status"] == "scheduled":
                     scheduled_time = datetime.fromisoformat(task["scheduled_for"])
                     
+                    # Se já passou do horário, executar imediatamente
                     if scheduled_time <= now:
                         logger.info(f"⏰ Executando tarefa agendada {task_id}")
                         
@@ -702,12 +791,12 @@ async def check_and_execute_scheduled_tasks():
                             )
                         )
             
-            # Verificar a cada minuto
-            await asyncio.sleep(60)
+            # Verificar a cada 20 segundos
+            await asyncio.sleep(20)
             
         except Exception as e:
             logger.error(f"Erro no verificador de tarefas: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(20)
 
 # Iniciar verificador de tarefas agendadas quando o servidor iniciar
 @app.on_event("startup")
