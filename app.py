@@ -183,9 +183,11 @@ async def process_variants_csv(data: Dict[str, Any], background_tasks: Backgroun
         "started_at": get_brazil_time_str(),
         "updated_at": get_brazil_time_str(),
         "config": {
+            "csvContent": csv_content,
             "productIds": product_ids,
             "submitData": submit_data,
             "storeName": store_name,
+            "accessToken": access_token,
             "hasCSV": True
         },
         "results": []
@@ -217,22 +219,36 @@ async def process_variants_background(
     product_ids: List[str],
     submit_data: Dict,
     store_name: str,
-    access_token: str
+    access_token: str,
+    is_resume: bool = False
 ):
     """Processar variantes em background usando CSV"""
     
-    logger.info(f"🚀 INICIANDO PROCESSAMENTO DE VARIANTES: {task_id}")
+    if not is_resume:
+        logger.info(f"🚀 INICIANDO PROCESSAMENTO DE VARIANTES: {task_id}")
+    else:
+        logger.info(f"▶️ RETOMANDO PROCESSAMENTO DE VARIANTES: {task_id}")
+    
     logger.info(f"📦 Produtos para processar: {len(product_ids)}")
     
     # Limpar nome da loja
     clean_store = store_name.replace('.myshopify.com', '').strip()
     api_version = '2024-04'
     
-    processed = 0
-    successful = 0
-    failed = 0
-    results = []
-    total = len(product_ids)
+    # Se for retomada, pegar progresso existente
+    if is_resume and task_id in tasks_db:
+        task = tasks_db[task_id]
+        processed = task["progress"]["processed"]
+        successful = task["progress"]["successful"]
+        failed = task["progress"]["failed"]
+        results = task.get("results", [])
+        total = task["progress"]["total"]
+    else:
+        processed = 0
+        successful = 0
+        failed = 0
+        results = []
+        total = len(product_ids)
     
     try:
         # Para cada produto, aplicar as mudanças via API
@@ -268,12 +284,12 @@ async def process_variants_background(
                     product_data = get_response.json()
                     current_product = product_data.get("product", {})
                     
-                    # 🔴 MUDANÇA: PEGAR O TÍTULO DO PRODUTO
+                    # PEGAR O TÍTULO DO PRODUTO
                     product_title = current_product.get("title", f"Produto {product_id}")
                     
-                    # 🔴 MUDANÇA: ATUALIZAR PROGRESSO COM TÍTULO
+                    # ATUALIZAR PROGRESSO COM TÍTULO - MANTÉM SEMPRE PREENCHIDO
                     if task_id in tasks_db:
-                        tasks_db[task_id]["progress"]["current_product"] = product_title  # USANDO TÍTULO
+                        tasks_db[task_id]["progress"]["current_product"] = product_title
                         tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                     
                     # Preparar payload de atualização baseado no submitData
@@ -286,12 +302,12 @@ async def process_variants_background(
                     # Aplicar mudanças de título de opções
                     if submit_data.get("titleChanges"):
                         options = []
-                        for i, option in enumerate(current_product.get("options", [])):
+                        for idx, option in enumerate(current_product.get("options", [])):
                             new_name = submit_data["titleChanges"].get(option["name"], option["name"])
                             options.append({
                                 "id": option.get("id"),
                                 "name": new_name,
-                                "position": option.get("position", i + 1),
+                                "position": option.get("position", idx + 1),
                                 "values": option.get("values", [])
                             })
                         update_payload["product"]["options"] = options
@@ -331,7 +347,6 @@ async def process_variants_background(
                         # Adicionar novas variantes se houver
                         if submit_data.get("newValues"):
                             # Lógica para criar novas variantes baseada nos novos valores
-                            # Isso seria mais complexo e dependeria da estrutura exata
                             pass
                         
                         update_payload["product"]["variants"] = variants
@@ -347,21 +362,21 @@ async def process_variants_background(
                         successful += 1
                         result = {
                             "product_id": product_id,
-                            "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO NO RESULTADO
+                            "product_title": product_title,
                             "status": "success",
                             "message": "Variantes atualizadas com sucesso"
                         }
-                        logger.info(f"✅ Produto '{product_title}' atualizado")  # 🔴 MUDANÇA: LOG COM TÍTULO
+                        logger.info(f"✅ Produto '{product_title}' atualizado")
                     else:
                         failed += 1
                         error_text = await update_response.text()
                         result = {
                             "product_id": product_id,
-                            "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO NO RESULTADO
+                            "product_title": product_title,
                             "status": "failed",
                             "message": f"Erro: {error_text}"
                         }
-                        logger.error(f"❌ Erro no produto '{product_title}'")  # 🔴 MUDANÇA: LOG COM TÍTULO
+                        logger.error(f"❌ Erro no produto '{product_title}'")
                 
             except Exception as e:
                 failed += 1
@@ -377,7 +392,7 @@ async def process_variants_background(
             processed += 1
             percentage = round((processed / total) * 100)
             
-            # Salvar na memória
+            # IMPORTANTE: NÃO LIMPAR current_product AQUI - MANTÉM ATÉ O PRÓXIMO
             if task_id in tasks_db:
                 tasks_db[task_id]["progress"] = {
                     "processed": processed,
@@ -385,7 +400,7 @@ async def process_variants_background(
                     "successful": successful,
                     "failed": failed,
                     "percentage": percentage,
-                    "current_product": None if i == len(product_ids)-1 else None  # 🔴 MUDANÇA: Limpar ao final
+                    "current_product": product_title if i < len(product_ids)-1 else None  # SÓ LIMPA NO FINAL
                 }
                 tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 tasks_db[task_id]["results"] = results[-50:]
@@ -409,7 +424,7 @@ async def process_variants_background(
         tasks_db[task_id]["status"] = final_status
         tasks_db[task_id]["completed_at"] = get_brazil_time_str()
         tasks_db[task_id]["results"] = results
-        tasks_db[task_id]["progress"]["current_product"] = None
+        tasks_db[task_id]["progress"]["current_product"] = None  # LIMPAR APENAS NO FINAL
         
         logger.info(f"🏁 PROCESSAMENTO DE VARIANTES FINALIZADO: ✅ {successful} | ❌ {failed}")
 
@@ -447,12 +462,12 @@ async def process_single_product_variants(
             product_data = get_response.json()
             current_product = product_data.get("product", {})
             
-            # 🔴 MUDANÇA: PEGAR O TÍTULO DO PRODUTO
+            # PEGAR O TÍTULO DO PRODUTO
             product_title = current_product.get("title", f"Produto {product_id}")
             
-            # 🔴 MUDANÇA: ATUALIZAR STATUS DA TAREFA COM TÍTULO
+            # ATUALIZAR STATUS DA TAREFA COM TÍTULO
             if task_id in tasks_db:
-                tasks_db[task_id]["progress"]["current_product"] = product_title  # USANDO TÍTULO
+                tasks_db[task_id]["progress"]["current_product"] = product_title
                 tasks_db[task_id]["updated_at"] = get_brazil_time_str()
             
             # Preparar payload de atualização
@@ -533,7 +548,7 @@ async def process_single_product_variants(
                     tasks_db[task_id]["progress"]["processed"] = 1
                     tasks_db[task_id]["progress"]["successful"] = 1
                     tasks_db[task_id]["progress"]["percentage"] = 100
-                logger.info(f"✅ Produto '{product_title}' atualizado com sucesso")  # 🔴 MUDANÇA: LOG COM TÍTULO
+                logger.info(f"✅ Produto '{product_title}' atualizado com sucesso")
             else:
                 error_text = await update_response.text()
                 if task_id in tasks_db:
@@ -542,7 +557,7 @@ async def process_single_product_variants(
                     tasks_db[task_id]["completed_at"] = get_brazil_time_str()
                     tasks_db[task_id]["progress"]["processed"] = 1
                     tasks_db[task_id]["progress"]["failed"] = 1
-                logger.error(f"❌ Erro ao atualizar produto '{product_title}': {error_text}")  # 🔴 MUDANÇA: LOG COM TÍTULO
+                logger.error(f"❌ Erro ao atualizar produto '{product_title}': {error_text}")
     
     except Exception as e:
         logger.error(f"❌ Exceção no processamento de variantes: {str(e)}")
@@ -877,7 +892,7 @@ async def pause_task(task_id: str):
 
 @app.post("/api/tasks/resume/{task_id}")
 async def resume_task(task_id: str, background_tasks: BackgroundTasks):
-    """Retomar uma tarefa pausada - VERSÃO MELHORADA"""
+    """Retomar uma tarefa pausada - VERSÃO MELHORADA COM SUPORTE A VARIANTES"""
     
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
@@ -896,49 +911,91 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
     task["resumed_at"] = get_brazil_time_str()
     task["updated_at"] = get_brazil_time_str()
     
-    # Continuar de onde parou
+    # Verificar o tipo de tarefa
+    task_type = task.get("task_type", "bulk_edit")
     config = task.get("config", {})
-    all_product_ids = config.get("productIds", [])
     
-    # CORREÇÃO: Garantir que temos o progresso correto
-    processed_count = task.get("progress", {}).get("processed", 0)
-    remaining_products = all_product_ids[processed_count:]
+    logger.info(f"▶️ Retomando tarefa {task_id} (tipo: {task_type})")
     
-    logger.info(f"▶️ Retomando tarefa {task_id}")
-    logger.info(f"   Total de produtos: {len(all_product_ids)}")
-    logger.info(f"   Já processados: {processed_count}")
-    logger.info(f"   Restantes: {len(remaining_products)}")
-    
-    if len(remaining_products) > 0:
-        # MANTER background_tasks.add_task (MAIS SEGURO!)
-        background_tasks.add_task(
-            process_products_background,
-            task_id,
-            remaining_products,
-            config.get("operations", []),
-            config.get("storeName", ""),
-            config.get("accessToken", ""),
-            is_resume=True
-        )
+    if task_type == "variant_management":
+        # RETOMAR VARIANTES
+        all_product_ids = config.get("productIds", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_products = all_product_ids[processed_count:]
         
-        logger.info(f"✅ Tarefa {task_id} retomada com {len(remaining_products)} produtos")
+        logger.info(f"   Total de produtos: {len(all_product_ids)}")
+        logger.info(f"   Já processados: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_products)}")
         
-        return {
-            "success": True,
-            "message": f"Tarefa retomada com sucesso",
-            "task": task,
-            "remaining": len(remaining_products)
-        }
+        if len(remaining_products) > 0:
+            # Processar variantes restantes
+            background_tasks.add_task(
+                process_variants_background,
+                task_id,
+                config.get("csvContent", ""),
+                remaining_products,  # Apenas produtos restantes
+                config.get("submitData", {}),
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True  # Adicionar flag de retomada
+            )
+            
+            logger.info(f"✅ Tarefa de variantes {task_id} retomada com {len(remaining_products)} produtos")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de variantes retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_products)
+            }
+        else:
+            # Se não há produtos restantes, marcar como completa
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
     else:
-        # Se não há produtos restantes, marcar como completa
-        task["status"] = "completed"
-        task["completed_at"] = get_brazil_time_str()
+        # RETOMAR BULK EDIT NORMAL
+        all_product_ids = config.get("productIds", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_products = all_product_ids[processed_count:]
         
-        return {
-            "success": True,
-            "message": "Tarefa já estava completa",
-            "task": task
-        }
+        logger.info(f"   Total de produtos: {len(all_product_ids)}")
+        logger.info(f"   Já processados: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_products)}")
+        
+        if len(remaining_products) > 0:
+            background_tasks.add_task(
+                process_products_background,
+                task_id,
+                remaining_products,
+                config.get("operations", []),
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True
+            )
+            
+            logger.info(f"✅ Tarefa {task_id} retomada com {len(remaining_products)} produtos")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_products)
+            }
+        else:
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
 
 # ==================== CANCELAR TAREFAS ====================
 
@@ -1259,12 +1316,12 @@ async def process_products_background(
                 product_data = get_response.json()
                 current_product = product_data.get("product", {})
                 
-                # 🔴 MUDANÇA: PEGAR O TÍTULO DO PRODUTO
+                # PEGAR O TÍTULO DO PRODUTO
                 product_title = current_product.get("title", "Sem título")
                 
-                # 🔴 MUDANÇA: ATUALIZAR PROGRESSO COM TÍTULO ANTES DE PROCESSAR
+                # ATUALIZAR PROGRESSO COM TÍTULO ANTES DE PROCESSAR
                 if task_id in tasks_db:
-                    tasks_db[task_id]["progress"]["current_product"] = product_title  # USANDO TÍTULO
+                    tasks_db[task_id]["progress"]["current_product"] = product_title
                     tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 
                 # Preparar atualização
@@ -1336,21 +1393,21 @@ async def process_products_background(
                     successful += 1
                     result = {
                         "product_id": product_id,
-                        "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO
+                        "product_title": product_title,
                         "status": "success",
                         "message": "Produto atualizado com sucesso"
                     }
-                    logger.info(f"✅ Produto '{product_title}' atualizado")  # 🔴 MUDANÇA: LOG COM TÍTULO
+                    logger.info(f"✅ Produto '{product_title}' atualizado")
                 else:
                     failed += 1
                     error_text = await update_response.text()
                     result = {
                         "product_id": product_id,
-                        "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO
+                        "product_title": product_title,
                         "status": "failed",
                         "message": f"Erro HTTP {update_response.status_code}: {error_text}"
                     }
-                    logger.error(f"❌ Erro no produto '{product_title}': {error_text}")  # 🔴 MUDANÇA: LOG COM TÍTULO
+                    logger.error(f"❌ Erro no produto '{product_title}': {error_text}")
                     
             except Exception as e:
                 failed += 1
@@ -1366,7 +1423,7 @@ async def process_products_background(
             processed += 1
             percentage = round((processed / total) * 100)
             
-            # Salvar na memória
+            # IMPORTANTE: MANTER current_product PREENCHIDO ATÉ O PRÓXIMO
             if task_id in tasks_db:
                 tasks_db[task_id]["progress"] = {
                     "processed": processed,
@@ -1374,7 +1431,7 @@ async def process_products_background(
                     "successful": successful,
                     "failed": failed,
                     "percentage": percentage,
-                    "current_product": None if i == len(product_ids)-1 else None  # 🔴 MUDANÇA: Limpar ao final
+                    "current_product": product_title if i < len(product_ids)-1 else None  # SÓ LIMPA NO FINAL
                 }
                 tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 tasks_db[task_id]["results"] = results[-50:]
