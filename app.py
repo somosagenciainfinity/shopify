@@ -342,25 +342,45 @@ async def process_variants_background(
                                             if "newName" in change:
                                                 updated_variant[option_field] = change["newName"]
                                             
+                            # CORREÇÃO: Aplicar mudanças de valores e preços corretamente
+                            if submit_data.get("valueChanges"):
+                                for option_name, changes in submit_data["valueChanges"].items():
+                                    # Verificar cada campo de opção da variante
+                                    for option_field in ["option1", "option2", "option3"]:
+                                        current_option_value = variant.get(option_field)
+                                        
+                                        if current_option_value and current_option_value in changes:
+                                            change = changes[current_option_value]
+                                            
+                                            # Atualizar nome do valor se mudou
+                                            if "newName" in change:
+                                                updated_variant[option_field] = change["newName"]
+                                            
                                             # CORREÇÃO PRINCIPAL: Calcular preço corretamente
                                             if "extraPrice" in change:
-    current_price = float(variant.get("price", 0))
-    original_extra = float(change.get("originalExtraPrice", 0))
-    new_extra = float(change["extraPrice"])
-    
-    # Calcular preço base (removendo o preço extra anterior)
-    base_price = current_price - original_extra
-    
-    # Aplicar o novo preço extra
-    new_price = base_price + new_extra
-    updated_variant["price"] = str(new_price)
-    
-    # Atualizar compare_at_price se existir
-    if variant.get("compare_at_price"):
-        compare_price = float(variant["compare_at_price"])
-        base_compare = compare_price - original_extra
-        new_compare = base_compare + new_extra
-        updated_variant["compare_at_price"] = str(new_compare)
+                                                new_extra = float(change["extraPrice"])
+                                                
+                                                # Se temos o basePrice, usar ele diretamente ✅ MODIFICADO
+                                                if "basePrice" in change:
+                                                    base_price = float(change["basePrice"])
+                                                    new_price = base_price + new_extra
+                                                else:
+                                                    # Fallback para o método antigo
+                                                    current_price = float(variant.get("price", 0))
+                                                    original_extra = float(change.get("originalExtraPrice", 0))
+                                                    base_price = current_price - original_extra
+                                                    new_price = base_price + new_extra
+                                                
+                                                updated_variant["price"] = str(new_price)
+                                                
+                                                # Atualizar compare_at_price se existir
+                                                if variant.get("compare_at_price"):
+                                                    # ✅ CORREÇÃO: Calcular compare_at_price INDEPENDENTEMENTE
+                                                    compare_price = float(variant["compare_at_price"])
+                                                    original_extra = float(change.get("originalExtraPrice", 0))
+                                                    base_compare = compare_price - original_extra
+                                                    new_compare = base_compare + new_extra
+                                                    updated_variant["compare_at_price"] = str(new_compare)
                             
                             variants.append(updated_variant)
                         
