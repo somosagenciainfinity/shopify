@@ -251,11 +251,6 @@ async def process_variants_background(
             try:
                 logger.info(f"📦 Processando variantes do produto {product_id} ({i+1}/{len(product_ids)})")
                 
-                # Atualizar progresso
-                if task_id in tasks_db:
-                    tasks_db[task_id]["progress"]["current_product"] = f"Produto {product_id}"
-                    tasks_db[task_id]["updated_at"] = get_brazil_time_str()
-                
                 # URL da API
                 product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
                 headers = {
@@ -272,6 +267,14 @@ async def process_variants_background(
                     
                     product_data = get_response.json()
                     current_product = product_data.get("product", {})
+                    
+                    # 🔴 MUDANÇA: PEGAR O TÍTULO DO PRODUTO
+                    product_title = current_product.get("title", f"Produto {product_id}")
+                    
+                    # 🔴 MUDANÇA: ATUALIZAR PROGRESSO COM TÍTULO
+                    if task_id in tasks_db:
+                        tasks_db[task_id]["progress"]["current_product"] = product_title  # USANDO TÍTULO
+                        tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                     
                     # Preparar payload de atualização baseado no submitData
                     update_payload = {
@@ -344,19 +347,21 @@ async def process_variants_background(
                         successful += 1
                         result = {
                             "product_id": product_id,
+                            "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO NO RESULTADO
                             "status": "success",
                             "message": "Variantes atualizadas com sucesso"
                         }
-                        logger.info(f"✅ Produto {product_id} atualizado")
+                        logger.info(f"✅ Produto '{product_title}' atualizado")  # 🔴 MUDANÇA: LOG COM TÍTULO
                     else:
                         failed += 1
                         error_text = await update_response.text()
                         result = {
                             "product_id": product_id,
+                            "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO NO RESULTADO
                             "status": "failed",
                             "message": f"Erro: {error_text}"
                         }
-                        logger.error(f"❌ Erro no produto {product_id}")
+                        logger.error(f"❌ Erro no produto '{product_title}'")  # 🔴 MUDANÇA: LOG COM TÍTULO
                 
             except Exception as e:
                 failed += 1
@@ -380,7 +385,7 @@ async def process_variants_background(
                     "successful": successful,
                     "failed": failed,
                     "percentage": percentage,
-                    "current_product": None if i == len(product_ids)-1 else f"Produto {product_id}"
+                    "current_product": None if i == len(product_ids)-1 else None  # 🔴 MUDANÇA: Limpar ao final
                 }
                 tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 tasks_db[task_id]["results"] = results[-50:]
@@ -425,11 +430,6 @@ async def process_single_product_variants(
     api_version = '2024-04'
     
     try:
-        # Atualizar status da tarefa
-        if task_id in tasks_db:
-            tasks_db[task_id]["progress"]["current_product"] = f"Produto {product_id}"
-            tasks_db[task_id]["updated_at"] = get_brazil_time_str()
-        
         # URL da API
         product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
         headers = {
@@ -446,6 +446,14 @@ async def process_single_product_variants(
             
             product_data = get_response.json()
             current_product = product_data.get("product", {})
+            
+            # 🔴 MUDANÇA: PEGAR O TÍTULO DO PRODUTO
+            product_title = current_product.get("title", f"Produto {product_id}")
+            
+            # 🔴 MUDANÇA: ATUALIZAR STATUS DA TAREFA COM TÍTULO
+            if task_id in tasks_db:
+                tasks_db[task_id]["progress"]["current_product"] = product_title  # USANDO TÍTULO
+                tasks_db[task_id]["updated_at"] = get_brazil_time_str()
             
             # Preparar payload de atualização
             update_payload = {
@@ -525,7 +533,7 @@ async def process_single_product_variants(
                     tasks_db[task_id]["progress"]["processed"] = 1
                     tasks_db[task_id]["progress"]["successful"] = 1
                     tasks_db[task_id]["progress"]["percentage"] = 100
-                logger.info(f"✅ Produto {product_id} atualizado com sucesso")
+                logger.info(f"✅ Produto '{product_title}' atualizado com sucesso")  # 🔴 MUDANÇA: LOG COM TÍTULO
             else:
                 error_text = await update_response.text()
                 if task_id in tasks_db:
@@ -534,7 +542,7 @@ async def process_single_product_variants(
                     tasks_db[task_id]["completed_at"] = get_brazil_time_str()
                     tasks_db[task_id]["progress"]["processed"] = 1
                     tasks_db[task_id]["progress"]["failed"] = 1
-                logger.error(f"❌ Erro ao atualizar produto: {error_text}")
+                logger.error(f"❌ Erro ao atualizar produto '{product_title}': {error_text}")  # 🔴 MUDANÇA: LOG COM TÍTULO
     
     except Exception as e:
         logger.error(f"❌ Exceção no processamento de variantes: {str(e)}")
@@ -1235,11 +1243,6 @@ async def process_products_background(
             try:
                 logger.info(f"📦 Processando produto {product_id} ({i+1}/{len(product_ids)})")
                 
-                # ATUALIZAR PROGRESSO ANTES DE PROCESSAR
-                if task_id in tasks_db:
-                    tasks_db[task_id]["progress"]["current_product"] = f"Produto {product_id}"
-                    tasks_db[task_id]["updated_at"] = get_brazil_time_str()
-                
                 # URL da API
                 product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
                 headers = {
@@ -1255,7 +1258,14 @@ async def process_products_background(
                 
                 product_data = get_response.json()
                 current_product = product_data.get("product", {})
+                
+                # 🔴 MUDANÇA: PEGAR O TÍTULO DO PRODUTO
                 product_title = current_product.get("title", "Sem título")
+                
+                # 🔴 MUDANÇA: ATUALIZAR PROGRESSO COM TÍTULO ANTES DE PROCESSAR
+                if task_id in tasks_db:
+                    tasks_db[task_id]["progress"]["current_product"] = product_title  # USANDO TÍTULO
+                    tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 
                 # Preparar atualização
                 update_payload = {"product": {"id": int(product_id)}}
@@ -1326,21 +1336,21 @@ async def process_products_background(
                     successful += 1
                     result = {
                         "product_id": product_id,
-                        "product_title": product_title,
+                        "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO
                         "status": "success",
                         "message": "Produto atualizado com sucesso"
                     }
-                    logger.info(f"✅ Produto {product_id} atualizado")
+                    logger.info(f"✅ Produto '{product_title}' atualizado")  # 🔴 MUDANÇA: LOG COM TÍTULO
                 else:
                     failed += 1
                     error_text = await update_response.text()
                     result = {
                         "product_id": product_id,
-                        "product_title": product_title,
+                        "product_title": product_title,  # 🔴 MUDANÇA: INCLUIR TÍTULO
                         "status": "failed",
                         "message": f"Erro HTTP {update_response.status_code}: {error_text}"
                     }
-                    logger.error(f"❌ Erro no produto {product_id}: {error_text}")
+                    logger.error(f"❌ Erro no produto '{product_title}': {error_text}")  # 🔴 MUDANÇA: LOG COM TÍTULO
                     
             except Exception as e:
                 failed += 1
@@ -1364,7 +1374,7 @@ async def process_products_background(
                     "successful": successful,
                     "failed": failed,
                     "percentage": percentage,
-                    "current_product": None if i == len(product_ids)-1 else product_title
+                    "current_product": None if i == len(product_ids)-1 else None  # 🔴 MUDANÇA: Limpar ao final
                 }
                 tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 tasks_db[task_id]["results"] = results[-50:]
