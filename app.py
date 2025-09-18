@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Any
 import httpx
 import asyncio
 import json
+import secrets
 from datetime import datetime
 import uvicorn
 import logging
@@ -13,7 +14,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Shopify Task Processor", version="2.0.0")
+app = FastAPI(title="Shopify Task Processor", version="3.0.0")
 
 # CORS - IMPORTANTE!
 app.add_middleware(
@@ -27,7 +28,7 @@ app.add_middleware(
 # Armazenar tarefas em memória
 tasks_db = {}
 
-# Modelo de dados
+# ==================== MODELOS DE DADOS ====================
 class TaskRequest(BaseModel):
     id: str
     productIds: List[str]
@@ -38,23 +39,53 @@ class TaskRequest(BaseModel):
     config: Optional[Dict[str, Any]] = {}
     workerUrl: Optional[str] = None
 
+# ==================== ENDPOINTS PRINCIPAIS ====================
+
 @app.get("/")
 async def root():
     """Health check endpoint"""
     return {
-        "message": "🚀 Railway API - Processando tarefas!",
+        "message": "🚀 Railway API - Gerenciamento Completo de Tarefas!",
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "tasks_in_memory": len(tasks_db),
-        "version": "2.0.0"
+        "version": "3.0.0",
+        "features": [
+            "Processamento de tarefas",
+            "Agendamento de tarefas",
+            "Pausar/Retomar tarefas",
+            "Cancelamento de tarefas",
+            "Gerenciamento completo"
+        ]
     }
+
+@app.get("/health")
+async def health_check():
+    """Health check detalhado"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "uptime": "running",
+        "tasks": {
+            "total": len(tasks_db),
+            "scheduled": sum(1 for t in tasks_db.values() if t["status"] == "scheduled"),
+            "processing": sum(1 for t in tasks_db.values() if t["status"] in ["processing", "running"]),
+            "paused": sum(1 for t in tasks_db.values() if t["status"] == "paused"),
+            "completed": sum(1 for t in tasks_db.values() if "completed" in t["status"]),
+            "cancelled": sum(1 for t in tasks_db.values() if t["status"] == "cancelled")
+        },
+        "metrics": {
+            "total_products_processed": sum(len(t.get("results", [])) for t in tasks_db.values()),
+            "memory_usage_kb": len(str(tasks_db)) / 1024
+        }
+    }
+
+# ==================== CRIAR E PROCESSAR TAREFAS ====================
 
 @app.post("/process-task")
 async def process_task(task: TaskRequest, background_tasks: BackgroundTasks):
     """Processar tarefa em background"""
     logger.info(f"📋 Nova tarefa {task.id}: {len(task.productIds)} produtos")
-    logger.info(f"🔧 Operações: {task.operations}")
-    logger.info(f"🏪 Loja: {task.storeName}")
     
     # Validar dados
     if not task.productIds:
@@ -63,10 +94,12 @@ async def process_task(task: TaskRequest, background_tasks: BackgroundTasks):
     if not task.operations:
         raise HTTPException(status_code=400, detail="Nenhuma operação definida")
     
-    # Salvar tarefa na memória COM STATUS INICIAL
+    # Salvar tarefa na memória
     tasks_db[task.id] = {
         "id": task.id,
-        "status": "processing",  # ← IMPORTANTE: começar como processing
+        "name": f"Edição em Massa - {len(task.productIds)} produtos",
+        "status": "processing",
+        "task_type": task.taskType,
         "progress": {
             "processed": 0,
             "total": len(task.productIds),
@@ -76,11 +109,12 @@ async def process_task(task: TaskRequest, background_tasks: BackgroundTasks):
             "current_product": None
         },
         "started_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
         "config": task.dict(),
         "results": []
     }
     
-    logger.info(f"✅ Tarefa {task.id} salva na memória")
+    logger.info(f"✅ Tarefa {task.id} iniciada")
     
     # Processar em background
     background_tasks.add_task(
@@ -100,74 +134,433 @@ async def process_task(task: TaskRequest, background_tasks: BackgroundTasks):
         "mode": "background_processing"
     }
 
+# ==================== AGENDAMENTO DE TAREFAS ====================
+
+@app.post("/api/tasks/schedule")
+async def schedule_task(data: Dict[str, Any]):
+    """Criar nova tarefa agendada"""
+    task_id = data.get("id") or f"task_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    task = {
+        "id": task_id,
+        "name": data.get("name", "Tarefa Agendada"),
+        "task_type": data.get("task_type", "bulk_edit"),
+        "status": "scheduled",
+        "scheduled_for": data.get("scheduled_for", datetime.now().isoformat()),
+        "priority": data.get("priority", "medium"),
+        "description": data.get("description", ""),
+        "config": data.get("config", {}),
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "progress": {
+            "processed": 0,
+            "total": data.get("config", {}).get("itemCount", 0),
+            "successful": 0,
+            "failed": 0,
+            "percentage": 0
+        }
+    }
+    
+    tasks_db[task_id] = task
+    logger.info(f"📅 Tarefa {task_id} agendada para {task['scheduled_for']}")
+    
+    return {
+        "success": True,
+        "taskId": task_id,
+        "task": task
+    }
+
+@app.post("/api/tasks/execute/{task_id}")
+async def execute_scheduled_task(task_id: str, background_tasks: BackgroundTasks):
+    """Executar uma tarefa agendada imediatamente"""
+    
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
+    
+    task = tasks_db[task_id]
+    
+    if task["status"] != "scheduled":
+        return {
+            "success": False,
+            "message": f"Tarefa não está agendada (status: {task['status']})"
+        }
+    
+    # Mudar status para processing
+    task["status"] = "processing"
+    task["started_at"] = datetime.now().isoformat()
+    task["updated_at"] = datetime.now().isoformat()
+    
+    # Extrair configurações
+    config = task.get("config", {})
+    
+    # Processar em background
+    background_tasks.add_task(
+        process_products_background,
+        task_id,
+        config.get("productIds", []),
+        config.get("operations", []),
+        config.get("storeName", ""),
+        config.get("accessToken", "")
+    )
+    
+    logger.info(f"▶️ Tarefa agendada {task_id} iniciada manualmente")
+    
+    return {
+        "success": True,
+        "message": "Tarefa iniciada com sucesso",
+        "task": task
+    }
+
+# ==================== PAUSAR E RETOMAR TAREFAS ====================
+
+@app.post("/api/tasks/pause/{task_id}")
+async def pause_task(task_id: str):
+    """Pausar uma tarefa em execução"""
+    
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
+    
+    task = tasks_db[task_id]
+    
+    if task["status"] not in ["processing", "running"]:
+        return {
+            "success": False,
+            "message": f"Tarefa não pode ser pausada (status: {task['status']})"
+        }
+    
+    task["status"] = "paused"
+    task["paused_at"] = datetime.now().isoformat()
+    task["updated_at"] = datetime.now().isoformat()
+    
+    logger.info(f"⏸️ Tarefa {task_id} pausada")
+    
+    return {
+        "success": True,
+        "message": "Tarefa pausada com sucesso",
+        "task": task
+    }
+
+@app.post("/api/tasks/resume/{task_id}")
+async def resume_task(task_id: str, background_tasks: BackgroundTasks):
+    """Retomar uma tarefa pausada"""
+    
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
+    
+    task = tasks_db[task_id]
+    
+    if task["status"] != "paused":
+        return {
+            "success": False,
+            "message": f"Tarefa não está pausada (status: {task['status']})"
+        }
+    
+    task["status"] = "processing"
+    task["resumed_at"] = datetime.now().isoformat()
+    task["updated_at"] = datetime.now().isoformat()
+    
+    # Continuar de onde parou
+    config = task.get("config", {})
+    product_ids = config.get("productIds", [])
+    
+    # Pegar apenas produtos não processados
+    processed_count = task["progress"]["processed"]
+    remaining_products = product_ids[processed_count:]
+    
+    if remaining_products:
+        background_tasks.add_task(
+            process_products_background,
+            task_id,
+            remaining_products,
+            config.get("operations", []),
+            config.get("storeName", ""),
+            config.get("accessToken", ""),
+            is_resume=True
+        )
+    
+    logger.info(f"▶️ Tarefa {task_id} retomada")
+    
+    return {
+        "success": True,
+        "message": "Tarefa retomada com sucesso",
+        "task": task
+    }
+
+# ==================== CANCELAR TAREFAS ====================
+
+@app.post("/api/tasks/cancel/{task_id}")
+async def cancel_task(task_id: str):
+    """Cancelar uma tarefa (agendada, pausada ou em execução)"""
+    
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
+    
+    task = tasks_db[task_id]
+    
+    # Só não pode cancelar se já terminou
+    if task["status"] in ["completed", "completed_with_errors", "failed"]:
+        return {
+            "success": False,
+            "message": f"Tarefa já finalizada (status: {task['status']})"
+        }
+    
+    task["status"] = "cancelled"
+    task["cancelled_at"] = datetime.now().isoformat()
+    task["updated_at"] = datetime.now().isoformat()
+    
+    logger.info(f"❌ Tarefa {task_id} cancelada")
+    
+    return {
+        "success": True,
+        "message": "Tarefa cancelada com sucesso",
+        "task": task
+    }
+
+@app.post("/task-cancel/{task_id}")
+async def cancel_task_alt(task_id: str):
+    """Endpoint alternativo para cancelar tarefa (compatibilidade)"""
+    return await cancel_task(task_id)
+
+# ==================== LISTAR TAREFAS ====================
+
+@app.get("/tasks")
+async def list_tasks_simple():
+    """Endpoint simples /tasks para compatibilidade"""
+    tasks_list = list(tasks_db.values())
+    
+    return {
+        "success": True,
+        "tasks": tasks_list,
+        "total": len(tasks_list)
+    }
+
+@app.get("/api/tasks/all")
+async def get_all_tasks():
+    """Retornar TODAS as tarefas com estatísticas"""
+    all_tasks = list(tasks_db.values())
+    
+    # Ordenar por updated_at mais recente
+    all_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    
+    return {
+        "success": True,
+        "total": len(all_tasks),
+        "tasks": all_tasks,
+        "stats": {
+            "scheduled": sum(1 for t in all_tasks if t["status"] == "scheduled"),
+            "processing": sum(1 for t in all_tasks if t["status"] in ["processing", "running"]),
+            "paused": sum(1 for t in all_tasks if t["status"] == "paused"),
+            "completed": sum(1 for t in all_tasks if t["status"] == "completed"),
+            "completed_with_errors": sum(1 for t in all_tasks if t["status"] == "completed_with_errors"),
+            "failed": sum(1 for t in all_tasks if t["status"] == "failed"),
+            "cancelled": sum(1 for t in all_tasks if t["status"] == "cancelled")
+        }
+    }
+
+@app.get("/api/tasks/scheduled")
+async def get_scheduled_tasks():
+    """Retornar APENAS tarefas agendadas"""
+    scheduled_tasks = []
+    
+    for task_id, task in tasks_db.items():
+        if task.get("status") == "scheduled":
+            scheduled_tasks.append(task)
+    
+    # Ordenar por data de agendamento
+    scheduled_tasks.sort(key=lambda x: x.get("scheduled_for", ""))
+    
+    logger.info(f"📅 Retornando {len(scheduled_tasks)} tarefas agendadas")
+    
+    return {
+        "success": True,
+        "total": len(scheduled_tasks),
+        "tasks": scheduled_tasks
+    }
+
+@app.get("/api/tasks/running")
+async def get_running_tasks():
+    """Retornar tarefas em execução e pausadas"""
+    active_tasks = []
+    
+    for task_id, task in tasks_db.items():
+        if task.get("status") in ["processing", "running", "paused"]:
+            active_tasks.append(task)
+    
+    # Ordenar por progresso
+    active_tasks.sort(key=lambda x: x.get("progress", {}).get("percentage", 0))
+    
+    logger.info(f"🏃 Retornando {len(active_tasks)} tarefas ativas")
+    
+    return {
+        "success": True,
+        "total": len(active_tasks),
+        "tasks": active_tasks
+    }
+
+# ==================== STATUS E ATUALIZAÇÃO ====================
+
+@app.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    """Verificar status detalhado da tarefa"""
+    
+    if task_id not in tasks_db:
+        logger.warning(f"⚠️ Tarefa {task_id} não encontrada")
+        return {
+            "id": task_id,
+            "status": "not_found",
+            "message": "Tarefa não encontrada",
+            "progress": {
+                "processed": 0,
+                "total": 0,
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0
+            }
+        }
+    
+    task = tasks_db[task_id]
+    logger.info(f"📊 Status: {task['status']} - {task['progress']['percentage']}%")
+    
+    return task
+
+@app.put("/api/tasks/update/{task_id}")
+async def update_task(task_id: str, data: Dict[str, Any]):
+    """Atualizar qualquer tarefa"""
+    
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
+    
+    task = tasks_db[task_id]
+    
+    # Atualizar campos permitidos
+    updatable_fields = ["name", "scheduled_for", "priority", "description", "status"]
+    for field in updatable_fields:
+        if field in data:
+            task[field] = data[field]
+    
+    task["updated_at"] = datetime.now().isoformat()
+    
+    logger.info(f"📝 Tarefa {task_id} atualizada")
+    
+    return {
+        "success": True,
+        "task": task
+    }
+
+# ==================== DELETAR TAREFAS ====================
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    """Deletar uma tarefa"""
+    
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
+    
+    task = tasks_db[task_id]
+    del tasks_db[task_id]
+    
+    logger.info(f"🗑️ Tarefa {task_id} deletada")
+    
+    return {
+        "success": True,
+        "message": "Tarefa deletada com sucesso",
+        "deleted_task": task
+    }
+
+@app.delete("/tasks/clear")
+async def clear_all_tasks():
+    """Limpar todas as tarefas da memória"""
+    count = len(tasks_db)
+    tasks_db.clear()
+    
+    logger.info(f"🗑️ {count} tarefas removidas da memória")
+    
+    return {
+        "success": True,
+        "message": f"{count} tarefas removidas",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ==================== PROCESSAMENTO DE PRODUTOS ====================
+
 async def process_products_background(
     task_id: str, 
     product_ids: List[str], 
     operations: List[Dict], 
     store_name: str,
-    access_token: str
+    access_token: str,
+    is_resume: bool = False
 ):
     """PROCESSAR PRODUTOS EM BACKGROUND"""
-    logger.info(f"🚀 INICIANDO PROCESSAMENTO REAL: {task_id}")
-    logger.info(f"📦 Total de produtos: {len(product_ids)}")
-    logger.info(f"⚙️ Operações a aplicar: {operations}")
+    if not is_resume:
+        logger.info(f"🚀 INICIANDO PROCESSAMENTO: {task_id}")
+    else:
+        logger.info(f"▶️ RETOMANDO PROCESSAMENTO: {task_id}")
+    
+    logger.info(f"📦 Produtos para processar: {len(product_ids)}")
     
     # Limpar nome da loja
     clean_store = store_name.replace('.myshopify.com', '').strip()
     api_version = '2024-04'
     
-    total = len(product_ids)
-    processed = 0
-    successful = 0
-    failed = 0
-    results = []
-    
-    # Atualizar status inicial
-    if task_id in tasks_db:
-        tasks_db[task_id]["status"] = "processing"
-        tasks_db[task_id]["updated_at"] = datetime.now().isoformat()
+    # Se for retomada, pegar progresso existente
+    if is_resume and task_id in tasks_db:
+        task = tasks_db[task_id]
+        processed = task["progress"]["processed"]
+        successful = task["progress"]["successful"]
+        failed = task["progress"]["failed"]
+        results = task.get("results", [])
+        total = task["progress"]["total"]
+    else:
+        processed = 0
+        successful = 0
+        failed = 0
+        results = []
+        total = len(product_ids)
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i, product_id in enumerate(product_ids):
             try:
-                # Verificar cancelamento
-                if task_id in tasks_db and tasks_db[task_id].get("status") == "cancelled":
-                    logger.info(f"⏹️ Tarefa {task_id} cancelada")
-                    return
+                # Verificar status da tarefa
+                if task_id in tasks_db:
+                    current_status = tasks_db[task_id].get("status")
+                    
+                    # Se foi pausada, parar
+                    if current_status == "paused":
+                        logger.info(f"⏸️ Tarefa {task_id} pausada, parando processamento")
+                        return
+                    
+                    # Se foi cancelada, parar
+                    if current_status == "cancelled":
+                        logger.info(f"❌ Tarefa {task_id} cancelada, parando processamento")
+                        return
                 
-                logger.info(f"📦 [{i+1}/{total}] Processando produto ID: {product_id}")
+                logger.info(f"📦 Processando produto {product_id} ({i+1}/{len(product_ids)})")
                 
-                # URL da API REST do Shopify
+                # URL da API
                 product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
                 headers = {
                     "X-Shopify-Access-Token": access_token,
                     "Content-Type": "application/json"
                 }
                 
-                # 1. BUSCAR PRODUTO ATUAL
-                logger.info(f"🔍 Buscando produto {product_id}...")
+                # Buscar produto
                 get_response = await client.get(product_url, headers=headers)
                 
                 if get_response.status_code != 200:
-                    logger.error(f"❌ Erro ao buscar produto: {get_response.status_code}")
-                    logger.error(f"Resposta: {get_response.text}")
-                    raise Exception(f"Erro ao buscar produto: {get_response.status_code}")
+                    raise Exception(f"Erro ao buscar: {get_response.status_code}")
                 
                 product_data = get_response.json()
                 current_product = product_data.get("product", {})
                 product_title = current_product.get("title", "Sem título")
                 
-                logger.info(f"✅ Produto encontrado: {product_title}")
-                
-                # 2. PREPARAR PAYLOAD DE ATUALIZAÇÃO
+                # Preparar atualização
                 update_payload = {"product": {"id": int(product_id)}}
                 
-                # Aplicar cada operação
+                # Aplicar operações
                 for op in operations:
                     field = op.get("field")
                     value = op.get("value")
-                    
-                    logger.info(f"🔧 Aplicando: {field} = {value}")
                     
                     if field == "title":
                         update_payload["product"]["title"] = value
@@ -193,7 +586,6 @@ async def process_products_background(
                             all_tags = list(set(current_tags + new_tags))
                             update_payload["product"]["tags"] = ", ".join(all_tags)
                     
-                    # Variantes (preço, SKU, etc)
                     elif field in ["price", "compare_at_price", "sku"] and current_product.get("variants"):
                         if "variants" not in update_payload["product"]:
                             update_payload["product"]["variants"] = []
@@ -210,16 +602,14 @@ async def process_products_background(
                             
                             update_payload["product"]["variants"].append(variant_update)
                 
-                logger.info(f"📤 Enviando atualização: {json.dumps(update_payload, indent=2)}")
-                
-                # 3. ENVIAR ATUALIZAÇÃO
+                # Enviar atualização
                 update_response = await client.put(
                     product_url,
                     headers=headers,
                     json=update_payload
                 )
                 
-                # 4. PROCESSAR RESULTADO
+                # Processar resultado
                 if update_response.status_code == 200:
                     successful += 1
                     result = {
@@ -228,19 +618,16 @@ async def process_products_background(
                         "status": "success",
                         "message": "Produto atualizado com sucesso"
                     }
-                    logger.info(f"✅ SUCESSO: Produto {product_id} ({product_title}) atualizado!")
+                    logger.info(f"✅ Produto {product_id} atualizado")
                 else:
                     failed += 1
-                    error_detail = update_response.text[:500]
                     result = {
                         "product_id": product_id,
                         "product_title": product_title,
                         "status": "failed",
-                        "message": f"Erro HTTP {update_response.status_code}",
-                        "error": error_detail
+                        "message": f"Erro HTTP {update_response.status_code}"
                     }
-                    logger.error(f"❌ FALHA: Produto {product_id}: {update_response.status_code}")
-                    logger.error(f"Detalhes: {error_detail}")
+                    logger.error(f"❌ Erro no produto {product_id}")
                     
             except Exception as e:
                 failed += 1
@@ -249,14 +636,14 @@ async def process_products_background(
                     "status": "failed",
                     "message": str(e)
                 }
-                logger.error(f"❌ EXCEÇÃO ao processar {product_id}: {str(e)}")
+                logger.error(f"❌ Exceção: {str(e)}")
             
-            # 5. ATUALIZAR PROGRESSO
+            # Atualizar progresso
             results.append(result)
-            processed = i + 1
+            processed += 1
             percentage = round((processed / total) * 100)
             
-            # ATUALIZAR NA MEMÓRIA (IMPORTANTE!)
+            # Salvar na memória
             if task_id in tasks_db:
                 tasks_db[task_id]["progress"] = {
                     "processed": processed,
@@ -267,14 +654,12 @@ async def process_products_background(
                     "current_product": product_title
                 }
                 tasks_db[task_id]["updated_at"] = datetime.now().isoformat()
-                tasks_db[task_id]["results"] = results[-50:]  # Últimos 50
-                
-                logger.info(f"📊 PROGRESSO SALVO: {processed}/{total} ({percentage}%)")
+                tasks_db[task_id]["results"] = results[-50:]
             
             # Rate limiting
             await asyncio.sleep(0.3)
     
-    # 6. FINALIZAR TAREFA
+    # Finalizar
     final_status = "completed" if failed == 0 else "completed_with_errors"
     
     if task_id in tasks_db:
@@ -282,55 +667,58 @@ async def process_products_background(
         tasks_db[task_id]["completed_at"] = datetime.now().isoformat()
         tasks_db[task_id]["results"] = results
         
-        logger.info(f"🏁 TAREFA FINALIZADA: {final_status}")
-        logger.info(f"📊 RESULTADO FINAL: ✅ {successful} sucessos | ❌ {failed} falhas")
+        logger.info(f"🏁 TAREFA FINALIZADA: ✅ {successful} | ❌ {failed}")
 
-@app.get("/task-status/{task_id}")
-async def get_task_status(task_id: str):
-    """Verificar status da tarefa"""
-    logger.info(f"📊 Status solicitado para: {task_id}")
-    
-    if task_id not in tasks_db:
-        logger.warning(f"⚠️ Tarefa {task_id} não encontrada")
-        return {
-            "id": task_id,
-            "status": "not_found",
-            "message": "Tarefa não encontrada",
-            "progress": {
-                "processed": 0,
-                "total": 0,
-                "successful": 0,
-                "failed": 0,
-                "percentage": 0
-            }
-        }
-    
-    task = tasks_db[task_id]
-    logger.info(f"📊 Retornando status: {task['status']} - {task['progress']['percentage']}%")
-    
-    return task
+# ==================== VERIFICADOR DE TAREFAS AGENDADAS ====================
 
-@app.get("/health")
-async def health_check():
-    """Health check"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "uptime": "running",
-        "tasks": {
-            "total": len(tasks_db),
-            "processing": sum(1 for t in tasks_db.values() if t["status"] == "processing"),
-            "completed": sum(1 for t in tasks_db.values() if "completed" in t["status"]),
-            "cancelled": sum(1 for t in tasks_db.values() if t["status"] == "cancelled")
-        },
-        "metrics": {
-            "total_products_processed": sum(len(t.get("results", [])) for t in tasks_db.values()),
-            "memory_usage_kb": len(str(tasks_db)) / 1024
-        }
-    }
+async def check_and_execute_scheduled_tasks():
+    """Verificar e executar tarefas agendadas automaticamente"""
+    while True:
+        try:
+            now = datetime.now()
+            
+            for task_id, task in list(tasks_db.items()):
+                if task["status"] == "scheduled":
+                    scheduled_time = datetime.fromisoformat(task["scheduled_for"])
+                    
+                    if scheduled_time <= now:
+                        logger.info(f"⏰ Executando tarefa agendada {task_id}")
+                        
+                        # Mudar status e processar
+                        task["status"] = "processing"
+                        task["started_at"] = now.isoformat()
+                        task["updated_at"] = now.isoformat()
+                        
+                        config = task.get("config", {})
+                        
+                        # Criar task para processar
+                        asyncio.create_task(
+                            process_products_background(
+                                task_id,
+                                config.get("productIds", []),
+                                config.get("operations", []),
+                                config.get("storeName", ""),
+                                config.get("accessToken", "")
+                            )
+                        )
+            
+            # Verificar a cada minuto
+            await asyncio.sleep(60)
+            
+        except Exception as e:
+            logger.error(f"Erro no verificador de tarefas: {e}")
+            await asyncio.sleep(60)
+
+# Iniciar verificador de tarefas agendadas quando o servidor iniciar
+@app.on_event("startup")
+async def startup_event():
+    """Iniciar verificador de tarefas agendadas"""
+    asyncio.create_task(check_and_execute_scheduled_tasks())
+    logger.info("⏰ Verificador de tarefas agendadas iniciado")
 
 if __name__ == "__main__":
     port = 8000
-    logger.info(f"🚀 Railway Shopify Processor iniciado na porta {port}")
-    logger.info(f"✅ Pronto para processar edições em massa!")
+    logger.info(f"🚀 Railway Shopify Processor v3.0 iniciado na porta {port}")
+    logger.info(f"✅ Sistema completo de gerenciamento de tarefas ativo!")
+    logger.info(f"📋 Funcionalidades: Agendar, Processar, Pausar, Retomar, Cancelar")
     uvicorn.run(app, host="0.0.0.0", port=port)
