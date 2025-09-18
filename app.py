@@ -311,7 +311,7 @@ async def pause_task(task_id: str):
 
 @app.post("/api/tasks/resume/{task_id}")
 async def resume_task(task_id: str, background_tasks: BackgroundTasks):
-    """Retomar uma tarefa pausada"""
+    """Retomar uma tarefa pausada - VERSÃO MELHORADA"""
     
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
@@ -319,24 +319,32 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
     task = tasks_db[task_id]
     
     if task["status"] != "paused":
+        logger.warning(f"⚠️ Tentativa de retomar tarefa não pausada: {task_id} (status: {task['status']})")
         return {
             "success": False,
-            "message": f"Tarefa não está pausada (status: {task['status']})"
+            "message": f"Tarefa não está pausada (status atual: {task['status']})"
         }
     
+    # Mudar status para processing
     task["status"] = "processing"
     task["resumed_at"] = datetime.now().isoformat()
     task["updated_at"] = datetime.now().isoformat()
     
     # Continuar de onde parou
     config = task.get("config", {})
-    product_ids = config.get("productIds", [])
+    all_product_ids = config.get("productIds", [])
     
-    # Pegar apenas produtos não processados
-    processed_count = task["progress"]["processed"]
-    remaining_products = product_ids[processed_count:]
+    # CORREÇÃO: Garantir que temos o progresso correto
+    processed_count = task.get("progress", {}).get("processed", 0)
+    remaining_products = all_product_ids[processed_count:]
     
-    if remaining_products:
+    logger.info(f"▶️ Retomando tarefa {task_id}")
+    logger.info(f"   Total de produtos: {len(all_product_ids)}")
+    logger.info(f"   Já processados: {processed_count}")
+    logger.info(f"   Restantes: {len(remaining_products)}")
+    
+    if len(remaining_products) > 0:
+        # MANTER background_tasks.add_task (MAIS SEGURO!)
         background_tasks.add_task(
             process_products_background,
             task_id,
@@ -346,14 +354,25 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
             config.get("accessToken", ""),
             is_resume=True
         )
-    
-    logger.info(f"▶️ Tarefa {task_id} retomada")
-    
-    return {
-        "success": True,
-        "message": "Tarefa retomada com sucesso",
-        "task": task
-    }
+        
+        logger.info(f"✅ Tarefa {task_id} retomada com {len(remaining_products)} produtos")
+        
+        return {
+            "success": True,
+            "message": f"Tarefa retomada com sucesso",
+            "task": task,
+            "remaining": len(remaining_products)
+        }
+    else:
+        # Se não há produtos restantes, marcar como completa
+        task["status"] = "completed"
+        task["completed_at"] = datetime.now().isoformat()
+        
+        return {
+            "success": True,
+            "message": "Tarefa já estava completa",
+            "task": task
+        }
 
 # ==================== CANCELAR TAREFAS ====================
 
@@ -610,7 +629,7 @@ async def process_products_background(
     access_token: str,
     is_resume: bool = False
 ):
-    """PROCESSAR PRODUTOS EM BACKGROUND"""
+    """PROCESSAR PRODUTOS EM BACKGROUND - VERSÃO MELHORADA"""
     if not is_resume:
         logger.info(f"🚀 INICIANDO PROCESSAMENTO: {task_id}")
     else:
@@ -639,22 +658,28 @@ async def process_products_background(
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i, product_id in enumerate(product_ids):
-            try:
-                # Verificar status da tarefa
-                if task_id in tasks_db:
-                    current_status = tasks_db[task_id].get("status")
-                    
-                    # Se foi pausada, parar
-                    if current_status == "paused":
-                        logger.info(f"⏸️ Tarefa {task_id} pausada, parando processamento")
-                        return
-                    
-                    # Se foi cancelada, parar
-                    if current_status == "cancelled":
-                        logger.info(f"❌ Tarefa {task_id} cancelada, parando processamento")
-                        return
+            # VERIFICAR STATUS ANTES DE PROCESSAR CADA PRODUTO
+            if task_id not in tasks_db:
+                logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
+                return
                 
+            current_status = tasks_db[task_id].get("status")
+            
+            # PARAR IMEDIATAMENTE SE PAUSADO OU CANCELADO
+            if current_status in ["paused", "cancelled"]:
+                logger.info(f"🛑 Tarefa {task_id} foi {current_status}, parando processamento IMEDIATAMENTE")
+                # Salvar progresso atual antes de parar
+                if current_status == "paused" and task_id in tasks_db:
+                    tasks_db[task_id]["progress"]["current_product"] = None
+                return
+            
+            try:
                 logger.info(f"📦 Processando produto {product_id} ({i+1}/{len(product_ids)})")
+                
+                # ATUALIZAR PROGRESSO ANTES DE PROCESSAR
+                if task_id in tasks_db:
+                    tasks_db[task_id]["progress"]["current_product"] = f"Produto {product_id}"
+                    tasks_db[task_id]["updated_at"] = datetime.now().isoformat()
                 
                 # URL da API
                 product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
@@ -780,10 +805,16 @@ async def process_products_background(
                     "successful": successful,
                     "failed": failed,
                     "percentage": percentage,
-                    "current_product": product_title
+                    "current_product": None if i == len(product_ids)-1 else product_title
                 }
                 tasks_db[task_id]["updated_at"] = datetime.now().isoformat()
                 tasks_db[task_id]["results"] = results[-50:]
+            
+            # VERIFICAR NOVAMENTE APÓS PROCESSAR CADA PRODUTO
+            if task_id in tasks_db:
+                if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
+                    logger.info(f"🛑 Parando após processar {product_id}")
+                    return
             
             # Rate limiting
             await asyncio.sleep(0.3)
@@ -795,6 +826,7 @@ async def process_products_background(
         tasks_db[task_id]["status"] = final_status
         tasks_db[task_id]["completed_at"] = datetime.now().isoformat()
         tasks_db[task_id]["results"] = results
+        tasks_db[task_id]["progress"]["current_product"] = None
         
         logger.info(f"🏁 TAREFA FINALIZADA: ✅ {successful} | ❌ {failed}")
 
