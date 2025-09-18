@@ -568,6 +568,112 @@ async def process_single_product_variants(
             tasks_db[task_id]["progress"]["processed"] = 1
             tasks_db[task_id]["progress"]["failed"] = 1
 
+# ==================== ATUALIZAR PRODUTOS DO SHOPIFY ====================
+
+@app.post("/api/products/refresh")
+async def refresh_products_from_shopify(data: Dict[str, Any]):
+    """Buscar produtos atualizados diretamente do Shopify"""
+    
+    store_name = data.get("storeName", "")
+    access_token = data.get("accessToken", "")
+    
+    if not store_name or not access_token:
+        raise HTTPException(status_code=400, detail="storeName e accessToken são obrigatórios")
+    
+    logger.info(f"🔄 Buscando produtos atualizados do Shopify para {store_name}")
+    
+    # Limpar nome da loja
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    api_version = '2024-04'
+    
+    try:
+        all_products = []
+        
+        # Buscar primeira página
+        url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products.json?limit=250"
+        headers = {
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Primeira requisição
+            response = await client.get(url, headers=headers)
+            
+            if response.status_code != 200:
+                error_text = await response.text()
+                logger.error(f"❌ Erro ao buscar produtos: {error_text}")
+                raise HTTPException(status_code=response.status_code, detail=f"Erro do Shopify: {error_text}")
+            
+            data = response.json()
+            products = data.get("products", [])
+            all_products.extend(products)
+            
+            logger.info(f"📦 Primeira página: {len(products)} produtos")
+            
+            # Verificar se há mais páginas através do header Link
+            link_header = response.headers.get("link", "")
+            
+            # Continuar buscando páginas enquanto houver
+            page_count = 1
+            while link_header and 'rel="next"' in link_header:
+                # Extrair URL da próxima página
+                parts = link_header.split(",")
+                next_url = None
+                
+                for part in parts:
+                    if 'rel="next"' in part:
+                        # Extrair URL entre < e >
+                        start = part.find("<") + 1
+                        end = part.find(">")
+                        if start > 0 and end > start:
+                            next_url = part[start:end]
+                            break
+                
+                if not next_url:
+                    break
+                
+                # Buscar próxima página
+                response = await client.get(next_url, headers=headers)
+                
+                if response.status_code != 200:
+                    logger.warning(f"⚠️ Erro ao buscar página {page_count + 1}, parando paginação")
+                    break
+                
+                data = response.json()
+                products = data.get("products", [])
+                all_products.extend(products)
+                
+                page_count += 1
+                logger.info(f"📦 Página {page_count}: {len(products)} produtos (Total: {len(all_products)})")
+                
+                # Atualizar link header
+                link_header = response.headers.get("link", "")
+                
+                # Rate limiting
+                await asyncio.sleep(0.5)
+        
+        # Buscar informações adicionais se necessário (variants completas)
+        logger.info(f"✅ Total de {len(all_products)} produtos carregados do Shopify")
+        
+        # Enriquecer com dados de variants se necessário
+        for product in all_products:
+            # Garantir que variants estão presentes
+            if "variants" not in product or not product["variants"]:
+                product["variants"] = []
+            
+            # Garantir que options estão presentes
+            if "options" not in product or not product["options"]:
+                product["options"] = []
+        
+        return all_products
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro ao buscar produtos do Shopify: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
+
 # ==================== AGENDAMENTO DE TAREFAS ====================
 
 @app.post("/api/tasks/schedule")
