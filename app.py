@@ -328,19 +328,39 @@ async def process_variants_background(
                                 "option3": variant.get("option3")
                             }
                             
-                            # Aplicar mudanças de valores
-                            for option_field in ["option1", "option2", "option3"]:
-                                if variant.get(option_field):
-                                    for option_name, changes in submit_data.get("valueChanges", {}).items():
-                                        if variant[option_field] in changes:
-                                            change = changes[variant[option_field]]
-                                            updated_variant[option_field] = change.get("newName", variant[option_field])
+                            # CORREÇÃO: Aplicar mudanças de valores e preços corretamente
+                            if submit_data.get("valueChanges"):
+                                for option_name, changes in submit_data["valueChanges"].items():
+                                    # Verificar cada campo de opção da variante
+                                    for option_field in ["option1", "option2", "option3"]:
+                                        current_option_value = variant.get(option_field)
+                                        
+                                        if current_option_value and current_option_value in changes:
+                                            change = changes[current_option_value]
                                             
-                                            # Ajustar preço se houver mudança
+                                            # Atualizar nome do valor se mudou
+                                            if "newName" in change:
+                                                updated_variant[option_field] = change["newName"]
+                                            
+                                            # CORREÇÃO PRINCIPAL: Calcular preço corretamente
                                             if "extraPrice" in change:
-                                                current_price = float(variant.get("price", 0))
-                                                extra_price = float(change["extraPrice"])
-                                                updated_variant["price"] = str(current_price + extra_price)
+    current_price = float(variant.get("price", 0))
+    original_extra = float(change.get("originalExtraPrice", 0))
+    new_extra = float(change["extraPrice"])
+    
+    # Calcular preço base (removendo o preço extra anterior)
+    base_price = current_price - original_extra
+    
+    # Aplicar o novo preço extra
+    new_price = base_price + new_extra
+    updated_variant["price"] = str(new_price)
+    
+    # Atualizar compare_at_price se existir
+    if variant.get("compare_at_price"):
+        compare_price = float(variant["compare_at_price"])
+        base_compare = compare_price - original_extra
+        new_compare = base_compare + new_extra
+        updated_variant["compare_at_price"] = str(new_compare)
                             
                             variants.append(updated_variant)
                         
@@ -376,7 +396,7 @@ async def process_variants_background(
                             "status": "failed",
                             "message": f"Erro: {error_text}"
                         }
-                        logger.error(f"❌ Erro no produto '{product_title}'")
+                        logger.error(f"❌ Erro no produto '{product_title}': {error_text}")
                 
             except Exception as e:
                 failed += 1
