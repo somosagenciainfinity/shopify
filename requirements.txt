@@ -2,5 +2,6 @@ fastapi
 uvicorn
 httpx
 pydantic
-websockets
 python-multipart
+websockets
+pytz
