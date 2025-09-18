@@ -676,10 +676,17 @@ async def process_products_background(
                 # Preparar atualização
                 update_payload = {"product": {"id": int(product_id)}}
                 
+                # CORREÇÃO: Coletar todas as operações de variantes primeiro
+                variant_updates = {}
+                for variant in current_product.get("variants", []):
+                    variant_updates[variant["id"]] = {"id": variant["id"]}
+                
                 # Aplicar operações
                 for op in operations:
                     field = op.get("field")
                     value = op.get("value")
+                    
+                    logger.info(f"  Aplicando: {field} = {value}")
                     
                     if field == "title":
                         update_payload["product"]["title"] = value
@@ -705,21 +712,23 @@ async def process_products_background(
                             all_tags = list(set(current_tags + new_tags))
                             update_payload["product"]["tags"] = ", ".join(all_tags)
                     
-                    elif field in ["price", "compare_at_price", "sku"] and current_product.get("variants"):
-                        if "variants" not in update_payload["product"]:
-                            update_payload["product"]["variants"] = []
-                        
-                        for variant in current_product["variants"]:
-                            variant_update = {"id": variant["id"]}
-                            
+                    # CORREÇÃO: Acumular updates de variantes
+                    elif field in ["price", "compare_at_price", "sku"]:
+                        for variant_id in variant_updates:
                             if field == "price":
-                                variant_update["price"] = str(value)
+                                variant_updates[variant_id]["price"] = str(value)
                             elif field == "compare_at_price":
-                                variant_update["compare_at_price"] = str(value) if value else None
+                                variant_updates[variant_id]["compare_at_price"] = str(value) if value else None
                             elif field == "sku":
-                                variant_update["sku"] = str(value)
-                            
-                            update_payload["product"]["variants"].append(variant_update)
+                                variant_updates[variant_id]["sku"] = str(value)
+                
+                # Adicionar variantes ao payload apenas uma vez com TODOS os campos
+                if variant_updates:
+                    update_payload["product"]["variants"] = list(variant_updates.values())
+                    logger.info(f"  Atualizando {len(variant_updates)} variantes")
+                
+                # Log do payload final
+                logger.info(f"  Payload final: {json.dumps(update_payload, indent=2)}")
                 
                 # Enviar atualização
                 update_response = await client.put(
@@ -740,13 +749,14 @@ async def process_products_background(
                     logger.info(f"✅ Produto {product_id} atualizado")
                 else:
                     failed += 1
+                    error_text = await update_response.text()
                     result = {
                         "product_id": product_id,
                         "product_title": product_title,
                         "status": "failed",
-                        "message": f"Erro HTTP {update_response.status_code}"
+                        "message": f"Erro HTTP {update_response.status_code}: {error_text}"
                     }
-                    logger.error(f"❌ Erro no produto {product_id}")
+                    logger.error(f"❌ Erro no produto {product_id}: {error_text}")
                     
             except Exception as e:
                 failed += 1
