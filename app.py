@@ -7,12 +7,24 @@ import asyncio
 import json
 import secrets
 from datetime import datetime, timezone, timedelta
+import pytz
 import uvicorn
 import logging
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configurar timezone de Brasília
+BRAZIL_TZ = pytz.timezone('America/Sao_Paulo')
+
+def get_brazil_time():
+    """Retorna o horário atual de Brasília"""
+    return datetime.now(BRAZIL_TZ)
+
+def get_brazil_time_str():
+    """Retorna o horário atual de Brasília como string ISO"""
+    return get_brazil_time().isoformat()
 
 app = FastAPI(title="Shopify Task Processor", version="3.0.0")
 
@@ -47,7 +59,7 @@ async def root():
     return {
         "message": "🚀 Railway API - Gerenciamento Completo de Tarefas!",
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": get_brazil_time_str(),
         "tasks_in_memory": len(tasks_db),
         "version": "3.0.0",
         "features": [
@@ -64,7 +76,7 @@ async def health_check():
     """Health check detalhado"""
     return {
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": get_brazil_time_str(),
         "uptime": "running",
         "tasks": {
             "total": len(tasks_db),
@@ -108,8 +120,8 @@ async def process_task(task: TaskRequest, background_tasks: BackgroundTasks):
             "percentage": 0,
             "current_product": None
         },
-        "started_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat(),
+        "started_at": get_brazil_time_str(),
+        "updated_at": get_brazil_time_str(),
         "config": task.dict(),
         "results": []
     }
@@ -145,7 +157,7 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
     logger.info(f"📋 Recebendo agendamento: {data.get('name')}")
     logger.info(f"⏰ Para executar em: {data.get('scheduled_for')}")
     
-    scheduled_for = data.get("scheduled_for", datetime.now().isoformat())
+    scheduled_for = data.get("scheduled_for", get_brazil_time_str())
     
     # CORREÇÃO DE TIMEZONE - Assumir que o horário vem em UTC se tiver 'Z'
     if scheduled_for.endswith('Z'):
@@ -185,12 +197,12 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
             "status": "processing",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),  # Adicionar horário local
-            "started_at": now.isoformat(),
+            "started_at": get_brazil_time_str(),
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
             "config": data.get("config", {}),
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
             "progress": {
                 "processed": 0,
                 "total": data.get("config", {}).get("itemCount", 0),
@@ -226,8 +238,8 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
             "config": data.get("config", {}),
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
             "progress": {
                 "processed": 0,
                 "total": data.get("config", {}).get("itemCount", 0),
@@ -267,8 +279,8 @@ async def execute_scheduled_task(task_id: str, background_tasks: BackgroundTasks
     
     # Mudar status para processing
     task["status"] = "processing"
-    task["started_at"] = datetime.now().isoformat()
-    task["updated_at"] = datetime.now().isoformat()
+    task["started_at"] = get_brazil_time_str()
+    task["updated_at"] = get_brazil_time_str()
     
     # Extrair configurações
     config = task.get("config", {})
@@ -309,8 +321,8 @@ async def pause_task(task_id: str):
         }
     
     task["status"] = "paused"
-    task["paused_at"] = datetime.now().isoformat()
-    task["updated_at"] = datetime.now().isoformat()
+    task["paused_at"] = get_brazil_time_str()
+    task["updated_at"] = get_brazil_time_str()
     
     logger.info(f"⏸️ Tarefa {task_id} pausada")
     
@@ -338,8 +350,8 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
     
     # Mudar status para processing
     task["status"] = "processing"
-    task["resumed_at"] = datetime.now().isoformat()
-    task["updated_at"] = datetime.now().isoformat()
+    task["resumed_at"] = get_brazil_time_str()
+    task["updated_at"] = get_brazil_time_str()
     
     # Continuar de onde parou
     config = task.get("config", {})
@@ -377,7 +389,7 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
     else:
         # Se não há produtos restantes, marcar como completa
         task["status"] = "completed"
-        task["completed_at"] = datetime.now().isoformat()
+        task["completed_at"] = get_brazil_time_str()
         
         return {
             "success": True,
@@ -404,8 +416,8 @@ async def cancel_task(task_id: str):
         }
     
     task["status"] = "cancelled"
-    task["cancelled_at"] = datetime.now().isoformat()
-    task["updated_at"] = datetime.now().isoformat()
+    task["cancelled_at"] = get_brazil_time_str()
+    task["updated_at"] = get_brazil_time_str()
     
     logger.info(f"❌ Tarefa {task_id} cancelada")
     
@@ -545,7 +557,7 @@ async def update_task(task_id: str, data: Dict[str, Any], background_tasks: Back
         if field in data:
             task[field] = data[field]
     
-    task["updated_at"] = datetime.now().isoformat()
+    task["updated_at"] = get_brazil_time_str()
     
     # IMPORTANTE: Se atualizou o scheduled_for e já passou, executar IMEDIATAMENTE
     if "scheduled_for" in data and task["status"] == "scheduled":
@@ -574,7 +586,7 @@ async def update_task(task_id: str, data: Dict[str, Any], background_tasks: Back
             
             # Mudar status e processar
             task["status"] = "processing"
-            task["started_at"] = now.isoformat()
+            task["started_at"] = get_brazil_time_str()
             
             config = task.get("config", {})
             
@@ -628,7 +640,7 @@ async def clear_all_tasks():
     return {
         "success": True,
         "message": f"{count} tarefas removidas",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": get_brazil_time_str()
     }
 
 # ==================== PROCESSAMENTO DE PRODUTOS ====================
@@ -691,7 +703,7 @@ async def process_products_background(
                 # ATUALIZAR PROGRESSO ANTES DE PROCESSAR
                 if task_id in tasks_db:
                     tasks_db[task_id]["progress"]["current_product"] = f"Produto {product_id}"
-                    tasks_db[task_id]["updated_at"] = datetime.now().isoformat()
+                    tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 
                 # URL da API
                 product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
@@ -819,7 +831,7 @@ async def process_products_background(
                     "percentage": percentage,
                     "current_product": None if i == len(product_ids)-1 else product_title
                 }
-                tasks_db[task_id]["updated_at"] = datetime.now().isoformat()
+                tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 tasks_db[task_id]["results"] = results[-50:]
             
             # VERIFICAR NOVAMENTE APÓS PROCESSAR CADA PRODUTO
@@ -836,7 +848,7 @@ async def process_products_background(
     
     if task_id in tasks_db:
         tasks_db[task_id]["status"] = final_status
-        tasks_db[task_id]["completed_at"] = datetime.now().isoformat()
+        tasks_db[task_id]["completed_at"] = get_brazil_time_str()
         tasks_db[task_id]["results"] = results
         tasks_db[task_id]["progress"]["current_product"] = None
         
@@ -876,8 +888,8 @@ async def check_and_execute_scheduled_tasks():
                         
                         # Mudar status e processar
                         task["status"] = "processing"
-                        task["started_at"] = now.isoformat()
-                        task["updated_at"] = now.isoformat()
+                        task["started_at"] = get_brazil_time_str()
+                        task["updated_at"] = get_brazil_time_str()
                         
                         config = task.get("config", {})
                         
