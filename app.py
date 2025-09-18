@@ -182,6 +182,336 @@ async def shopify_proxy(request: Request):
         logger.error(f"Proxy error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==================== PRODUTOS E COLEÇÕES OTIMIZADOS ====================
+
+@app.get("/api/products/all")
+async def get_all_products(
+    store_name: str,
+    access_token: str = Header(None, alias="X-Shopify-Access-Token")
+):
+    """Carregar todos os produtos com paginação otimizada"""
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Access token required")
+    
+    clean_store = store_name.replace('.myshopify.com', '')
+    all_products = []
+    cursor = None
+    page = 0
+    
+    logger.info(f"📦 Iniciando carregamento de produtos para {clean_store}")
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while True:
+            page += 1
+            query = """
+            query($cursor: String) {
+                products(first: 100, after: $cursor) {
+                    edges {
+                        node {
+                            id
+                            title
+                            handle
+                            status
+                            createdAt
+                            updatedAt
+                            productType
+                            vendor
+                            tags
+                            bodyHtml
+                            publishedAt
+                            featuredImage {
+                                url
+                                altText
+                            }
+                            images(first: 10) {
+                                edges {
+                                    node {
+                                        id
+                                        url
+                                        altText
+                                    }
+                                }
+                            }
+                            collections(first: 50) {
+                                edges {
+                                    node {
+                                        id
+                                        title
+                                        handle
+                                    }
+                                }
+                            }
+                            variants(first: 100) {
+                                edges {
+                                    node {
+                                        id
+                                        title
+                                        price
+                                        compareAtPrice
+                                        inventoryQuantity
+                                        sku
+                                        barcode
+                                        selectedOptions {
+                                            name
+                                            value
+                                        }
+                                    }
+                                }
+                            }
+                            options {
+                                id
+                                name
+                                position
+                                values
+                            }
+                        }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+            """
+            
+            try:
+                response = await client.post(
+                    f"https://{clean_store}.myshopify.com/admin/api/2024-10/graphql.json",
+                    json={"query": query, "variables": {"cursor": cursor}},
+                    headers={
+                        "X-Shopify-Access-Token": access_token,
+                        "Content-Type": "application/json"
+                    }
+                )
+                
+                if response.status_code != 200:
+                    logger.error(f"Erro na página {page}: {response.status_code}")
+                    break
+                
+                data = response.json()
+                
+                if "errors" in data:
+                    logger.error(f"Erros GraphQL: {data['errors']}")
+                    break
+                
+                products_data = data.get("data", {}).get("products", {})
+                edges = products_data.get("edges", [])
+                
+                # Processar produtos
+                for edge in edges:
+                    node = edge["node"]
+                    
+                    # Processar coleções
+                    collection_ids = []
+                    for coll_edge in node.get("collections", {}).get("edges", []):
+                        coll_id = coll_edge["node"]["id"].split("/")[-1]
+                        collection_ids.append(int(coll_id))
+                    
+                    # Processar imagens
+                    images = []
+                    for img_edge in node.get("images", {}).get("edges", []):
+                        img = img_edge["node"]
+                        images.append({
+                            "id": int(img["id"].split("/")[-1]) if "/" in img["id"] else img["id"],
+                            "url": img["url"],
+                            "alt": img.get("altText", "")
+                        })
+                    
+                    # Processar variantes
+                    variants = []
+                    for var_edge in node.get("variants", {}).get("edges", []):
+                        var = var_edge["node"]
+                        
+                        # Extrair options
+                        option1 = option2 = option3 = None
+                        for idx, opt in enumerate(var.get("selectedOptions", [])):
+                            if idx == 0:
+                                option1 = opt["value"]
+                            elif idx == 1:
+                                option2 = opt["value"]
+                            elif idx == 2:
+                                option3 = opt["value"]
+                        
+                        variants.append({
+                            "id": int(var["id"].split("/")[-1]),
+                            "title": var["title"],
+                            "price": var["price"],
+                            "compare_at_price": var.get("compareAtPrice"),
+                            "inventory_quantity": var.get("inventoryQuantity", 0),
+                            "sku": var.get("sku", ""),
+                            "barcode": var.get("barcode", ""),
+                            "option1": option1,
+                            "option2": option2,
+                            "option3": option3
+                        })
+                    
+                    # Montar produto
+                    product = {
+                        "id": int(node["id"].split("/")[-1]),
+                        "title": node["title"],
+                        "handle": node["handle"],
+                        "status": node["status"],
+                        "created_at": node["createdAt"],
+                        "updated_at": node["updatedAt"],
+                        "published_at": node.get("publishedAt"),
+                        "product_type": node.get("productType", ""),
+                        "vendor": node.get("vendor", ""),
+                        "tags": node.get("tags", []),
+                        "body_html": node.get("bodyHtml", ""),
+                        "featured_image": {
+                            "url": node["featuredImage"]["url"],
+                            "alt": node["featuredImage"].get("altText", "")
+                        } if node.get("featuredImage") else None,
+                        "images": images,
+                        "collection_ids": collection_ids,
+                        "variants": variants,
+                        "options": node.get("options", [])
+                    }
+                    
+                    all_products.append(product)
+                
+                # Verificar se tem próxima página
+                page_info = products_data.get("pageInfo", {})
+                if not page_info.get("hasNextPage"):
+                    break
+                
+                cursor = page_info.get("endCursor")
+                logger.info(f"📦 Página {page} carregada: {len(all_products)} produtos até agora")
+                
+                # Rate limiting
+                await asyncio.sleep(0.2)
+                
+            except Exception as e:
+                logger.error(f"Erro carregando produtos página {page}: {e}")
+                break
+    
+    logger.info(f"✅ Total de produtos carregados: {len(all_products)}")
+    
+    return {
+        "success": True,
+        "total": len(all_products),
+        "products": all_products
+    }
+
+@app.get("/api/collections/all")
+async def get_all_collections(
+    store_name: str,
+    access_token: str = Header(None, alias="X-Shopify-Access-Token")
+):
+    """Carregar todas as coleções com paginação"""
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Access token required")
+    
+    clean_store = store_name.replace('.myshopify.com', '')
+    all_collections = []
+    cursor = None
+    page = 0
+    
+    logger.info(f"📚 Iniciando carregamento de coleções para {clean_store}")
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            page += 1
+            query = """
+            query($cursor: String) {
+                collections(first: 250, after: $cursor) {
+                    edges {
+                        node {
+                            id
+                            title
+                            handle
+                            description
+                            productsCount
+                        }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+            """
+            
+            try:
+                response = await client.post(
+                    f"https://{clean_store}.myshopify.com/admin/api/2024-10/graphql.json",
+                    json={"query": query, "variables": {"cursor": cursor}},
+                    headers={
+                        "X-Shopify-Access-Token": access_token,
+                        "Content-Type": "application/json"
+                    }
+                )
+                
+                if response.status_code != 200:
+                    break
+                
+                data = response.json()
+                collections_data = data.get("data", {}).get("collections", {})
+                
+                for edge in collections_data.get("edges", []):
+                    node = edge["node"]
+                    all_collections.append({
+                        "id": int(node["id"].split("/")[-1]),
+                        "title": node["title"],
+                        "handle": node["handle"],
+                        "description": node.get("description", ""),
+                        "products_count": node.get("productsCount", 0)
+                    })
+                
+                page_info = collections_data.get("pageInfo", {})
+                if not page_info.get("hasNextPage"):
+                    break
+                
+                cursor = page_info.get("endCursor")
+                logger.info(f"📚 Página {page}: {len(all_collections)} coleções")
+                
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Erro carregando coleções: {e}")
+                break
+    
+    logger.info(f"✅ Total de coleções: {len(all_collections)}")
+    
+    return {
+        "success": True,
+        "total": len(all_collections),
+        "collections": all_collections
+    }
+
+@app.post("/api/load-store-data")
+async def load_store_data(request: Dict[str, str]):
+    """Carregar todos os dados da loja de uma vez (produtos + coleções)"""
+    store_name = request.get("store_name", "").replace('.myshopify.com', '')
+    access_token = request.get("access_token", "")
+    
+    if not store_name or not access_token:
+        raise HTTPException(status_code=400, detail="Store name and access token required")
+    
+    try:
+        # Carregar em paralelo
+        async with httpx.AsyncClient() as client:
+            # Carregar produtos e coleções em paralelo
+            products_task = get_all_products(store_name, access_token)
+            collections_task = get_all_collections(store_name, access_token)
+            
+            products_result = await products_task
+            collections_result = await collections_task
+        
+        return {
+            "success": True,
+            "products": products_result["products"],
+            "collections": collections_result["collections"],
+            "totals": {
+                "products": products_result["total"],
+                "collections": collections_result["total"]
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Erro carregando dados da loja: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==================== SHOPIFY OAUTH ====================
 
 @app.post("/api/shopify/oauth/token")
