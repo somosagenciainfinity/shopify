@@ -511,7 +511,7 @@ async def load_store_data(request: Dict[str, str]):
 # ADICIONE ESTAS FUNÇÕES AUXILIARES (sem decorador @app.get):
 
 async def _load_all_products(store_name: str, access_token: str):
-    """Função auxiliar para carregar produtos"""
+    """Função auxiliar para carregar produtos com TODOS os campos"""
     clean_store = store_name.replace('.myshopify.com', '')
     all_products = []
     cursor = None
@@ -524,23 +524,52 @@ async def _load_all_products(store_name: str, access_token: str):
             page += 1
             query = """
             query($cursor: String) {
-                products(first: 100, after: $cursor) {
+                products(first: 50, after: $cursor) {
                     edges {
                         node {
                             id
                             title
                             handle
                             status
+                            createdAt
+                            updatedAt
+                            publishedAt
                             vendor
                             productType
                             tags
+                            bodyHtml
+                            featuredImage {
+                                id
+                                url
+                                altText
+                                width
+                                height
+                            }
+                            images(first: 20) {
+                                edges {
+                                    node {
+                                        id
+                                        url
+                                        altText
+                                        width
+                                        height
+                                    }
+                                }
+                            }
                             collections(first: 50) {
                                 edges {
                                     node {
                                         id
                                         title
+                                        handle
                                     }
                                 }
+                            }
+                            options {
+                                id
+                                name
+                                position
+                                values
                             }
                             variants(first: 100) {
                                 edges {
@@ -548,7 +577,22 @@ async def _load_all_products(store_name: str, access_token: str):
                                         id
                                         title
                                         price
+                                        compareAtPrice
+                                        inventoryQuantity
                                         sku
+                                        barcode
+                                        weight
+                                        weightUnit
+                                        taxable
+                                        selectedOptions {
+                                            name
+                                            value
+                                        }
+                                        image {
+                                            id
+                                            url
+                                            altText
+                                        }
                                     }
                                 }
                             }
@@ -573,9 +617,15 @@ async def _load_all_products(store_name: str, access_token: str):
                 )
                 
                 if response.status_code != 200:
+                    logger.error(f"Erro HTTP {response.status_code}")
                     break
                 
                 data = response.json()
+                
+                if "errors" in data:
+                    logger.error(f"Erro GraphQL: {data['errors']}")
+                    break
+                    
                 products_data = data.get("data", {}).get("products", {})
                 
                 for edge in products_data.get("edges", []):
@@ -587,25 +637,105 @@ async def _load_all_products(store_name: str, access_token: str):
                         coll_id = int(coll["node"]["id"].split("/")[-1])
                         collection_ids.append(coll_id)
                     
-                    # Processar variantes
-                    variants = []
-                    for var in node.get("variants", {}).get("edges", []):
-                        variants.append({
-                            "id": int(var["node"]["id"].split("/")[-1]),
-                            "title": var["node"]["title"],
-                            "price": var["node"]["price"],
-                            "sku": var["node"].get("sku", "")
+                    # Processar featured image
+                    featured_image = None
+                    if node.get("featuredImage"):
+                        fi = node["featuredImage"]
+                        featured_image = {
+                            "id": int(fi["id"].split("/")[-1]) if fi.get("id") and "/" in fi["id"] else None,
+                            "url": fi.get("url", ""),
+                            "alt": fi.get("altText", ""),
+                            "width": fi.get("width", 0),
+                            "height": fi.get("height", 0)
+                        }
+                    
+                    # Processar todas as imagens
+                    images = []
+                    for img_edge in node.get("images", {}).get("edges", []):
+                        img = img_edge["node"]
+                        images.append({
+                            "id": int(img["id"].split("/")[-1]) if "/" in img["id"] else img["id"],
+                            "url": img.get("url", ""),
+                            "alt": img.get("altText", ""),
+                            "width": img.get("width", 0),
+                            "height": img.get("height", 0)
                         })
+                    
+                    # Processar options
+                    options = []
+                    for opt in node.get("options", []):
+                        options.append({
+                            "id": int(opt["id"].split("/")[-1]) if "/" in opt["id"] else opt["id"],
+                            "name": opt.get("name", ""),
+                            "position": opt.get("position", 1),
+                            "values": opt.get("values", [])
+                        })
+                    
+                    # Processar variantes com TODOS os campos
+                    variants = []
+                    for var_edge in node.get("variants", {}).get("edges", []):
+                        var = var_edge["node"]
+                        
+                        # Extrair options
+                        option1 = option2 = option3 = None
+                        for idx, opt in enumerate(var.get("selectedOptions", [])):
+                            if idx == 0:
+                                option1 = opt["value"]
+                            elif idx == 1:
+                                option2 = opt["value"]
+                            elif idx == 2:
+                                option3 = opt["value"]
+                        
+                        # Imagem da variante
+                        variant_image_id = None
+                        if var.get("image") and var["image"].get("id"):
+                            variant_image_id = int(var["image"]["id"].split("/")[-1])
+                        
+                        variants.append({
+                            "id": int(var["id"].split("/")[-1]),
+                            "title": var.get("title", ""),
+                            "price": var.get("price", "0"),
+                            "compare_at_price": var.get("compareAtPrice", None),
+                            "inventory_quantity": var.get("inventoryQuantity", 0),
+                            "sku": var.get("sku", ""),
+                            "barcode": var.get("barcode", ""),
+                            "weight": var.get("weight", 0),
+                            "weight_unit": var.get("weightUnit", "kg"),
+                            "taxable": var.get("taxable", True),
+                            "option1": option1,
+                            "option2": option2,
+                            "option3": option3,
+                            "image_id": variant_image_id,
+                            "inventory_management": "shopify" if var.get("inventoryQuantity") is not None else None,
+                            "inventory_policy": "deny",
+                            "fulfillment_service": "manual",
+                            "requires_shipping": True
+                        })
+                    
+                    # Traduzir status
+                    status_map = {
+                        "ACTIVE": "active",
+                        "DRAFT": "draft", 
+                        "ARCHIVED": "archived"
+                    }
                     
                     all_products.append({
                         "id": int(node["id"].split("/")[-1]),
-                        "title": node["title"],
-                        "handle": node["handle"],
-                        "status": node["status"],
+                        "title": node.get("title", ""),
+                        "handle": node.get("handle", ""),
+                        "status": status_map.get(node.get("status", ""), node.get("status", "")),
+                        "status_original": node.get("status", ""),
+                        "created_at": node.get("createdAt", ""),
+                        "updated_at": node.get("updatedAt", ""),
+                        "published_at": node.get("publishedAt", ""),
                         "vendor": node.get("vendor", ""),
                         "product_type": node.get("productType", ""),
-                        "tags": node.get("tags", []),
+                        "tags": node.get("tags", []) if isinstance(node.get("tags"), list) else node.get("tags", ""),
+                        "body_html": node.get("bodyHtml", ""),
                         "collection_ids": collection_ids,
+                        "featured_image": featured_image,
+                        "images": images,
+                        "options": options,
                         "variants": variants
                     })
                 
@@ -614,17 +744,18 @@ async def _load_all_products(store_name: str, access_token: str):
                     break
                 
                 cursor = page_info.get("endCursor")
-                logger.info(f"Página {page}: {len(all_products)} produtos")
+                logger.info(f"Página {page}: {len(all_products)} produtos carregados")
                 await asyncio.sleep(0.2)
                 
             except Exception as e:
-                logger.error(f"Erro: {e}")
+                logger.error(f"Erro na página {page}: {e}")
                 break
     
+    logger.info(f"✅ Total: {len(all_products)} produtos com todos os campos")
     return {"success": True, "total": len(all_products), "products": all_products}
 
 async def _load_all_collections(store_name: str, access_token: str):
-    """Função auxiliar para carregar coleções"""
+    """Função auxiliar para carregar coleções com TODOS os campos"""
     clean_store = store_name.replace('.myshopify.com', '')
     all_collections = []
     cursor = None
@@ -644,7 +775,16 @@ async def _load_all_collections(store_name: str, access_token: str):
                             title
                             handle
                             description
+                            descriptionHtml
+                            updatedAt
+                            image {
+                                url
+                                altText
+                                width
+                                height
+                            }
                             productsCount
+                            sortOrder
                         }
                     }
                     pageInfo {
@@ -666,19 +806,42 @@ async def _load_all_collections(store_name: str, access_token: str):
                 )
                 
                 if response.status_code != 200:
+                    logger.error(f"Erro HTTP {response.status_code} ao carregar coleções")
                     break
                 
                 data = response.json()
+                
+                if "errors" in data:
+                    logger.error(f"Erro GraphQL em coleções: {data['errors']}")
+                    break
+                
                 collections_data = data.get("data", {}).get("collections", {})
                 
                 for edge in collections_data.get("edges", []):
                     node = edge["node"]
+                    
+                    # Processar imagem da coleção
+                    image = None
+                    if node.get("image"):
+                        img = node["image"]
+                        image = {
+                            "url": img.get("url", ""),
+                            "alt": img.get("altText", ""),
+                            "width": img.get("width", 0),
+                            "height": img.get("height", 0)
+                        }
+                    
                     all_collections.append({
                         "id": int(node["id"].split("/")[-1]),
-                        "title": node["title"],
-                        "handle": node["handle"],
+                        "title": node.get("title", ""),
+                        "handle": node.get("handle", ""),
                         "description": node.get("description", ""),
-                        "products_count": node.get("productsCount", 0)
+                        "description_html": node.get("descriptionHtml", ""),
+                        "updated_at": node.get("updatedAt", ""),
+                        "image": image,
+                        "products_count": node.get("productsCount", 0),
+                        "sort_order": node.get("sortOrder", ""),
+                        "published": True  # Collections in GraphQL are always published
                     })
                 
                 page_info = collections_data.get("pageInfo", {})
@@ -686,12 +849,17 @@ async def _load_all_collections(store_name: str, access_token: str):
                     break
                 
                 cursor = page_info.get("endCursor")
-                logger.info(f"Página {page}: {len(all_collections)} coleções")
+                logger.info(f"📚 Página {page}: {len(all_collections)} coleções carregadas")
                 await asyncio.sleep(0.1)
                 
             except Exception as e:
-                logger.error(f"Erro: {e}")
+                logger.error(f"Erro carregando coleções página {page}: {e}")
                 break
+    
+    logger.info(f"✅ Total: {len(all_collections)} coleções carregadas com sucesso")
+    
+    # IMPORTANTE: Atualizar o products_count baseado nos produtos carregados
+    # Isso será feito depois quando os produtos forem carregados
     
     return {"success": True, "total": len(all_collections), "collections": all_collections}
 
