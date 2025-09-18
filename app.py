@@ -146,6 +146,405 @@ async def process_task(task: TaskRequest, background_tasks: BackgroundTasks):
         "mode": "background_processing"
     }
 
+# ==================== PROCESSAMENTO DE VARIANTES VIA CSV ====================
+
+@app.post("/process-variants-csv")
+async def process_variants_csv(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Processar variantes usando CSV - compatível com o frontend de Variants"""
+    
+    task_id = data.get("id") or f"variant_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    logger.info(f"📋 Nova tarefa de variantes {task_id}")
+    
+    # Extrair dados do payload
+    csv_content = data.get("csvContent", "")
+    product_ids = data.get("productIds", [])
+    submit_data = data.get("submitData", {})
+    store_name = data.get("storeName", "")
+    access_token = data.get("accessToken", "")
+    
+    if not csv_content:
+        raise HTTPException(status_code=400, detail="CSV content não fornecido")
+    
+    # Salvar tarefa na memória
+    tasks_db[task_id] = {
+        "id": task_id,
+        "name": f"Gerenciamento de Variantes - {len(product_ids)} produtos",
+        "status": "processing",
+        "task_type": "variant_management",
+        "progress": {
+            "processed": 0,
+            "total": len(product_ids),
+            "successful": 0,
+            "failed": 0,
+            "percentage": 0,
+            "current_product": None
+        },
+        "started_at": get_brazil_time_str(),
+        "updated_at": get_brazil_time_str(),
+        "config": {
+            "productIds": product_ids,
+            "submitData": submit_data,
+            "storeName": store_name,
+            "hasCSV": True
+        },
+        "results": []
+    }
+    
+    logger.info(f"✅ Tarefa de variantes {task_id} iniciada")
+    
+    # Processar em background
+    background_tasks.add_task(
+        process_variants_background,
+        task_id,
+        csv_content,
+        product_ids,
+        submit_data,
+        store_name,
+        access_token
+    )
+    
+    return {
+        "success": True,
+        "message": f"Processamento de variantes iniciado para {len(product_ids)} produtos",
+        "taskId": task_id,
+        "mode": "csv_processing"
+    }
+
+async def process_variants_background(
+    task_id: str,
+    csv_content: str,
+    product_ids: List[str],
+    submit_data: Dict,
+    store_name: str,
+    access_token: str
+):
+    """Processar variantes em background usando CSV"""
+    
+    logger.info(f"🚀 INICIANDO PROCESSAMENTO DE VARIANTES: {task_id}")
+    logger.info(f"📦 Produtos para processar: {len(product_ids)}")
+    
+    # Limpar nome da loja
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    api_version = '2024-04'
+    
+    processed = 0
+    successful = 0
+    failed = 0
+    results = []
+    total = len(product_ids)
+    
+    try:
+        # Para cada produto, aplicar as mudanças via API
+        for i, product_id in enumerate(product_ids):
+            # Verificar se a tarefa foi pausada ou cancelada
+            if task_id not in tasks_db:
+                logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
+                return
+            
+            current_status = tasks_db[task_id].get("status")
+            
+            if current_status in ["paused", "cancelled"]:
+                logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
+                return
+            
+            try:
+                logger.info(f"📦 Processando variantes do produto {product_id} ({i+1}/{len(product_ids)})")
+                
+                # Atualizar progresso
+                if task_id in tasks_db:
+                    tasks_db[task_id]["progress"]["current_product"] = f"Produto {product_id}"
+                    tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                
+                # URL da API
+                product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
+                headers = {
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json"
+                }
+                
+                # Buscar produto atual
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    get_response = await client.get(product_url, headers=headers)
+                    
+                    if get_response.status_code != 200:
+                        raise Exception(f"Erro ao buscar produto: {get_response.status_code}")
+                    
+                    product_data = get_response.json()
+                    current_product = product_data.get("product", {})
+                    
+                    # Preparar payload de atualização baseado no submitData
+                    update_payload = {
+                        "product": {
+                            "id": int(product_id)
+                        }
+                    }
+                    
+                    # Aplicar mudanças de título de opções
+                    if submit_data.get("titleChanges"):
+                        options = []
+                        for i, option in enumerate(current_product.get("options", [])):
+                            new_name = submit_data["titleChanges"].get(option["name"], option["name"])
+                            options.append({
+                                "id": option.get("id"),
+                                "name": new_name,
+                                "position": option.get("position", i + 1),
+                                "values": option.get("values", [])
+                            })
+                        update_payload["product"]["options"] = options
+                    
+                    # Aplicar mudanças de variantes
+                    if submit_data.get("valueChanges") or submit_data.get("newValues"):
+                        variants = []
+                        
+                        for variant in current_product.get("variants", []):
+                            updated_variant = {
+                                "id": variant.get("id"),
+                                "price": variant.get("price"),
+                                "compare_at_price": variant.get("compare_at_price"),
+                                "sku": variant.get("sku"),
+                                "inventory_quantity": variant.get("inventory_quantity"),
+                                "option1": variant.get("option1"),
+                                "option2": variant.get("option2"),
+                                "option3": variant.get("option3")
+                            }
+                            
+                            # Aplicar mudanças de valores
+                            for option_field in ["option1", "option2", "option3"]:
+                                if variant.get(option_field):
+                                    for option_name, changes in submit_data.get("valueChanges", {}).items():
+                                        if variant[option_field] in changes:
+                                            change = changes[variant[option_field]]
+                                            updated_variant[option_field] = change.get("newName", variant[option_field])
+                                            
+                                            # Ajustar preço se houver mudança
+                                            if "extraPrice" in change:
+                                                current_price = float(variant.get("price", 0))
+                                                extra_price = float(change["extraPrice"])
+                                                updated_variant["price"] = str(current_price + extra_price)
+                            
+                            variants.append(updated_variant)
+                        
+                        # Adicionar novas variantes se houver
+                        if submit_data.get("newValues"):
+                            # Lógica para criar novas variantes baseada nos novos valores
+                            # Isso seria mais complexo e dependeria da estrutura exata
+                            pass
+                        
+                        update_payload["product"]["variants"] = variants
+                    
+                    # Enviar atualização
+                    update_response = await client.put(
+                        product_url,
+                        headers=headers,
+                        json=update_payload
+                    )
+                    
+                    if update_response.status_code == 200:
+                        successful += 1
+                        result = {
+                            "product_id": product_id,
+                            "status": "success",
+                            "message": "Variantes atualizadas com sucesso"
+                        }
+                        logger.info(f"✅ Produto {product_id} atualizado")
+                    else:
+                        failed += 1
+                        error_text = await update_response.text()
+                        result = {
+                            "product_id": product_id,
+                            "status": "failed",
+                            "message": f"Erro: {error_text}"
+                        }
+                        logger.error(f"❌ Erro no produto {product_id}")
+                
+            except Exception as e:
+                failed += 1
+                result = {
+                    "product_id": product_id,
+                    "status": "failed",
+                    "message": str(e)
+                }
+                logger.error(f"❌ Exceção: {str(e)}")
+            
+            # Atualizar progresso
+            results.append(result)
+            processed += 1
+            percentage = round((processed / total) * 100)
+            
+            # Salvar na memória
+            if task_id in tasks_db:
+                tasks_db[task_id]["progress"] = {
+                    "processed": processed,
+                    "total": total,
+                    "successful": successful,
+                    "failed": failed,
+                    "percentage": percentage,
+                    "current_product": None if i == len(product_ids)-1 else f"Produto {product_id}"
+                }
+                tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                tasks_db[task_id]["results"] = results[-50:]
+            
+            # Verificar novamente se foi pausado/cancelado
+            if task_id in tasks_db:
+                if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
+                    logger.info(f"🛑 Parando após processar {product_id}")
+                    return
+            
+            # Rate limiting
+            await asyncio.sleep(0.5)
+    
+    except Exception as e:
+        logger.error(f"❌ Erro geral no processamento de variantes: {str(e)}")
+    
+    # Finalizar
+    final_status = "completed" if failed == 0 else "completed_with_errors"
+    
+    if task_id in tasks_db:
+        tasks_db[task_id]["status"] = final_status
+        tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+        tasks_db[task_id]["results"] = results
+        tasks_db[task_id]["progress"]["current_product"] = None
+        
+        logger.info(f"🏁 PROCESSAMENTO DE VARIANTES FINALIZADO: ✅ {successful} | ❌ {failed}")
+
+# Função auxiliar para processar variantes de um único produto
+async def process_single_product_variants(
+    task_id: str,
+    product_id: str,
+    submit_data: Dict,
+    store_name: str,
+    access_token: str
+):
+    """Processar variantes de um único produto"""
+    
+    logger.info(f"🚀 PROCESSANDO VARIANTES DO PRODUTO: {product_id}")
+    
+    # Limpar nome da loja
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    api_version = '2024-04'
+    
+    try:
+        # Atualizar status da tarefa
+        if task_id in tasks_db:
+            tasks_db[task_id]["progress"]["current_product"] = f"Produto {product_id}"
+            tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+        
+        # URL da API
+        product_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
+        headers = {
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Buscar produto atual
+            get_response = await client.get(product_url, headers=headers)
+            
+            if get_response.status_code != 200:
+                raise Exception(f"Erro ao buscar produto: {get_response.status_code}")
+            
+            product_data = get_response.json()
+            current_product = product_data.get("product", {})
+            
+            # Preparar payload de atualização
+            update_payload = {
+                "product": {
+                    "id": int(product_id),
+                    "options": [],
+                    "variants": []
+                }
+            }
+            
+            # Aplicar mudanças de título de opções
+            if submit_data.get("titleChanges"):
+                for i, option in enumerate(current_product.get("options", [])):
+                    new_name = submit_data["titleChanges"].get(option["name"], option["name"])
+                    update_payload["product"]["options"].append({
+                        "id": option.get("id"),
+                        "name": new_name,
+                        "position": option.get("position", i + 1),
+                        "values": option.get("values", [])
+                    })
+            else:
+                update_payload["product"]["options"] = current_product.get("options", [])
+            
+            # Aplicar mudanças nas variantes
+            for variant in current_product.get("variants", []):
+                updated_variant = {
+                    "id": variant.get("id"),
+                    "price": variant.get("price"),
+                    "compare_at_price": variant.get("compare_at_price"),
+                    "sku": variant.get("sku"),
+                    "inventory_quantity": variant.get("inventory_quantity"),
+                    "option1": variant.get("option1"),
+                    "option2": variant.get("option2"),
+                    "option3": variant.get("option3")
+                }
+                
+                # Aplicar mudanças de valores e preços
+                if submit_data.get("valueChanges"):
+                    for option_name, changes in submit_data["valueChanges"].items():
+                        for option_field in ["option1", "option2", "option3"]:
+                            if variant.get(option_field) in changes:
+                                change = changes[variant[option_field]]
+                                updated_variant[option_field] = change.get("newName", variant[option_field])
+                                
+                                # Ajustar preço se houver mudança
+                                if "extraPrice" in change:
+                                    current_price = float(variant.get("price", 0))
+                                    original_extra = float(change.get("originalExtraPrice", 0))
+                                    new_extra = float(change["extraPrice"])
+                                    base_price = current_price - original_extra
+                                    updated_variant["price"] = str(base_price + new_extra)
+                                    
+                                    # Atualizar compare_at_price se existir
+                                    if variant.get("compare_at_price"):
+                                        compare_price = float(variant["compare_at_price"])
+                                        base_compare = compare_price - original_extra
+                                        updated_variant["compare_at_price"] = str(base_compare + new_extra)
+                
+                update_payload["product"]["variants"].append(updated_variant)
+            
+            # Adicionar novas variantes se houver
+            if submit_data.get("newValues"):
+                # Esta parte seria mais complexa e dependeria de como as novas variantes são estruturadas
+                logger.info(f"📝 Novas variantes a serem criadas: {submit_data['newValues']}")
+            
+            # Enviar atualização
+            update_response = await client.put(
+                product_url,
+                headers=headers,
+                json=update_payload
+            )
+            
+            if update_response.status_code == 200:
+                if task_id in tasks_db:
+                    tasks_db[task_id]["status"] = "completed"
+                    tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+                    tasks_db[task_id]["progress"]["processed"] = 1
+                    tasks_db[task_id]["progress"]["successful"] = 1
+                    tasks_db[task_id]["progress"]["percentage"] = 100
+                logger.info(f"✅ Produto {product_id} atualizado com sucesso")
+            else:
+                error_text = await update_response.text()
+                if task_id in tasks_db:
+                    tasks_db[task_id]["status"] = "failed"
+                    tasks_db[task_id]["error_message"] = error_text
+                    tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+                    tasks_db[task_id]["progress"]["processed"] = 1
+                    tasks_db[task_id]["progress"]["failed"] = 1
+                logger.error(f"❌ Erro ao atualizar produto: {error_text}")
+    
+    except Exception as e:
+        logger.error(f"❌ Exceção no processamento de variantes: {str(e)}")
+        if task_id in tasks_db:
+            tasks_db[task_id]["status"] = "failed"
+            tasks_db[task_id]["error_message"] = str(e)
+            tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+            tasks_db[task_id]["progress"]["processed"] = 1
+            tasks_db[task_id]["progress"]["failed"] = 1
+
 # ==================== AGENDAMENTO DE TAREFAS ====================
 
 @app.post("/api/tasks/schedule")
@@ -255,6 +654,142 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
         # LOG ADICIONAL
         diff = (scheduled_time_naive - now).total_seconds()
         logger.info(f"⏱️ Tarefa será executada em {diff:.0f} segundos ({diff/60:.1f} minutos)")
+    
+    return {
+        "success": True,
+        "taskId": task_id,
+        "task": task
+    }
+
+# ==================== AGENDAMENTO DE VARIANTES ====================
+
+@app.post("/api/tasks/schedule-variants")
+async def schedule_variants_task(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Agendar tarefa de variantes - endpoint específico"""
+    
+    task_id = data.get("id") or f"scheduled_variant_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    # LOG PARA DEBUG
+    logger.info(f"📋 Recebendo agendamento de variantes: {data.get('name')}")
+    logger.info(f"⏰ Para executar em: {data.get('scheduled_for')}")
+    
+    scheduled_for = data.get("scheduled_for", get_brazil_time_str())
+    
+    # CORREÇÃO DE TIMEZONE - Assumir que o horário vem em UTC se tiver 'Z'
+    if scheduled_for.endswith('Z'):
+        scheduled_for_clean = scheduled_for[:-1]
+        scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+        scheduled_time_local = scheduled_time.astimezone()
+        scheduled_time_naive = scheduled_time_local.replace(tzinfo=None)
+    else:
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_for)
+            if scheduled_time.tzinfo is not None:
+                scheduled_time_naive = scheduled_time.replace(tzinfo=None)
+            else:
+                scheduled_time_naive = scheduled_time
+        except:
+            scheduled_time_naive = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+    
+    now = datetime.now()
+    
+    # LOG do horário convertido
+    logger.info(f"📅 Horário original: {scheduled_for}")
+    logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
+    logger.info(f"📅 Horário atual do servidor: {now}")
+    
+    # Se já passou, executar imediatamente
+    if scheduled_time_naive <= now:
+        logger.info(f"📅 Tarefa de variantes {task_id} agendada para horário passado, executando imediatamente!")
+        
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Gerenciamento de Variantes"),
+            "task_type": "variant_management",
+            "status": "processing",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "started_at": get_brazil_time_str(),
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": data.get("config", {}),
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0
+            }
+        }
+        
+        tasks_db[task_id] = task
+        
+        # Processar imediatamente
+        config = task.get("config", {})
+        
+        # Verificar se tem CSV ou submitData para processamento de variantes
+        if config.get("csvContent"):
+            # Processar com CSV
+            background_tasks.add_task(
+                process_variants_background,
+                task_id,
+                config.get("csvContent", ""),
+                config.get("productIds", []),
+                config.get("submitData", {}),
+                config.get("storeName", ""),
+                config.get("accessToken", "")
+            )
+        elif config.get("submitData") and config.get("productId"):
+            # Processar diretamente com submitData (para um produto)
+            background_tasks.add_task(
+                process_single_product_variants,
+                task_id,
+                config.get("productId"),
+                config.get("submitData", {}),
+                config.get("storeName", ""),
+                config.get("accessToken", "")
+            )
+        else:
+            logger.error(f"❌ Configuração inválida para tarefa de variantes {task_id}")
+            tasks_db[task_id]["status"] = "failed"
+            tasks_db[task_id]["error_message"] = "Configuração inválida: faltam dados necessários"
+            return {
+                "success": False,
+                "message": "Configuração inválida para tarefa de variantes"
+            }
+        
+        logger.info(f"▶️ Tarefa de variantes {task_id} iniciada imediatamente")
+    else:
+        # Agendar normalmente
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Gerenciamento de Variantes"),
+            "task_type": "variant_management",
+            "status": "scheduled",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": data.get("config", {}),
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0
+            }
+        }
+        
+        tasks_db[task_id] = task
+        logger.info(f"📅 Tarefa de variantes {task_id} agendada para {scheduled_time_naive} (horário local)")
+        
+        # LOG ADICIONAL
+        diff = (scheduled_time_naive - now).total_seconds()
+        logger.info(f"⏱️ Tarefa de variantes será executada em {diff:.0f} segundos ({diff/60:.1f} minutos)")
     
     return {
         "success": True,
@@ -893,16 +1428,41 @@ async def check_and_execute_scheduled_tasks():
                         
                         config = task.get("config", {})
                         
-                        # Criar task para processar
-                        asyncio.create_task(
-                            process_products_background(
-                                task_id,
-                                config.get("productIds", []),
-                                config.get("operations", []),
-                                config.get("storeName", ""),
-                                config.get("accessToken", "")
+                        # Verificar o tipo de tarefa
+                        if task.get("task_type") == "variant_management":
+                            # Processar variantes
+                            if config.get("csvContent"):
+                                asyncio.create_task(
+                                    process_variants_background(
+                                        task_id,
+                                        config.get("csvContent", ""),
+                                        config.get("productIds", []),
+                                        config.get("submitData", {}),
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                            elif config.get("submitData") and config.get("productId"):
+                                asyncio.create_task(
+                                    process_single_product_variants(
+                                        task_id,
+                                        config.get("productId"),
+                                        config.get("submitData", {}),
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                        else:
+                            # Processar edição em massa normal
+                            asyncio.create_task(
+                                process_products_background(
+                                    task_id,
+                                    config.get("productIds", []),
+                                    config.get("operations", []),
+                                    config.get("storeName", ""),
+                                    config.get("accessToken", "")
+                                )
                             )
-                        )
             
             # Verificar a cada 20 segundos
             await asyncio.sleep(20)
