@@ -960,7 +960,7 @@ async def process_variants_background(
                                 "option3": variant.get("option3")
                             }
                             
-                            # CORREÇÃO: Aplicar mudanças de valores e preços corretamente
+                            # ✅ CORREÇÃO: Aplicar mudanças de valores e preços corretamente
                             if submit_data.get("valueChanges"):
                                 for option_name, changes in submit_data["valueChanges"].items():
                                     # Verificar cada campo de opção da variante
@@ -974,45 +974,32 @@ async def process_variants_background(
                                             if "newName" in change:
                                                 updated_variant[option_field] = change["newName"]
                                             
-                            # CORREÇÃO: Aplicar mudanças de valores e preços corretamente
-                            if submit_data.get("valueChanges"):
-                                for option_name, changes in submit_data["valueChanges"].items():
-                                    # Verificar cada campo de opção da variante
-                                    for option_field in ["option1", "option2", "option3"]:
-                                        current_option_value = variant.get(option_field)
-                                        
-                                        if current_option_value and current_option_value in changes:
-                                            change = changes[current_option_value]
-                                            
-                                            # Atualizar nome do valor se mudou
-                                            if "newName" in change:
-                                                updated_variant[option_field] = change["newName"]
-                                            
-                                            # CORREÇÃO PRINCIPAL: Calcular preço corretamente
+                                            # ✅ CORREÇÃO PRINCIPAL: Calcular preço corretamente
                                             if "extraPrice" in change:
                                                 new_extra = float(change["extraPrice"])
+                                                original_extra = float(change.get("originalExtraPrice", 0))
                                                 
-                                                # Se temos o basePrice, usar ele diretamente ✅ MODIFICADO
-                                                if "basePrice" in change:
-                                                    base_price = float(change["basePrice"])
-                                                    new_price = base_price + new_extra
-                                                else:
-                                                    # Fallback para o método antigo
-                                                    current_price = float(variant.get("price", 0))
-                                                    original_extra = float(change.get("originalExtraPrice", 0))
-                                                    base_price = current_price - original_extra
-                                                    new_price = base_price + new_extra
+                                                # Calcular o preço base (sem o extra original)
+                                                current_price = float(variant.get("price", 0))
+                                                base_price = current_price - original_extra
                                                 
+                                                # Aplicar o NOVO extra (não somar, mas substituir)
+                                                new_price = base_price + new_extra
                                                 updated_variant["price"] = str(new_price)
                                                 
                                                 # Atualizar compare_at_price se existir
                                                 if variant.get("compare_at_price"):
-                                                    # ✅ CORREÇÃO: Calcular compare_at_price INDEPENDENTEMENTE
                                                     compare_price = float(variant["compare_at_price"])
-                                                    original_extra = float(change.get("originalExtraPrice", 0))
                                                     base_compare = compare_price - original_extra
                                                     new_compare = base_compare + new_extra
                                                     updated_variant["compare_at_price"] = str(new_compare)
+                                                
+                                                logger.info(f"💰 Atualizando preço da variante {variant.get('id')}:")
+                                                logger.info(f"   Preço atual: R$ {current_price}")
+                                                logger.info(f"   Extra original: R$ {original_extra}")
+                                                logger.info(f"   Preço base: R$ {base_price}")
+                                                logger.info(f"   Novo extra: R$ {new_extra}")
+                                                logger.info(f"   Novo preço: R$ {new_price}")
                             
                             variants.append(updated_variant)
                         
@@ -1177,7 +1164,7 @@ async def process_single_product_variants(
                     "option3": variant.get("option3")
                 }
                 
-                # Aplicar mudanças de valores e preços
+                # ✅ CORREÇÃO: Aplicar mudanças de valores e preços
                 if submit_data.get("valueChanges"):
                     for option_name, changes in submit_data["valueChanges"].items():
                         for option_field in ["option1", "option2", "option3"]:
@@ -1185,12 +1172,16 @@ async def process_single_product_variants(
                                 change = changes[variant[option_field]]
                                 updated_variant[option_field] = change.get("newName", variant[option_field])
                                 
-                                # Ajustar preço se houver mudança
+                                # ✅ CORREÇÃO: Ajustar preço se houver mudança
                                 if "extraPrice" in change:
-                                    current_price = float(variant.get("price", 0))
-                                    original_extra = float(change.get("originalExtraPrice", 0))
                                     new_extra = float(change["extraPrice"])
+                                    original_extra = float(change.get("originalExtraPrice", 0))
+                                    current_price = float(variant.get("price", 0))
+                                    
+                                    # Calcular o preço base removendo o extra original
                                     base_price = current_price - original_extra
+                                    
+                                    # Aplicar o NOVO extra (substituir, não somar)
                                     updated_variant["price"] = str(base_price + new_extra)
                                     
                                     # Atualizar compare_at_price se existir
@@ -1198,6 +1189,8 @@ async def process_single_product_variants(
                                         compare_price = float(variant["compare_at_price"])
                                         base_compare = compare_price - original_extra
                                         updated_variant["compare_at_price"] = str(base_compare + new_extra)
+                                    
+                                    logger.info(f"💰 Preço corrigido: Base R$ {base_price} + Extra R$ {new_extra} = R$ {base_price + new_extra}")
                 
                 update_payload["product"]["variants"].append(updated_variant)
             
