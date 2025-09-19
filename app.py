@@ -251,6 +251,337 @@ async def export_images_csv(data: Dict[str, Any]):
             'message': f"Erro ao exportar: {str(e)}"
         }
 
+# ==================== ENDPOINTS DE ALT-TEXT COM BACKGROUND E AGENDAMENTO ====================
+@app.post("/process-alt-text")
+async def process_alt_text_task(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Processar alt-text em background"""
+    
+    task_id = data.get("id") or f"alt_text_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    logger.info(f"📋 Nova tarefa de alt-text {task_id}")
+    
+    csv_data = data.get("csvData", [])
+    store_name = data.get("storeName", "")
+    access_token = data.get("accessToken", "")
+    
+    if not csv_data or not store_name or not access_token:
+        raise HTTPException(status_code=400, detail="Dados incompletos para processamento")
+    
+    # Salvar tarefa na memória
+    tasks_db[task_id] = {
+        "id": task_id,
+        "name": f"Alt-Text SEO - {len(csv_data)} imagens",
+        "status": "processing",
+        "task_type": "alt_text",
+        "progress": {
+            "processed": 0,
+            "total": len(csv_data),
+            "successful": 0,
+            "failed": 0,
+            "unchanged": 0,
+            "percentage": 0,
+            "current_image": None
+        },
+        "started_at": get_brazil_time_str(),
+        "updated_at": get_brazil_time_str(),
+        "config": {
+            "csvData": csv_data,
+            "storeName": store_name,
+            "accessToken": access_token,
+            "itemCount": len(csv_data)
+        },
+        "results": []
+    }
+    
+    logger.info(f"✅ Tarefa de alt-text {task_id} iniciada")
+    
+    # Processar em background
+    background_tasks.add_task(
+        process_alt_text_background,
+        task_id,
+        csv_data,
+        store_name,
+        access_token
+    )
+    
+    return {
+        "success": True,
+        "message": f"Processamento de alt-text iniciado para {len(csv_data)} imagens",
+        "taskId": task_id,
+        "estimatedTime": f"{len(csv_data) * 0.2:.1f} segundos",
+        "mode": "background_processing"
+    }
+
+@app.post("/api/tasks/schedule-alt-text")
+async def schedule_alt_text_task(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Agendar tarefa de alt-text"""
+    
+    task_id = data.get("id") or f"scheduled_alt_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    logger.info(f"📋 Recebendo agendamento de alt-text: {data.get('name')}")
+    logger.info(f"⏰ Para executar em: {data.get('scheduled_for')}")
+    
+    scheduled_for = data.get("scheduled_for", get_brazil_time_str())
+    
+    # Processar timezone
+    if scheduled_for.endswith('Z'):
+        scheduled_for_clean = scheduled_for[:-1]
+        scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+        scheduled_time_local = scheduled_time.astimezone()
+        scheduled_time_naive = scheduled_time_local.replace(tzinfo=None)
+    else:
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_for)
+            if scheduled_time.tzinfo is not None:
+                scheduled_time_naive = scheduled_time.replace(tzinfo=None)
+            else:
+                scheduled_time_naive = scheduled_time
+        except:
+            scheduled_time_naive = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+    
+    now = datetime.now()
+    
+    logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
+    logger.info(f"📅 Horário atual do servidor: {now}")
+    
+    # Se já passou, executar imediatamente
+    if scheduled_time_naive <= now:
+        logger.info(f"📅 Tarefa de alt-text {task_id} agendada para horário passado, executando imediatamente!")
+        
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Alt-Text SEO"),
+            "task_type": "alt_text",
+            "status": "processing",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "started_at": get_brazil_time_str(),
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": data.get("config", {}),
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "unchanged": 0,
+                "percentage": 0
+            }
+        }
+        
+        tasks_db[task_id] = task
+        
+        # Processar imediatamente
+        config = task.get("config", {})
+        background_tasks.add_task(
+            process_alt_text_background,
+            task_id,
+            config.get("csvData", []),
+            config.get("storeName", ""),
+            config.get("accessToken", "")
+        )
+        
+        logger.info(f"▶️ Tarefa de alt-text {task_id} iniciada imediatamente")
+    else:
+        # Agendar normalmente
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Alt-Text SEO"),
+            "task_type": "alt_text",
+            "status": "scheduled",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": data.get("config", {}),
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "unchanged": 0,
+                "percentage": 0
+            }
+        }
+        
+        tasks_db[task_id] = task
+        logger.info(f"📅 Tarefa de alt-text {task_id} agendada para {scheduled_time_naive}")
+        
+        diff = (scheduled_time_naive - now).total_seconds()
+        logger.info(f"⏱️ Tarefa será executada em {diff:.0f} segundos ({diff/60:.1f} minutos)")
+    
+    return {
+        "success": True,
+        "taskId": task_id,
+        "task": task
+    }
+
+async def process_alt_text_background(
+    task_id: str,
+    csv_data: List[Dict],
+    store_name: str,
+    access_token: str,
+    is_resume: bool = False
+):
+    """Processar alt-text em background"""
+    
+    if not is_resume:
+        logger.info(f"🚀 INICIANDO PROCESSAMENTO DE ALT-TEXT: {task_id}")
+    else:
+        logger.info(f"▶️ RETOMANDO PROCESSAMENTO DE ALT-TEXT: {task_id}")
+    
+    logger.info(f"📸 Imagens para processar: {len(csv_data)}")
+    
+    clean_store = store_name.replace('.myshopify.com', '')
+    
+    # Se for retomada, pegar progresso existente
+    if is_resume and task_id in tasks_db:
+        task = tasks_db[task_id]
+        processed = task["progress"]["processed"]
+        successful = task["progress"]["successful"]
+        failed = task["progress"]["failed"]
+        unchanged = task["progress"].get("unchanged", 0)
+        results = task.get("results", [])
+        total = task["progress"]["total"]
+    else:
+        processed = 0
+        successful = 0
+        failed = 0
+        unchanged = 0
+        results = []
+        total = len(csv_data)
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for i, image_data in enumerate(csv_data[processed:], start=processed):
+            # Verificar se a tarefa foi pausada ou cancelada
+            if task_id not in tasks_db:
+                logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
+                return
+            
+            current_status = tasks_db[task_id].get("status")
+            
+            if current_status in ["paused", "cancelled"]:
+                logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
+                return
+            
+            try:
+                # Renderizar template
+                final_alt_text = image_data.get('template_used', '')
+                
+                # Substituir variáveis
+                replacements = {
+                    r'\{\{\s*product\.title\s*\}\}': image_data.get('product_title', ''),
+                    r'\{\{\s*product\.handle\s*\}\}': image_data.get('product_handle', ''),
+                    r'\{\{\s*product\.vendor\s*\}\}': image_data.get('product_vendor', ''),
+                    r'\{\{\s*product\.type\s*\}\}': image_data.get('product_type', ''),
+                    r'\{\{\s*image\.position\s*\}\}': str(image_data.get('image_position', '1')),
+                    r'\{\{\s*variant\.name1\s*\}\}': image_data.get('variant_name1', ''),
+                    r'\{\{\s*variant\.name2\s*\}\}': image_data.get('variant_name2', ''),
+                    r'\{\{\s*variant\.name3\s*\}\}': image_data.get('variant_name3', ''),
+                    r'\{\{\s*variant\.value1\s*\}\}': image_data.get('variant_value1', ''),
+                    r'\{\{\s*variant\.value2\s*\}\}': image_data.get('variant_value2', ''),
+                    r'\{\{\s*variant\.value3\s*\}\}': image_data.get('variant_value3', ''),
+                }
+                
+                for pattern, replacement in replacements.items():
+                    final_alt_text = re.sub(pattern, replacement, final_alt_text)
+                
+                final_alt_text = ' '.join(final_alt_text.split()).strip()
+                
+                # Verificar se precisa de atualização
+                if image_data.get('current_alt_text') == final_alt_text:
+                    logger.info(f"ℹ️ Alt-text já correto para imagem {image_data.get('image_id')}")
+                    unchanged += 1
+                    processed += 1
+                    continue
+                
+                # Atualizar via API Shopify
+                shopify_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/products/{image_data.get('product_id')}/images/{image_data.get('image_id')}.json"
+                
+                headers = {
+                    'X-Shopify-Access-Token': access_token,
+                    'Content-Type': 'application/json'
+                }
+                
+                update_data = {
+                    'image': {
+                        'id': int(image_data.get('image_id')),
+                        'alt': final_alt_text
+                    }
+                }
+                
+                response = await client.put(shopify_url, json=update_data, headers=headers)
+                
+                if response.status_code == 200:
+                    logger.info(f"✅ Alt-text atualizado: imagem {image_data.get('image_id')}")
+                    successful += 1
+                    results.append({
+                        'image_id': image_data.get('image_id'),
+                        'product_id': image_data.get('product_id'),
+                        'status': 'success',
+                        'old_alt': image_data.get('current_alt_text'),
+                        'new_alt': final_alt_text
+                    })
+                else:
+                    error_text = await response.text()
+                    logger.error(f"❌ Erro Shopify: {error_text}")
+                    failed += 1
+                    results.append({
+                        'image_id': image_data.get('image_id'),
+                        'status': 'failed',
+                        'error': f"HTTP {response.status_code}: {error_text}"
+                    })
+                    
+            except Exception as e:
+                logger.error(f"❌ Erro ao processar imagem: {str(e)}")
+                failed += 1
+                results.append({
+                    'image_id': image_data.get('image_id'),
+                    'status': 'failed',
+                    'error': str(e)
+                })
+            
+            # Atualizar progresso
+            processed += 1
+            percentage = round((processed / total) * 100)
+            
+            if task_id in tasks_db:
+                tasks_db[task_id]["progress"] = {
+                    "processed": processed,
+                    "total": total,
+                    "successful": successful,
+                    "failed": failed,
+                    "unchanged": unchanged,
+                    "percentage": percentage,
+                    "current_image": f"Imagem {image_data.get('image_id')}" if i < len(csv_data)-1 else None
+                }
+                tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                tasks_db[task_id]["results"] = results[-50:]
+            
+            # Verificar novamente se foi pausado/cancelado
+            if task_id in tasks_db:
+                if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
+                    logger.info(f"🛑 Parando após processar imagem {image_data.get('image_id')}")
+                    return
+            
+            # Rate limiting
+            await asyncio.sleep(0.2)
+    
+    # Finalizar
+    final_status = "completed" if failed == 0 else "completed_with_errors"
+    
+    if task_id in tasks_db:
+        tasks_db[task_id]["status"] = final_status
+        tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+        tasks_db[task_id]["results"] = results
+        tasks_db[task_id]["progress"]["current_image"] = None
+        
+        logger.info(f"🏁 ALT-TEXT FINALIZADO: ✅ {successful} | ❌ {failed} | ⚪ {unchanged}")
+
 # ==================== ENDPOINTS PRINCIPAIS ====================
 
 @app.get("/")
