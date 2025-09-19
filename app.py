@@ -10,6 +10,9 @@ from datetime import datetime, timezone, timedelta
 import pytz
 import uvicorn
 import logging
+import re
+import csv
+import io
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +53,200 @@ class TaskRequest(BaseModel):
     taskType: Optional[str] = "bulk_edit"
     config: Optional[Dict[str, Any]] = {}
     workerUrl: Optional[str] = None
+
+# ==================== ENDPOINTS DE ALT-TEXT E IMAGENS (CSV) ====================
+@app.route('/api/images/import-csv', methods=['POST'])
+def import_images_csv():
+    """Importa alt-text de um arquivo CSV"""
+    try:
+        data = request.json
+        csv_data = data.get('csvData')
+        store_name = data.get('storeName')
+        access_token = data.get('accessToken')
+        dry_run = data.get('dryRun', False)
+        
+        if not csv_data or not store_name or not access_token:
+            return jsonify({
+                'success': False,
+                'message': 'Dados ou conexão não fornecidos'
+            }), 400
+        
+        results = []
+        successful = 0
+        failed = 0
+        unchanged = 0
+        
+        clean_store = store_name.replace('.myshopify.com', '')
+        
+        for image_data in csv_data:
+            try:
+                # Renderizar template com dados completos
+                final_alt_text = image_data.get('template_used', '')
+                
+                # Substituir variáveis do produto
+                replacements = {
+                    r'\{\{\s*product\.title\s*\}\}': image_data.get('product_title', ''),
+                    r'\{\{\s*product\.handle\s*\}\}': image_data.get('product_handle', ''),
+                    r'\{\{\s*product\.vendor\s*\}\}': image_data.get('product_vendor', ''),
+                    r'\{\{\s*product\.type\s*\}\}': image_data.get('product_type', ''),
+                    r'\{\{\s*image\.position\s*\}\}': str(image_data.get('image_position', '1')),
+                    r'\{\{\s*variant\.name1\s*\}\}': image_data.get('variant_name1', ''),
+                    r'\{\{\s*variant\.name2\s*\}\}': image_data.get('variant_name2', ''),
+                    r'\{\{\s*variant\.name3\s*\}\}': image_data.get('variant_name3', ''),
+                    r'\{\{\s*variant\.value1\s*\}\}': image_data.get('variant_value1', ''),
+                    r'\{\{\s*variant\.value2\s*\}\}': image_data.get('variant_value2', ''),
+                    r'\{\{\s*variant\.value3\s*\}\}': image_data.get('variant_value3', ''),
+                }
+                
+                for pattern, replacement in replacements.items():
+                    final_alt_text = re.sub(pattern, replacement, final_alt_text)
+                
+                # Limpar texto final
+                final_alt_text = ' '.join(final_alt_text.split()).strip()
+                
+                # Verificar se precisa de atualização
+                if image_data.get('current_alt_text') == final_alt_text:
+                    print(f"ℹ️ Alt-text já correto para imagem {image_data.get('image_id')}")
+                    unchanged += 1
+                    continue
+                
+                if dry_run:
+                    print(f"🧪 DRY RUN: Atualizaria imagem {image_data.get('image_id')} com: '{final_alt_text}'")
+                    successful += 1
+                    continue
+                
+                # Atualizar via API Shopify
+                shopify_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/products/{image_data.get('product_id')}/images/{image_data.get('image_id')}.json"
+                
+                headers = {
+                    'X-Shopify-Access-Token': access_token,
+                    'Content-Type': 'application/json'
+                }
+                
+                update_data = {
+                    'image': {
+                        'id': int(image_data.get('image_id')),
+                        'alt': final_alt_text
+                    }
+                }
+                
+                response = requests.put(shopify_url, json=update_data, headers=headers)
+                
+                if response.ok:
+                    print(f"✅ Alt-text atualizado: imagem {image_data.get('image_id')} → '{final_alt_text}'")
+                    successful += 1
+                    results.append({
+                        'image_id': image_data.get('image_id'),
+                        'product_id': image_data.get('product_id'),
+                        'status': 'success',
+                        'old_alt': image_data.get('current_alt_text'),
+                        'new_alt': final_alt_text
+                    })
+                else:
+                    print(f"❌ Erro Shopify para imagem {image_data.get('image_id')}: {response.text}")
+                    failed += 1
+                    results.append({
+                        'image_id': image_data.get('image_id'),
+                        'status': 'failed',
+                        'error': f"HTTP {response.status_code}: {response.text}"
+                    })
+                    
+            except Exception as e:
+                print(f"❌ Erro ao processar imagem {image_data.get('image_id')}: {str(e)}")
+                failed += 1
+                results.append({
+                    'image_id': image_data.get('image_id'),
+                    'status': 'failed',
+                    'error': str(e)
+                })
+            
+            # Pausa entre requests
+            time.sleep(0.2)
+        
+        stats = {
+            'total': len(csv_data),
+            'successful': successful,
+            'failed': failed,
+            'unchanged': unchanged,
+            'processed': successful + failed + unchanged
+        }
+        
+        print(f"🏁 Processamento concluído: {stats}")
+        
+        return jsonify({
+            'success': True,
+            'message': f"Processamento concluído: {successful} sucessos, {failed} falhas, {unchanged} inalterados",
+            'stats': stats,
+            'results': results
+        })
+        
+    except Exception as e:
+        print(f"❌ Erro no processamento: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f"Erro no processamento: {str(e)}"
+        }), 500
+
+@app.route('/api/images/export-csv', methods=['POST'])
+def export_images_csv():
+    """Exporta imagens para CSV"""
+    try:
+        data = request.json
+        images = data.get('images', [])
+        
+        # Criar CSV
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Headers
+        headers = [
+            'image_id', 'product_id', 'product_title', 'product_handle',
+            'product_vendor', 'product_type', 'image_position', 
+            'current_alt_text', 'new_alt_text', 'template_used',
+            'variant_name1', 'variant_value1',
+            'variant_name2', 'variant_value2',
+            'variant_name3', 'variant_value3'
+        ]
+        writer.writerow(headers)
+        
+        # Dados
+        for img in images:
+            row = [
+                img.get('id'),
+                img.get('product_id'),
+                img.get('product_title'),
+                img.get('product_handle'),
+                img.get('product_vendor'),
+                img.get('product_type'),
+                img.get('position'),
+                img.get('alt', ''),
+                '',  # new_alt_text - vazio para o usuário preencher
+                '',  # template_used - vazio para o usuário preencher
+                img.get('variant_name1', ''),
+                img.get('variant_value1', ''),
+                img.get('variant_name2', ''),
+                img.get('variant_value2', ''),
+                img.get('variant_name3', ''),
+                img.get('variant_value3', '')
+            ]
+            writer.writerow(row)
+        
+        output.seek(0)
+        
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={
+                'Content-Disposition': f'attachment; filename=images-alt-text-{datetime.now().strftime("%Y%m%d")}.csv'
+            }
+        )
+        
+    except Exception as e:
+        print(f"❌ Erro ao exportar CSV: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f"Erro ao exportar: {str(e)}"
+        }), 500
 
 # ==================== ENDPOINTS PRINCIPAIS ====================
 
