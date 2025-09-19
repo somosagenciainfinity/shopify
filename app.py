@@ -1836,7 +1836,7 @@ async def update_task(task_id: str, data: Dict[str, Any], background_tasks: Back
     
     task["updated_at"] = get_brazil_time_str()
     
-    # IMPORTANTE: Se atualizou o scheduled_for e já passou, executar IMEDIATAMENTE
+    # IMPORTANTE: Se atualizou o scheduled_for
     if "scheduled_for" in data and task["status"] == "scheduled":
         scheduled_for = data["scheduled_for"]
         
@@ -1853,11 +1853,36 @@ async def update_task(task_id: str, data: Dict[str, Any], background_tasks: Back
             except:
                 scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
         
-        # Também atualizar o scheduled_for_local
+        # Atualizar o scheduled_for_local
         task["scheduled_for_local"] = scheduled_time.isoformat()
+        
+        # NOVO: Recalcular notificações se configuradas
+        if task.get("config", {}).get("notifications"):
+            notifications = task["config"]["notifications"]
+            if notifications.get("before_execution"):
+                notification_time_minutes = notifications.get("notification_time", 30)
+                
+                # Calcular o novo horário da notificação
+                notification_datetime = scheduled_time - timedelta(minutes=notification_time_minutes)
+                
+                # Armazenar o horário da notificação
+                task["notification_scheduled_for"] = notification_datetime.isoformat()
+                
+                # Também atualizar no config para persistência
+                task["config"]["notifications"]["scheduled_at"] = notification_datetime.isoformat()
+                
+                logger.info(f"📱 Notificação reagendada para: {notification_datetime}")
+                logger.info(f"   ({notification_time_minutes} minutos antes da execução)")
+                
+                # Se a notificação já passou mas a tarefa ainda não, desabilitar notificação prévia
+                now = datetime.now()
+                if notification_datetime <= now < scheduled_time:
+                    logger.warning(f"⚠️ Horário da notificação já passou, notificação prévia desabilitada")
+                    task["config"]["notifications"]["before_execution_sent"] = True
         
         now = datetime.now()
         
+        # Se o novo horário já passou, executar imediatamente
         if scheduled_time <= now:
             logger.info(f"📝 Tarefa {task_id} atualizada para horário passado, executando imediatamente!")
             
@@ -1867,23 +1892,71 @@ async def update_task(task_id: str, data: Dict[str, Any], background_tasks: Back
             
             config = task.get("config", {})
             
-            # Processar em background
-            background_tasks.add_task(
-                process_products_background,
-                task_id,
-                config.get("productIds", []),
-                config.get("operations", []),
-                config.get("storeName", ""),
-                config.get("accessToken", "")
-            )
+            # Determinar o tipo de tarefa e processar adequadamente
+            task_type = task.get("task_type", "bulk_edit")
+            
+            if task_type == "alt_text":
+                # Processar alt-text
+                background_tasks.add_task(
+                    process_alt_text_background,
+                    task_id,
+                    config.get("csvData", []),
+                    config.get("storeName", ""),
+                    config.get("accessToken", "")
+                )
+            elif task_type == "variant_management":
+                # Processar variantes
+                if config.get("csvContent"):
+                    background_tasks.add_task(
+                        process_variants_background,
+                        task_id,
+                        config.get("csvContent", ""),
+                        config.get("productIds", []),
+                        config.get("submitData", {}),
+                        config.get("storeName", ""),
+                        config.get("accessToken", "")
+                    )
+                elif config.get("submitData") and config.get("productId"):
+                    background_tasks.add_task(
+                        process_single_product_variants,
+                        task_id,
+                        config.get("productId"),
+                        config.get("submitData", {}),
+                        config.get("storeName", ""),
+                        config.get("accessToken", "")
+                    )
+            else:
+                # Processar bulk edit normal
+                background_tasks.add_task(
+                    process_products_background,
+                    task_id,
+                    config.get("productIds", []),
+                    config.get("operations", []),
+                    config.get("storeName", ""),
+                    config.get("accessToken", "")
+                )
             
             logger.info(f"▶️ Tarefa {task_id} iniciada após edição")
+        else:
+            # Tarefa ainda está no futuro
+            logger.info(f"📅 Tarefa {task_id} reagendada para {scheduled_time}")
+            
+            # Calcular tempo restante
+            time_remaining = (scheduled_time - now).total_seconds()
+            hours = int(time_remaining // 3600)
+            minutes = int((time_remaining % 3600) // 60)
+            
+            if hours > 0:
+                logger.info(f"⏱️ Será executada em {hours}h {minutes}min")
+            else:
+                logger.info(f"⏱️ Será executada em {minutes} minutos")
     else:
         logger.info(f"📝 Tarefa {task_id} atualizada")
     
     return {
         "success": True,
-        "task": task
+        "task": task,
+        "message": "Tarefa atualizada com sucesso"
     }
 
 # ==================== DELETAR TAREFAS ====================
