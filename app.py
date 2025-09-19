@@ -1546,13 +1546,14 @@ async def schedule_variants_task(data: Dict[str, Any], background_tasks: Backgro
             "status": "processing",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),
-            "notification_scheduled_for": notification_scheduled_for,  # NOVO
+            "notification_scheduled_for": notification_scheduled_for,
+            "notifications": data.get("notifications"),  # ✅ CORREÇÃO: Adicionar notificações
             "started_at": get_brazil_time_str(),
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
             "config": {
                 **data.get("config", {}),
-                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+                "notifications": data.get("notifications")
             },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
@@ -1611,12 +1612,13 @@ async def schedule_variants_task(data: Dict[str, Any], background_tasks: Backgro
             "status": "scheduled",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),
-            "notification_scheduled_for": notification_scheduled_for,  # NOVO
+            "notification_scheduled_for": notification_scheduled_for,
+            "notifications": data.get("notifications"),  # ✅ CORREÇÃO: Adicionar notificações
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
             "config": {
                 **data.get("config", {}),
-                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+                "notifications": data.get("notifications")
             },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
