@@ -344,6 +344,20 @@ async def schedule_alt_text_task(data: Dict[str, Any], background_tasks: Backgro
     logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
     logger.info(f"📅 Horário atual do servidor: {now}")
     
+    # NOVO: Processar notificações se configuradas
+    notification_scheduled_for = None
+    if data.get("notifications"):
+        notifications = data["notifications"]
+        if notifications.get("before_execution"):
+            notification_time_minutes = notifications.get("notification_time", 30)
+            
+            # Calcular horário da notificação
+            notification_datetime = scheduled_time_naive - timedelta(minutes=notification_time_minutes)
+            notification_scheduled_for = notification_datetime.isoformat()
+            
+            logger.info(f"📱 Notificação configurada para: {notification_datetime}")
+            logger.info(f"   ({notification_time_minutes} minutos antes da execução)")
+    
     # Se já passou, executar imediatamente
     if scheduled_time_naive <= now:
         logger.info(f"📅 Tarefa de alt-text {task_id} agendada para horário passado, executando imediatamente!")
@@ -355,10 +369,14 @@ async def schedule_alt_text_task(data: Dict[str, Any], background_tasks: Backgro
             "status": "processing",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,  # NOVO
             "started_at": get_brazil_time_str(),
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
-            "config": data.get("config", {}),
+            "config": {
+                **data.get("config", {}),
+                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+            },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
             "progress": {
@@ -393,9 +411,13 @@ async def schedule_alt_text_task(data: Dict[str, Any], background_tasks: Backgro
             "status": "scheduled",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,  # NOVO
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
-            "config": data.get("config", {}),
+            "config": {
+                **data.get("config", {}),
+                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+            },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
             "progress": {
@@ -582,6 +604,83 @@ async def process_alt_text_background(
         
         logger.info(f"🏁 ALT-TEXT FINALIZADO: ✅ {successful} | ❌ {failed} | ⚪ {unchanged}")
 
+# ==================== ENDPOINTS DE NOTIFICAÇÕES (NOVOS) ====================
+
+@app.get("/api/notifications/pending")
+async def get_pending_notifications():
+    """Retornar notificações pendentes para exibição"""
+    
+    now = datetime.now()
+    pending_notifications = []
+    
+    for task_id, task in tasks_db.items():
+        if task.get("status") == "scheduled":
+            # Verificar se tem notificação configurada
+            if task.get("notification_scheduled_for"):
+                notification_time = datetime.fromisoformat(
+                    task["notification_scheduled_for"].replace('Z', '')
+                )
+                
+                # Pegar horário da tarefa
+                task_time_str = task.get("scheduled_for_local") or task.get("scheduled_for")
+                if task_time_str.endswith('Z'):
+                    task_time = datetime.fromisoformat(task_time_str[:-1])
+                else:
+                    task_time = datetime.fromisoformat(task_time_str.replace('Z', ''))
+                
+                # Se está no período de notificação (passou da hora de notificar mas ainda não executou)
+                if notification_time <= now < task_time:
+                    # Verificar se já foi enviada/dispensada
+                    if not task.get("config", {}).get("notifications", {}).get("before_execution_sent"):
+                        pending_notifications.append({
+                            "task_id": task_id,
+                            "task_name": task.get("name"),
+                            "task_type": task.get("task_type"),
+                            "scheduled_for": task.get("scheduled_for"),
+                            "notification_time": task.get("notification_scheduled_for"),
+                            "priority": task.get("priority"),
+                            "minutes_before": task.get("config", {}).get("notifications", {}).get("notification_time"),
+                            "item_count": task.get("config", {}).get("itemCount") or task.get("progress", {}).get("total"),
+                            "description": task.get("description")
+                        })
+                        
+                        logger.info(f"📱 Notificação pendente para tarefa {task_id}: {task.get('name')}")
+    
+    logger.info(f"📱 Total de {len(pending_notifications)} notificações pendentes")
+    
+    return {
+        "notifications": pending_notifications,
+        "count": len(pending_notifications),
+        "server_time": now.isoformat()
+    }
+
+@app.post("/api/notifications/dismiss/{task_id}")
+async def dismiss_notification(task_id: str):
+    """Marcar notificação como dispensada/visualizada"""
+    
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
+    
+    task = tasks_db[task_id]
+    
+    # Marcar notificação como enviada/dispensada
+    if "config" not in task:
+        task["config"] = {}
+    if "notifications" not in task["config"]:
+        task["config"]["notifications"] = {}
+    
+    task["config"]["notifications"]["before_execution_sent"] = True
+    task["config"]["notifications"]["dismissed_at"] = get_brazil_time_str()
+    task["updated_at"] = get_brazil_time_str()
+    
+    logger.info(f"🔕 Notificação da tarefa {task_id} marcada como dispensada")
+    
+    return {
+        "success": True,
+        "message": "Notificação dispensada",
+        "task_id": task_id
+    }
+
 # ==================== ENDPOINTS PRINCIPAIS ====================
 
 @app.get("/")
@@ -614,7 +713,9 @@ async def health_check():
             "scheduled": sum(1 for t in tasks_db.values() if t["status"] == "scheduled"),
             "processing": sum(1 for t in tasks_db.values() if t["status"] in ["processing", "running"]),
             "paused": sum(1 for t in tasks_db.values() if t["status"] == "paused"),
-            "completed": sum(1 for t in tasks_db.values() if "completed" in t["status"]),
+            "completed": sum(1 for t in tasks_db.values() if t["status"] == "completed"),
+            "completed_with_errors": sum(1 for t in tasks_db.values() if t["status"] == "completed_with_errors"),
+            "failed": sum(1 for t in tasks_db.values() if t["status"] == "failed"),
             "cancelled": sum(1 for t in tasks_db.values() if t["status"] == "cancelled")
         },
         "metrics": {
@@ -1245,7 +1346,7 @@ async def refresh_products_from_shopify(data: Dict[str, Any]):
         logger.error(f"❌ Erro ao buscar produtos do Shopify: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
-# ==================== AGENDAMENTO DE TAREFAS ====================
+# ==================== AGENDAMENTO DE TAREFAS (CORRIGIDOS) ====================
 
 @app.post("/api/tasks/schedule")
 async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks):
@@ -1285,6 +1386,20 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
     logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
     logger.info(f"📅 Horário atual do servidor: {now}")
     
+    # NOVO: Processar notificações se configuradas
+    notification_scheduled_for = None
+    if data.get("notifications"):
+        notifications = data["notifications"]
+        if notifications.get("before_execution"):
+            notification_time_minutes = notifications.get("notification_time", 30)
+            
+            # Calcular horário da notificação
+            notification_datetime = scheduled_time_naive - timedelta(minutes=notification_time_minutes)
+            notification_scheduled_for = notification_datetime.isoformat()
+            
+            logger.info(f"📱 Notificação configurada para: {notification_datetime}")
+            logger.info(f"   ({notification_time_minutes} minutos antes da execução)")
+    
     # Se já passou, executar imediatamente
     if scheduled_time_naive <= now:
         logger.info(f"📅 Tarefa {task_id} agendada para horário passado, executando imediatamente!")
@@ -1296,10 +1411,14 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
             "status": "processing",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),  # Adicionar horário local
+            "notification_scheduled_for": notification_scheduled_for,  # NOVO
             "started_at": get_brazil_time_str(),
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
-            "config": data.get("config", {}),
+            "config": {
+                **data.get("config", {}),
+                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+            },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
             "progress": {
@@ -1334,9 +1453,13 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
             "status": "scheduled",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),  # Adicionar horário local
+            "notification_scheduled_for": notification_scheduled_for,  # NOVO
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
-            "config": data.get("config", {}),
+            "config": {
+                **data.get("config", {}),
+                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+            },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
             "progress": {
@@ -1361,7 +1484,7 @@ async def schedule_task(data: Dict[str, Any], background_tasks: BackgroundTasks)
         "task": task
     }
 
-# ==================== AGENDAMENTO DE VARIANTES ====================
+# ==================== AGENDAMENTO DE VARIANTES (CORRIGIDO) ====================
 
 @app.post("/api/tasks/schedule-variants")
 async def schedule_variants_task(data: Dict[str, Any], background_tasks: BackgroundTasks):
@@ -1398,6 +1521,20 @@ async def schedule_variants_task(data: Dict[str, Any], background_tasks: Backgro
     logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
     logger.info(f"📅 Horário atual do servidor: {now}")
     
+    # NOVO: Processar notificações se configuradas
+    notification_scheduled_for = None
+    if data.get("notifications"):
+        notifications = data["notifications"]
+        if notifications.get("before_execution"):
+            notification_time_minutes = notifications.get("notification_time", 30)
+            
+            # Calcular horário da notificação
+            notification_datetime = scheduled_time_naive - timedelta(minutes=notification_time_minutes)
+            notification_scheduled_for = notification_datetime.isoformat()
+            
+            logger.info(f"📱 Notificação configurada para: {notification_datetime}")
+            logger.info(f"   ({notification_time_minutes} minutos antes da execução)")
+    
     # Se já passou, executar imediatamente
     if scheduled_time_naive <= now:
         logger.info(f"📅 Tarefa de variantes {task_id} agendada para horário passado, executando imediatamente!")
@@ -1409,10 +1546,14 @@ async def schedule_variants_task(data: Dict[str, Any], background_tasks: Backgro
             "status": "processing",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,  # NOVO
             "started_at": get_brazil_time_str(),
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
-            "config": data.get("config", {}),
+            "config": {
+                **data.get("config", {}),
+                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+            },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
             "progress": {
@@ -1470,9 +1611,13 @@ async def schedule_variants_task(data: Dict[str, Any], background_tasks: Backgro
             "status": "scheduled",
             "scheduled_for": scheduled_for,
             "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,  # NOVO
             "priority": data.get("priority", "medium"),
             "description": data.get("description", ""),
-            "config": data.get("config", {}),
+            "config": {
+                **data.get("config", {}),
+                "notifications": data.get("notifications")  # NOVO: Salvar notificações
+            },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
             "progress": {
@@ -2269,6 +2414,16 @@ async def check_and_execute_scheduled_tasks():
                                         config.get("accessToken", "")
                                     )
                                 )
+                        elif task.get("task_type") == "alt_text":
+                            # Processar alt-text
+                            asyncio.create_task(
+                                process_alt_text_background(
+                                    task_id,
+                                    config.get("csvData", []),
+                                    config.get("storeName", ""),
+                                    config.get("accessToken", "")
+                                )
+                            )
                         else:
                             # Processar edição em massa normal
                             asyncio.create_task(
