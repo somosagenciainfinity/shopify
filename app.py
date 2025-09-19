@@ -931,16 +931,48 @@ async def process_variants_background(
                         }
                     }
                     
-                    # Aplicar mudanças de título de opções
-                    if submit_data.get("titleChanges"):
+                    # ✅ CORREÇÃO: Aplicar mudanças de título de opções E ORDEM DOS VALORES
+                    if submit_data.get("titleChanges") or submit_data.get("orderChanges") or submit_data.get("newValues"):
                         options = []
                         for idx, option in enumerate(current_product.get("options", [])):
-                            new_name = submit_data["titleChanges"].get(option["name"], option["name"])
+                            option_name = option["name"]
+                            new_name = submit_data.get("titleChanges", {}).get(option_name, option_name)
+                            
+                            # Aplicar nova ordem se existir
+                            current_values = option.get("values", [])
+                            
+                            # ✅ CORREÇÃO: Processar orderChanges
+                            if submit_data.get("orderChanges") and option_name in submit_data["orderChanges"]:
+                                # Reorganizar valores conforme a nova ordem
+                                order_data = submit_data["orderChanges"][option_name]
+                                ordered_values = []
+                                for item in order_data:
+                                    value_name = item.get("name", "")
+                                    if value_name and value_name in current_values:
+                                        ordered_values.append(value_name)
+                                # Adicionar valores que não estão na ordem (caso existam)
+                                for val in current_values:
+                                    if val not in ordered_values:
+                                        ordered_values.append(val)
+                                current_values = ordered_values
+                                logger.info(f"🔄 Aplicando nova ordem para opção '{option_name}': {current_values}")
+                            
+                            # ✅ CORREÇÃO: Adicionar novos valores se existirem
+                            if submit_data.get("newValues") and option_name in submit_data["newValues"]:
+                                new_values_list = submit_data["newValues"][option_name]
+                                for new_value_data in new_values_list:
+                                    new_value_name = new_value_data.get("name", "")
+                                    if new_value_name and new_value_name not in current_values:
+                                        # Adicionar na posição correta baseado na ordem
+                                        order_position = new_value_data.get("order", len(current_values))
+                                        current_values.insert(order_position, new_value_name)
+                                        logger.info(f"➕ Novo valor '{new_value_name}' adicionado à opção '{option_name}' na posição {order_position}")
+                            
                             options.append({
                                 "id": option.get("id"),
                                 "name": new_name,
                                 "position": option.get("position", idx + 1),
-                                "values": option.get("values", [])
+                                "values": current_values
                             })
                         update_payload["product"]["options"] = options
                     
@@ -960,7 +992,7 @@ async def process_variants_background(
                                 "option3": variant.get("option3")
                             }
                             
-                            # ✅ CORREÇÃO: Aplicar mudanças de valores e preços corretamente
+                            # Aplicar mudanças de valores e preços corretamente
                             if submit_data.get("valueChanges"):
                                 for option_name, changes in submit_data["valueChanges"].items():
                                     # Verificar cada campo de opção da variante
@@ -974,7 +1006,7 @@ async def process_variants_background(
                                             if "newName" in change:
                                                 updated_variant[option_field] = change["newName"]
                                             
-                                            # ✅ CORREÇÃO PRINCIPAL: Calcular preço corretamente
+                                            # Calcular preço corretamente
                                             if "extraPrice" in change:
                                                 new_extra = float(change["extraPrice"])
                                                 original_extra = float(change.get("originalExtraPrice", 0))
@@ -1003,10 +1035,103 @@ async def process_variants_background(
                             
                             variants.append(updated_variant)
                         
-                        # Adicionar novas variantes se houver
+                        # ✅ CORREÇÃO: Adicionar novas variantes se houver novos valores
                         if submit_data.get("newValues"):
-                            # Lógica para criar novas variantes baseada nos novos valores
-                            pass
+                            logger.info(f"🆕 Processando criação de novas variantes...")
+                            
+                            # Para cada opção com novos valores
+                            for option_name, new_values_list in submit_data["newValues"].items():
+                                # Encontrar o índice da opção
+                                option_index = None
+                                for idx, opt in enumerate(current_product.get("options", [])):
+                                    if opt["name"] == option_name:
+                                        option_index = idx
+                                        break
+                                
+                                if option_index is None:
+                                    logger.warning(f"⚠️ Opção '{option_name}' não encontrada no produto")
+                                    continue
+                                
+                                option_field = f"option{option_index + 1}"
+                                
+                                # Para cada novo valor
+                                for new_value_data in new_values_list:
+                                    new_value_name = new_value_data.get("name", "")
+                                    extra_price = float(new_value_data.get("extraPrice", 0))
+                                    
+                                    if not new_value_name:
+                                        continue
+                                    
+                                    logger.info(f"  Criando variantes para novo valor '{new_value_name}' com preço extra R$ {extra_price}")
+                                    
+                                    # Encontrar todas as combinações existentes das outras opções
+                                    existing_combinations = set()
+                                    for variant in variants:
+                                        combo = []
+                                        for i in range(3):
+                                            if i != option_index:
+                                                combo.append(variant.get(f"option{i+1}"))
+                                        existing_combinations.add(tuple(combo))
+                                    
+                                    # Criar uma nova variante para cada combinação
+                                    for combo in existing_combinations:
+                                        # Montar a nova variante
+                                        new_variant = {
+                                            "option1": None,
+                                            "option2": None,
+                                            "option3": None
+                                        }
+                                        
+                                        # Preencher o novo valor na posição correta
+                                        new_variant[option_field] = new_value_name
+                                        
+                                        # Preencher os outros valores da combinação
+                                        combo_index = 0
+                                        for i in range(3):
+                                            if i != option_index:
+                                                new_variant[f"option{i+1}"] = combo[combo_index] if combo_index < len(combo) else None
+                                                combo_index += 1
+                                        
+                                        # Verificar se esta variante já existe
+                                        variant_exists = False
+                                        for existing_variant in variants:
+                                            if (existing_variant.get("option1") == new_variant["option1"] and
+                                                existing_variant.get("option2") == new_variant["option2"] and
+                                                existing_variant.get("option3") == new_variant["option3"]):
+                                                variant_exists = True
+                                                break
+                                        
+                                        if not variant_exists:
+                                            # Usar a primeira variante como base para outros campos
+                                            base_variant = current_product.get("variants", [{}])[0]
+                                            base_price = float(base_variant.get("price", 0))
+                                            
+                                            # Criar a nova variante completa
+                                            complete_variant = {
+                                                "option1": new_variant["option1"],
+                                                "option2": new_variant["option2"],
+                                                "option3": new_variant["option3"],
+                                                "price": str(base_price + extra_price),
+                                                "sku": f"{base_variant.get('sku', '')}-{new_value_name.replace(' ', '-').lower()}",
+                                                "inventory_quantity": 0,
+                                                "inventory_management": "shopify",
+                                                "inventory_policy": "continue",
+                                                "fulfillment_service": "manual",
+                                                "requires_shipping": base_variant.get("requires_shipping", True),
+                                                "taxable": base_variant.get("taxable", True),
+                                                "barcode": base_variant.get("barcode"),
+                                                "grams": base_variant.get("grams", 0),
+                                                "weight": base_variant.get("weight", 0),
+                                                "weight_unit": base_variant.get("weight_unit", "kg")
+                                            }
+                                            
+                                            # Adicionar compare_at_price se existir
+                                            if base_variant.get("compare_at_price"):
+                                                base_compare = float(base_variant["compare_at_price"])
+                                                complete_variant["compare_at_price"] = str(base_compare + extra_price)
+                                            
+                                            variants.append(complete_variant)
+                                            logger.info(f"    ✅ Nova variante criada: {new_variant['option1']} | {new_variant['option2']} | {new_variant['option3']}")
                         
                         update_payload["product"]["variants"] = variants
                     
@@ -1138,20 +1263,50 @@ async def process_single_product_variants(
                 }
             }
             
-            # Aplicar mudanças de título de opções
-            if submit_data.get("titleChanges"):
-                for i, option in enumerate(current_product.get("options", [])):
-                    new_name = submit_data["titleChanges"].get(option["name"], option["name"])
-                    update_payload["product"]["options"].append({
-                        "id": option.get("id"),
-                        "name": new_name,
-                        "position": option.get("position", i + 1),
-                        "values": option.get("values", [])
-                    })
-            else:
-                update_payload["product"]["options"] = current_product.get("options", [])
+            # ✅ CORREÇÃO: Aplicar mudanças de título, ordem e novos valores nas opções
+            options = []
+            for idx, option in enumerate(current_product.get("options", [])):
+                option_name = option["name"]
+                new_name = submit_data.get("titleChanges", {}).get(option_name, option_name)
+                
+                # Aplicar nova ordem se existir
+                current_values = option.get("values", [])
+                
+                # Processar orderChanges
+                if submit_data.get("orderChanges") and option_name in submit_data["orderChanges"]:
+                    order_data = submit_data["orderChanges"][option_name]
+                    ordered_values = []
+                    for item in order_data:
+                        value_name = item.get("name", "")
+                        if value_name and value_name in current_values:
+                            ordered_values.append(value_name)
+                    for val in current_values:
+                        if val not in ordered_values:
+                            ordered_values.append(val)
+                    current_values = ordered_values
+                    logger.info(f"🔄 Aplicando nova ordem para opção '{option_name}'")
+                
+                # Adicionar novos valores se existirem
+                if submit_data.get("newValues") and option_name in submit_data["newValues"]:
+                    new_values_list = submit_data["newValues"][option_name]
+                    for new_value_data in new_values_list:
+                        new_value_name = new_value_data.get("name", "")
+                        if new_value_name and new_value_name not in current_values:
+                            order_position = new_value_data.get("order", len(current_values))
+                            current_values.insert(order_position, new_value_name)
+                            logger.info(f"➕ Novo valor '{new_value_name}' adicionado")
+                
+                options.append({
+                    "id": option.get("id"),
+                    "name": new_name,
+                    "position": option.get("position", idx + 1),
+                    "values": current_values
+                })
+            
+            update_payload["product"]["options"] = options
             
             # Aplicar mudanças nas variantes
+            variants = []
             for variant in current_product.get("variants", []):
                 updated_variant = {
                     "id": variant.get("id"),
@@ -1164,7 +1319,7 @@ async def process_single_product_variants(
                     "option3": variant.get("option3")
                 }
                 
-                # ✅ CORREÇÃO: Aplicar mudanças de valores e preços
+                # Aplicar mudanças de valores e preços
                 if submit_data.get("valueChanges"):
                     for option_name, changes in submit_data["valueChanges"].items():
                         for option_field in ["option1", "option2", "option3"]:
@@ -1172,7 +1327,7 @@ async def process_single_product_variants(
                                 change = changes[variant[option_field]]
                                 updated_variant[option_field] = change.get("newName", variant[option_field])
                                 
-                                # ✅ CORREÇÃO: Ajustar preço se houver mudança
+                                # Ajustar preço se houver mudança
                                 if "extraPrice" in change:
                                     new_extra = float(change["extraPrice"])
                                     original_extra = float(change.get("originalExtraPrice", 0))
@@ -1192,12 +1347,95 @@ async def process_single_product_variants(
                                     
                                     logger.info(f"💰 Preço corrigido: Base R$ {base_price} + Extra R$ {new_extra} = R$ {base_price + new_extra}")
                 
-                update_payload["product"]["variants"].append(updated_variant)
+                variants.append(updated_variant)
             
-            # Adicionar novas variantes se houver
+            # ✅ CORREÇÃO: Adicionar novas variantes se houver novos valores
             if submit_data.get("newValues"):
-                # Esta parte seria mais complexa e dependeria de como as novas variantes são estruturadas
-                logger.info(f"📝 Novas variantes a serem criadas: {submit_data['newValues']}")
+                logger.info(f"🆕 Criando novas variantes...")
+                
+                for option_name, new_values_list in submit_data["newValues"].items():
+                    # Encontrar índice da opção
+                    option_index = None
+                    for idx, opt in enumerate(options):
+                        if opt["name"] == option_name or (option_name in submit_data.get("titleChanges", {}) and opt["name"] == submit_data["titleChanges"][option_name]):
+                            option_index = idx
+                            break
+                    
+                    if option_index is None:
+                        continue
+                    
+                    option_field = f"option{option_index + 1}"
+                    
+                    for new_value_data in new_values_list:
+                        new_value_name = new_value_data.get("name", "")
+                        extra_price = float(new_value_data.get("extraPrice", 0))
+                        
+                        if not new_value_name:
+                            continue
+                        
+                        # Criar combinações com outros valores
+                        existing_combinations = set()
+                        for variant in variants:
+                            combo = []
+                            for i in range(3):
+                                if i != option_index:
+                                    combo.append(variant.get(f"option{i+1}"))
+                            existing_combinations.add(tuple(combo))
+                        
+                        for combo in existing_combinations:
+                            new_variant_options = {
+                                "option1": None,
+                                "option2": None,
+                                "option3": None
+                            }
+                            
+                            new_variant_options[option_field] = new_value_name
+                            
+                            combo_index = 0
+                            for i in range(3):
+                                if i != option_index:
+                                    new_variant_options[f"option{i+1}"] = combo[combo_index] if combo_index < len(combo) else None
+                                    combo_index += 1
+                            
+                            # Verificar se já existe
+                            variant_exists = False
+                            for existing_variant in variants:
+                                if (existing_variant.get("option1") == new_variant_options["option1"] and
+                                    existing_variant.get("option2") == new_variant_options["option2"] and
+                                    existing_variant.get("option3") == new_variant_options["option3"]):
+                                    variant_exists = True
+                                    break
+                            
+                            if not variant_exists:
+                                base_variant = current_product.get("variants", [{}])[0]
+                                base_price = float(base_variant.get("price", 0))
+                                
+                                complete_variant = {
+                                    "option1": new_variant_options["option1"],
+                                    "option2": new_variant_options["option2"],
+                                    "option3": new_variant_options["option3"],
+                                    "price": str(base_price + extra_price),
+                                    "sku": f"{base_variant.get('sku', '')}-{new_value_name.replace(' ', '-').lower()}",
+                                    "inventory_quantity": 0,
+                                    "inventory_management": "shopify",
+                                    "inventory_policy": "continue",
+                                    "fulfillment_service": "manual",
+                                    "requires_shipping": base_variant.get("requires_shipping", True),
+                                    "taxable": base_variant.get("taxable", True),
+                                    "barcode": base_variant.get("barcode"),
+                                    "grams": base_variant.get("grams", 0),
+                                    "weight": base_variant.get("weight", 0),
+                                    "weight_unit": base_variant.get("weight_unit", "kg")
+                                }
+                                
+                                if base_variant.get("compare_at_price"):
+                                    base_compare = float(base_variant["compare_at_price"])
+                                    complete_variant["compare_at_price"] = str(base_compare + extra_price)
+                                
+                                variants.append(complete_variant)
+                                logger.info(f"✅ Nova variante criada")
+            
+            update_payload["product"]["variants"] = variants
             
             # Enviar atualização
             update_response = await client.put(
