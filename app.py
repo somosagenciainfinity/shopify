@@ -604,73 +604,92 @@ async def process_alt_text_background(
         
         logger.info(f"🏁 ALT-TEXT FINALIZADO: ✅ {successful} | ❌ {failed} | ⚪ {unchanged}")
 
-# ==================== ENDPOINT DE EXECUÇÃO DE RENOMEAÇÃO (SEM WORKER) ====================
+# ==================== ENDPOINT DE RENOMEAÇÃO DE IMAGENS - MÉTODO CORRETO ====================
 
 @app.post("/api/rename/process")
 async def process_rename_images(data: Dict[str, Any], background_tasks: BackgroundTasks):
     """
-    Endpoint principal para processar renomeação de imagens
-    Faz tudo diretamente via API do Shopify, sem usar Worker externo
+    Endpoint para "renomear" imagens no Shopify
+    Como não é possível renomear diretamente, fazemos: download -> reupload com novo nome -> delete antiga
     """
     
-    task_id = data.get("id") or f"rename_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
-    
-    logger.info(f"📋 Nova tarefa de renomeação {task_id}")
-    
-    template = data.get("template", "")
-    images = data.get("images", [])
-    store_name = data.get("storeName", "")
-    access_token = data.get("accessToken", "")
-    
-    if not template or not images or not store_name or not access_token:
-        raise HTTPException(status_code=400, detail="Dados incompletos para processamento")
-    
-    # Salvar tarefa na memória
-    tasks_db[task_id] = {
-        "id": task_id,
-        "name": f"Renomeação - {len(images)} imagens",
-        "status": "processing",
-        "task_type": "rename_images",
-        "progress": {
-            "processed": 0,
-            "total": len(images),
-            "successful": 0,
-            "failed": 0,
-            "unchanged": 0,
-            "percentage": 0,
-            "current_image": None
-        },
-        "started_at": get_brazil_time_str(),
-        "updated_at": get_brazil_time_str(),
-        "config": {
-            "template": template,
-            "images": images,
-            "storeName": store_name,
-            "accessToken": access_token,
-            "itemCount": len(images)
-        },
-        "results": []
-    }
-    
-    logger.info(f"✅ Tarefa de renomeação {task_id} iniciada com {len(images)} imagens")
-    
-    # Processar em background
-    background_tasks.add_task(
-        process_rename_images_background,
-        task_id,
-        template,
-        images,
-        store_name,
-        access_token
-    )
-    
-    return {
-        "success": True,
-        "message": f"Processamento de renomeação iniciado para {len(images)} imagens",
-        "taskId": task_id,
-        "estimatedTime": f"{len(images) * 0.8:.1f} segundos",
-        "mode": "background_processing"
-    }
+    try:
+        logger.info(f"📋 Requisição de renomeação recebida")
+        logger.info(f"   Template: {data.get('template', 'N/A')}")
+        logger.info(f"   Imagens: {len(data.get('images', []))}")
+        logger.info(f"   Loja: {data.get('storeName', 'N/A')}")
+        
+        task_id = data.get("id") or f"rename_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+        
+        template = data.get("template", "")
+        images = data.get("images", [])
+        store_name = data.get("storeName", "")
+        access_token = data.get("accessToken", "")
+        
+        # Validação
+        if not template:
+            raise HTTPException(status_code=400, detail="Template de renomeação não fornecido")
+        if not images:
+            raise HTTPException(status_code=400, detail="Nenhuma imagem fornecida para renomear")
+        if not store_name:
+            raise HTTPException(status_code=400, detail="Nome da loja não fornecido")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Token de acesso não fornecido")
+        
+        logger.info(f"✅ Validação concluída - criando tarefa {task_id}")
+        
+        # Salvar tarefa na memória
+        tasks_db[task_id] = {
+            "id": task_id,
+            "name": f"Renomeação - {len(images)} imagens",
+            "status": "processing",
+            "task_type": "rename_images",
+            "progress": {
+                "processed": 0,
+                "total": len(images),
+                "successful": 0,
+                "failed": 0,
+                "unchanged": 0,
+                "percentage": 0,
+                "current_image": None
+            },
+            "started_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "config": {
+                "template": template,
+                "images": images,
+                "storeName": store_name,
+                "accessToken": access_token,
+                "itemCount": len(images)
+            },
+            "results": []
+        }
+        
+        logger.info(f"✅ Tarefa {task_id} criada com {len(images)} imagens")
+        
+        # Processar em background
+        background_tasks.add_task(
+            process_rename_images_background,
+            task_id,
+            template,
+            images,
+            store_name,
+            access_token
+        )
+        
+        return {
+            "success": True,
+            "message": f"Processamento de renomeação iniciado para {len(images)} imagens",
+            "taskId": task_id,
+            "estimatedTime": f"{len(images) * 1.5:.1f} segundos",
+            "mode": "background_processing"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro inesperado: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 async def process_rename_images_background(
     task_id: str,
@@ -681,103 +700,95 @@ async def process_rename_images_background(
     is_resume: bool = False
 ):
     """
-    Função de processamento em background para renomeação de imagens
-    Faz tudo diretamente via API do Shopify
+    Processa "renomeação" de imagens: Download -> Reupload -> Delete
+    MANTÉM o alt text original!
     """
     
-    if not is_resume:
-        logger.info(f"🚀 INICIANDO RENOMEAÇÃO VIA RAILWAY: {task_id}")
-    else:
-        logger.info(f"▶️ RETOMANDO RENOMEAÇÃO VIA RAILWAY: {task_id}")
-    
-    logger.info(f"📸 Template: {template}")
-    logger.info(f"📸 Total de imagens: {len(images)}")
-    
-    # Limpar nome da loja
-    clean_store = store_name.replace('.myshopify.com', '').strip()
-    api_version = '2024-01'
-    
-    # Se for retomada, pegar progresso existente
-    if is_resume and task_id in tasks_db:
-        task = tasks_db[task_id]
-        processed = task["progress"]["processed"]
-        successful = task["progress"]["successful"]
-        failed = task["progress"]["failed"]
-        unchanged = task["progress"].get("unchanged", 0)
-        results = task.get("results", [])
-        total = task["progress"]["total"]
-    else:
-        processed = 0
-        successful = 0
-        failed = 0
-        unchanged = 0
-        results = []
-        total = len(images)
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Processar cada imagem
-        for i, image in enumerate(images[processed:], start=processed):
-            # Verificar se a tarefa foi pausada ou cancelada
-            if task_id not in tasks_db:
-                logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
-                return
-            
-            current_status = tasks_db[task_id].get("status")
-            
-            if current_status in ["paused", "cancelled"]:
-                logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
-                return
-            
-            try:
-                # Renderizar o novo nome usando o template
-                new_filename = render_rename_template(template, image)
-                old_filename = image.get('filename', '')
+    try:
+        if not is_resume:
+            logger.info(f"🚀 INICIANDO PROCESSO DE RENOMEAÇÃO: {task_id}")
+            logger.info(f"⚠️ Nota: Shopify não permite renomear diretamente. Usando método reupload.")
+        else:
+            logger.info(f"▶️ RETOMANDO RENOMEAÇÃO: {task_id}")
+        
+        logger.info(f"📸 Template: {template}")
+        logger.info(f"📸 Total de imagens: {len(images)}")
+        
+        # Limpar nome da loja
+        clean_store = store_name.replace('.myshopify.com', '').strip()
+        api_version = '2024-01'
+        
+        # Se for retomada, pegar progresso existente
+        if is_resume and task_id in tasks_db:
+            task = tasks_db[task_id]
+            processed = task["progress"]["processed"]
+            successful = task["progress"]["successful"]
+            failed = task["progress"]["failed"]
+            unchanged = task["progress"].get("unchanged", 0)
+            results = task.get("results", [])
+            total = task["progress"]["total"]
+        else:
+            processed = 0
+            successful = 0
+            failed = 0
+            unchanged = 0
+            results = []
+            total = len(images)
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Processar cada imagem
+            for i, image in enumerate(images[processed:], start=processed):
+                # Verificar se a tarefa foi pausada ou cancelada
+                if task_id not in tasks_db:
+                    logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
+                    return
                 
-                # Se não tem filename, tentar pegar da URL
-                if not old_filename and image.get('url'):
-                    url_parts = image['url'].split('/')
-                    old_filename = url_parts[-1].split('?')[0] if url_parts else f"image-{image.get('id')}.jpg"
+                current_status = tasks_db[task_id].get("status")
                 
-                logger.info(f"📝 Processando imagem {image.get('id')}: {old_filename} → {new_filename}")
+                if current_status in ["paused", "cancelled"]:
+                    logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
+                    return
                 
-                # Verificar se precisa renomear
-                if new_filename in old_filename or f"{new_filename}.png" == old_filename or f"{new_filename}.jpg" == old_filename:
-                    logger.info(f"ℹ️ Imagem {image.get('id')} já tem o nome correto")
-                    unchanged += 1
-                    results.append({
-                        'image_id': image.get('id'),
-                        'product_id': image.get('product_id'),
-                        'status': 'unchanged',
-                        'old_name': old_filename,
-                        'new_name': f"{new_filename}"
-                    })
-                else:
-                    # RENOMEAR VIA API DO SHOPIFY
+                try:
+                    # Gerar novo nome
+                    new_filename = render_rename_template(template, image)
+                    
+                    # Pegar nome atual
+                    current_filename = image.get('filename', '')
+                    if not current_filename and image.get('url'):
+                        # Extrair nome do URL
+                        url_parts = image['url'].split('/')
+                        if url_parts:
+                            file_part = url_parts[-1].split('?')[0]
+                            current_filename = file_part
+                    
+                    logger.info(f"📝 Imagem {image.get('id')}: {current_filename} → {new_filename}.jpg")
+                    
+                    # Verificar se já tem o nome correto
+                    if new_filename in current_filename or f"{new_filename}.jpg" == current_filename or f"{new_filename}.png" == current_filename:
+                        logger.info(f"ℹ️ Imagem {image.get('id')} já tem o nome correto")
+                        unchanged += 1
+                        results.append({
+                            'image_id': image.get('id'),
+                            'product_id': image.get('product_id'),
+                            'status': 'unchanged',
+                            'old_name': current_filename,
+                            'new_name': f"{new_filename}.jpg"
+                        })
+                        processed += 1
+                        continue
+                    
                     product_id = image.get('product_id')
                     image_id = image.get('id')
                     
-                    # Primeiro, buscar a imagem atual
-                    get_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
-                    headers = {
-                        'X-Shopify-Access-Token': access_token,
-                        'Content-Type': 'application/json'
-                    }
-                    
-                    get_response = await client.get(get_url, headers=headers)
-                    
-                    if get_response.status_code != 200:
-                        raise Exception(f"Erro ao buscar imagem: HTTP {get_response.status_code}")
-                    
-                    image_data = get_response.json().get('image', {})
-                    
-                    # Baixar a imagem atual
-                    image_url = image.get('url') or image_data.get('src')
+                    # PASSO 1: Baixar a imagem atual
+                    image_url = image.get('url')
                     if not image_url:
                         raise Exception("URL da imagem não encontrada")
                     
-                    logger.info(f"📥 Baixando imagem de: {image_url}")
+                    logger.info(f"📥 Baixando imagem...")
                     
-                    img_response = await client.get(image_url)
+                    img_response = await client.get(image_url, timeout=30.0)
                     if img_response.status_code != 200:
                         raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
                     
@@ -787,35 +798,36 @@ async def process_rename_images_background(
                     import base64
                     image_base64 = base64.b64encode(image_content).decode('utf-8')
                     
-                    # Deletar a imagem antiga
-                    logger.info(f"🗑️ Deletando imagem antiga {image_id}")
-                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
-                    delete_response = await client.delete(delete_url, headers=headers)
+                    # IMPORTANTE: Preservar dados originais
+                    original_alt = image.get('alt', '')  # MANTER ALT TEXT ORIGINAL!
+                    original_position = image.get('position', 1)
+                    original_variant_ids = image.get('variant_ids', [])
                     
-                    if delete_response.status_code not in [200, 204]:
-                        logger.warning(f"⚠️ Aviso ao deletar imagem antiga: HTTP {delete_response.status_code}")
+                    logger.info(f"📋 Preservando: Alt='{original_alt}', Posição={original_position}")
                     
-                    # Aguardar um pouco para garantir que foi deletada
-                    await asyncio.sleep(0.5)
-                    
-                    # Criar nova imagem com o novo nome
-                    logger.info(f"📤 Criando nova imagem com nome: {new_filename}")
+                    # PASSO 2: Criar nova imagem com novo nome
+                    logger.info(f"📤 Criando nova imagem com nome: {new_filename}.jpg")
                     
                     create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images.json"
                     
-                    # Preparar dados da nova imagem
+                    headers = {
+                        'X-Shopify-Access-Token': access_token,
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    # Dados da nova imagem - MANTENDO ALT TEXT ORIGINAL!
                     new_image_data = {
                         "image": {
                             "attachment": image_base64,
-                            "filename": f"{new_filename}.png",
-                            "alt": image.get('alt', ''),
-                            "position": image.get('position', 1)
+                            "filename": f"{new_filename}.jpg",
+                            "alt": original_alt,  # MANTÉM O ALT TEXT ORIGINAL!
+                            "position": original_position
                         }
                     }
                     
-                    # Se tem variantes associadas, adicionar
-                    if image.get('variant_ids'):
-                        new_image_data["image"]["variant_ids"] = image.get('variant_ids')
+                    # Se tem variantes associadas, manter
+                    if original_variant_ids and len(original_variant_ids) > 0:
+                        new_image_data["image"]["variant_ids"] = original_variant_ids
                     
                     create_response = await client.post(
                         create_url,
@@ -823,137 +835,164 @@ async def process_rename_images_background(
                         json=new_image_data
                     )
                     
-                    if create_response.status_code in [200, 201]:
-                        created_image = create_response.json().get('image', {})
-                        logger.info(f"✅ Imagem renomeada com sucesso! Nova ID: {created_image.get('id')}")
-                        successful += 1
-                        
-                        # Preparar dados da imagem atualizada
-                        updated_image = {
-                            'id': created_image.get('id'),
-                            'product_id': product_id,
-                            'position': created_image.get('position'),
-                            'alt': created_image.get('alt'),
-                            'width': created_image.get('width'),
-                            'height': created_image.get('height'),
-                            'src': created_image.get('src'),
-                            'filename': f"{new_filename}.png",
-                            'variant_ids': created_image.get('variant_ids', [])
-                        }
-                        
-                        results.append({
-                            'image_id': image.get('id'),
-                            'new_image_id': created_image.get('id'),
-                            'product_id': product_id,
-                            'status': 'success',
-                            'old_name': old_filename,
-                            'new_name': f"{new_filename}.png",
-                            'updated_image': updated_image
-                        })
-                    else:
+                    if create_response.status_code not in [200, 201]:
                         error_text = await create_response.text()
-                        raise Exception(f"Erro ao criar nova imagem: {error_text}")
+                        raise Exception(f"Erro ao criar imagem: {error_text}")
                     
-            except Exception as e:
-                logger.error(f"❌ Erro ao renomear imagem {image.get('id')}: {str(e)}")
-                failed += 1
-                results.append({
-                    'image_id': image.get('id'),
-                    'product_id': image.get('product_id'),
-                    'status': 'failed',
-                    'error': str(e)
-                })
-            
-            # Atualizar progresso
-            processed += 1
-            percentage = round((processed / total) * 100)
-            
-            if task_id in tasks_db:
-                current_image_info = None
-                if processed < total:
-                    current_image_info = f"Imagem {image.get('id')} - {image.get('product_title', 'Produto')}"
+                    created_image = create_response.json().get('image', {})
+                    new_image_id = created_image.get('id')
+                    
+                    logger.info(f"✅ Nova imagem criada com ID: {new_image_id}")
+                    
+                    # PASSO 3: Deletar imagem antiga
+                    logger.info(f"🗑️ Deletando imagem antiga {image_id}")
+                    
+                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
+                    delete_response = await client.delete(delete_url, headers=headers)
+                    
+                    if delete_response.status_code not in [200, 204]:
+                        logger.warning(f"⚠️ Aviso ao deletar imagem antiga: HTTP {delete_response.status_code}")
+                        # Não falhar se não conseguir deletar, a nova já foi criada
+                    
+                    successful += 1
+                    
+                    # Preparar dados da imagem atualizada
+                    updated_image = {
+                        'id': new_image_id,
+                        'product_id': product_id,
+                        'position': created_image.get('position'),
+                        'alt': original_alt,  # MANTÉM O ALT ORIGINAL!
+                        'width': created_image.get('width'),
+                        'height': created_image.get('height'),
+                        'src': created_image.get('src'),
+                        'url': created_image.get('src'),
+                        'filename': f"{new_filename}.jpg",
+                        'variant_ids': created_image.get('variant_ids', [])
+                    }
+                    
+                    results.append({
+                        'image_id': image_id,
+                        'new_image_id': new_image_id,
+                        'product_id': product_id,
+                        'status': 'success',
+                        'old_name': current_filename,
+                        'new_name': f"{new_filename}.jpg",
+                        'updated_image': updated_image
+                    })
+                    
+                    logger.info(f"✅ Renomeação concluída para imagem {image_id}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Erro ao processar imagem {image.get('id')}: {str(e)}")
+                    failed += 1
+                    results.append({
+                        'image_id': image.get('id'),
+                        'product_id': image.get('product_id'),
+                        'status': 'failed',
+                        'error': str(e)
+                    })
                 
-                tasks_db[task_id]["progress"] = {
-                    "processed": processed,
-                    "total": total,
-                    "successful": successful,
-                    "failed": failed,
-                    "unchanged": unchanged,
-                    "percentage": percentage,
-                    "current_image": current_image_info
-                }
-                tasks_db[task_id]["updated_at"] = get_brazil_time_str()
-                tasks_db[task_id]["results"] = results[-50:]  # Manter apenas últimos 50 resultados
-            
-            # Verificar novamente se foi pausado/cancelado
-            if task_id in tasks_db:
-                if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
-                    logger.info(f"🛑 Parando após processar imagem {image.get('id')}")
-                    return
-            
-            # Rate limiting para não sobrecarregar a API do Shopify
-            await asyncio.sleep(0.5)
-    
-    # Finalizar tarefa
-    final_status = "completed" if failed == 0 else "completed_with_errors"
-    
-    if task_id in tasks_db:
-        tasks_db[task_id]["status"] = final_status
-        tasks_db[task_id]["completed_at"] = get_brazil_time_str()
-        tasks_db[task_id]["results"] = results
-        tasks_db[task_id]["progress"]["current_image"] = None
+                # Atualizar progresso
+                processed += 1
+                percentage = round((processed / total) * 100)
+                
+                if task_id in tasks_db:
+                    current_image_info = None
+                    if processed < total:
+                        current_image_info = f"Imagem {image.get('id')} - {image.get('product_title', 'Produto')}"
+                    
+                    tasks_db[task_id]["progress"] = {
+                        "processed": processed,
+                        "total": total,
+                        "successful": successful,
+                        "failed": failed,
+                        "unchanged": unchanged,
+                        "percentage": percentage,
+                        "current_image": current_image_info
+                    }
+                    tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                    tasks_db[task_id]["results"] = results[-50:]
+                
+                # Verificar novamente se foi pausado/cancelado
+                if task_id in tasks_db:
+                    if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
+                        logger.info(f"🛑 Parando após processar imagem {image.get('id')}")
+                        return
+                
+                # Rate limiting - importante para não sobrecarregar
+                await asyncio.sleep(1.0)
         
-        logger.info(f"🏁 RENOMEAÇÃO FINALIZADA VIA RAILWAY:")
-        logger.info(f"   ✅ Renomeados: {successful}")
-        logger.info(f"   ❌ Falhas: {failed}")
-        logger.info(f"   ⚪ Inalterados: {unchanged}")
-        logger.info(f"   📊 Total processado: {processed}/{total}")
+        # Finalizar tarefa
+        final_status = "completed" if failed == 0 else "completed_with_errors"
+        
+        if task_id in tasks_db:
+            tasks_db[task_id]["status"] = final_status
+            tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+            tasks_db[task_id]["results"] = results
+            tasks_db[task_id]["progress"]["current_image"] = None
+            
+            logger.info(f"🏁 PROCESSO DE RENOMEAÇÃO FINALIZADO:")
+            logger.info(f"   ✅ Renomeados: {successful}")
+            logger.info(f"   ❌ Falhas: {failed}")
+            logger.info(f"   ⚪ Inalterados: {unchanged}")
+            logger.info(f"   📊 Total: {processed}/{total}")
+            
+    except Exception as e:
+        logger.error(f"❌ Erro crítico no processamento: {str(e)}")
+        if task_id in tasks_db:
+            tasks_db[task_id]["status"] = "failed"
+            tasks_db[task_id]["error"] = str(e)
+            tasks_db[task_id]["completed_at"] = get_brazil_time_str()
 
 def render_rename_template(template: str, image: Dict) -> str:
     """
     Renderizar template de renomeação com os dados da imagem
-    Aplica todas as substituições e formatações necessárias
     """
     
-    result = template
-    
-    # Substituir variáveis do produto
-    result = re.sub(r'\{\{\s*product\.title\s*\}\}', image.get('product_title', ''), result)
-    result = re.sub(r'\{\{\s*product\.handle\s*\}\}', image.get('product_handle', ''), result)
-    result = re.sub(r'\{\{\s*product\.vendor\s*\}\}', image.get('product_vendor', ''), result)
-    result = re.sub(r'\{\{\s*product\.type\s*\}\}', image.get('product_type', ''), result)
-    result = re.sub(r'\{\{\s*image\.position\s*\}\}', str(image.get('position', 1)), result)
-    
-    # Substituir variáveis de variante se existirem
-    variant = None
-    if image.get('variant_associations'):
-        variant = image['variant_associations'][0] if len(image['variant_associations']) > 0 else None
-    
-    if variant:
-        result = re.sub(r'\{\{\s*variant\.name1\s*\}\}', variant.get('option1_name', ''), result)
-        result = re.sub(r'\{\{\s*variant\.name2\s*\}\}', variant.get('option2_name', ''), result)
-        result = re.sub(r'\{\{\s*variant\.name3\s*\}\}', variant.get('option3_name', ''), result)
-        result = re.sub(r'\{\{\s*variant\.value1\s*\}\}', variant.get('option1', ''), result)
-        result = re.sub(r'\{\{\s*variant\.value2\s*\}\}', variant.get('option2', ''), result)
-        result = re.sub(r'\{\{\s*variant\.value3\s*\}\}', variant.get('option3', ''), result)
-    else:
-        # Limpar variáveis de variante se não houver
-        result = re.sub(r'\{\{\s*variant\.name[1-3]\s*\}\}', '', result)
-        result = re.sub(r'\{\{\s*variant\.value[1-3]\s*\}\}', '', result)
-    
-    # Limpar e formatar o resultado final
-    result = result.strip()
-    result = re.sub(r'\s+', '-', result)  # Espaços para hífens
-    result = re.sub(r'[^a-zA-Z0-9\-]', '', result)  # Remover caracteres especiais
-    result = re.sub(r'--+', '-', result)  # Múltiplos hífens para um
-    result = re.sub(r'^-|-$', '', result)  # Remover hífens do início e fim
-    result = result.lower()  # Converter para minúsculas
-    
-    # Se o resultado estiver vazio, usar um nome padrão
-    if not result:
-        result = f"image-{image.get('id', 'unknown')}"
-    
-    return result
+    try:
+        result = template
+        
+        # Substituir variáveis do produto
+        result = re.sub(r'\{\{\s*product\.title\s*\}\}', image.get('product_title', ''), result)
+        result = re.sub(r'\{\{\s*product\.handle\s*\}\}', image.get('product_handle', ''), result)
+        result = re.sub(r'\{\{\s*product\.vendor\s*\}\}', image.get('product_vendor', ''), result)
+        result = re.sub(r'\{\{\s*product\.type\s*\}\}', image.get('product_type', ''), result)
+        result = re.sub(r'\{\{\s*image\.position\s*\}\}', str(image.get('position', 1)), result)
+        
+        # Substituir variáveis de variante se existirem
+        variant = None
+        if image.get('variant_associations'):
+            variant = image['variant_associations'][0] if len(image['variant_associations']) > 0 else None
+        
+        if variant:
+            result = re.sub(r'\{\{\s*variant\.name1\s*\}\}', variant.get('option1_name', ''), result)
+            result = re.sub(r'\{\{\s*variant\.name2\s*\}\}', variant.get('option2_name', ''), result)
+            result = re.sub(r'\{\{\s*variant\.name3\s*\}\}', variant.get('option3_name', ''), result)
+            result = re.sub(r'\{\{\s*variant\.value1\s*\}\}', variant.get('option1', ''), result)
+            result = re.sub(r'\{\{\s*variant\.value2\s*\}\}', variant.get('option2', ''), result)
+            result = re.sub(r'\{\{\s*variant\.value3\s*\}\}', variant.get('option3', ''), result)
+        else:
+            # Limpar variáveis de variante se não houver
+            result = re.sub(r'\{\{\s*variant\.name[1-3]\s*\}\}', '', result)
+            result = re.sub(r'\{\{\s*variant\.value[1-3]\s*\}\}', '', result)
+        
+        # Limpar e formatar o resultado final
+        result = result.strip()
+        result = re.sub(r'\s+', '-', result)  # Espaços para hífens
+        result = re.sub(r'[^a-zA-Z0-9\-]', '', result)  # Remover caracteres especiais
+        result = re.sub(r'--+', '-', result)  # Múltiplos hífens para um
+        result = re.sub(r'^-|-$', '', result)  # Remover hífens do início e fim
+        result = result.lower()  # Converter para minúsculas
+        
+        # Se o resultado estiver vazio, usar um nome padrão
+        if not result:
+            result = f"image-{image.get('id', 'unknown')}"
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao renderizar template: {str(e)}")
+        return f"image-{image.get('id', 'unknown')}"
 
 # ==================== ENDPOINT DE AGENDAMENTO DE RENOMEAÇÃO ====================
 
