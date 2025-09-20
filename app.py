@@ -604,6 +604,521 @@ async def process_alt_text_background(
         
         logger.info(f"🏁 ALT-TEXT FINALIZADO: ✅ {successful} | ❌ {failed} | ⚪ {unchanged}")
 
+# ==================== ENDPOINT DE EXECUÇÃO DE RENOMEAÇÃO (SEM WORKER) ====================
+
+@app.post("/api/rename/process")
+async def process_rename_images(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """
+    Endpoint principal para processar renomeação de imagens
+    Faz tudo diretamente via API do Shopify, sem usar Worker externo
+    """
+    
+    task_id = data.get("id") or f"rename_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    logger.info(f"📋 Nova tarefa de renomeação {task_id}")
+    
+    template = data.get("template", "")
+    images = data.get("images", [])
+    store_name = data.get("storeName", "")
+    access_token = data.get("accessToken", "")
+    
+    if not template or not images or not store_name or not access_token:
+        raise HTTPException(status_code=400, detail="Dados incompletos para processamento")
+    
+    # Salvar tarefa na memória
+    tasks_db[task_id] = {
+        "id": task_id,
+        "name": f"Renomeação - {len(images)} imagens",
+        "status": "processing",
+        "task_type": "rename_images",
+        "progress": {
+            "processed": 0,
+            "total": len(images),
+            "successful": 0,
+            "failed": 0,
+            "unchanged": 0,
+            "percentage": 0,
+            "current_image": None
+        },
+        "started_at": get_brazil_time_str(),
+        "updated_at": get_brazil_time_str(),
+        "config": {
+            "template": template,
+            "images": images,
+            "storeName": store_name,
+            "accessToken": access_token,
+            "itemCount": len(images)
+        },
+        "results": []
+    }
+    
+    logger.info(f"✅ Tarefa de renomeação {task_id} iniciada com {len(images)} imagens")
+    
+    # Processar em background
+    background_tasks.add_task(
+        process_rename_images_background,
+        task_id,
+        template,
+        images,
+        store_name,
+        access_token
+    )
+    
+    return {
+        "success": True,
+        "message": f"Processamento de renomeação iniciado para {len(images)} imagens",
+        "taskId": task_id,
+        "estimatedTime": f"{len(images) * 0.8:.1f} segundos",
+        "mode": "background_processing"
+    }
+
+async def process_rename_images_background(
+    task_id: str,
+    template: str,
+    images: List[Dict],
+    store_name: str,
+    access_token: str,
+    is_resume: bool = False
+):
+    """
+    Função de processamento em background para renomeação de imagens
+    Faz tudo diretamente via API do Shopify
+    """
+    
+    if not is_resume:
+        logger.info(f"🚀 INICIANDO RENOMEAÇÃO VIA RAILWAY: {task_id}")
+    else:
+        logger.info(f"▶️ RETOMANDO RENOMEAÇÃO VIA RAILWAY: {task_id}")
+    
+    logger.info(f"📸 Template: {template}")
+    logger.info(f"📸 Total de imagens: {len(images)}")
+    
+    # Limpar nome da loja
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    api_version = '2024-01'
+    
+    # Se for retomada, pegar progresso existente
+    if is_resume and task_id in tasks_db:
+        task = tasks_db[task_id]
+        processed = task["progress"]["processed"]
+        successful = task["progress"]["successful"]
+        failed = task["progress"]["failed"]
+        unchanged = task["progress"].get("unchanged", 0)
+        results = task.get("results", [])
+        total = task["progress"]["total"]
+    else:
+        processed = 0
+        successful = 0
+        failed = 0
+        unchanged = 0
+        results = []
+        total = len(images)
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Processar cada imagem
+        for i, image in enumerate(images[processed:], start=processed):
+            # Verificar se a tarefa foi pausada ou cancelada
+            if task_id not in tasks_db:
+                logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
+                return
+            
+            current_status = tasks_db[task_id].get("status")
+            
+            if current_status in ["paused", "cancelled"]:
+                logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
+                return
+            
+            try:
+                # Renderizar o novo nome usando o template
+                new_filename = render_rename_template(template, image)
+                old_filename = image.get('filename', '')
+                
+                # Se não tem filename, tentar pegar da URL
+                if not old_filename and image.get('url'):
+                    url_parts = image['url'].split('/')
+                    old_filename = url_parts[-1].split('?')[0] if url_parts else f"image-{image.get('id')}.jpg"
+                
+                logger.info(f"📝 Processando imagem {image.get('id')}: {old_filename} → {new_filename}")
+                
+                # Verificar se precisa renomear
+                if new_filename in old_filename or f"{new_filename}.png" == old_filename or f"{new_filename}.jpg" == old_filename:
+                    logger.info(f"ℹ️ Imagem {image.get('id')} já tem o nome correto")
+                    unchanged += 1
+                    results.append({
+                        'image_id': image.get('id'),
+                        'product_id': image.get('product_id'),
+                        'status': 'unchanged',
+                        'old_name': old_filename,
+                        'new_name': f"{new_filename}"
+                    })
+                else:
+                    # RENOMEAR VIA API DO SHOPIFY
+                    product_id = image.get('product_id')
+                    image_id = image.get('id')
+                    
+                    # Primeiro, buscar a imagem atual
+                    get_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
+                    headers = {
+                        'X-Shopify-Access-Token': access_token,
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    get_response = await client.get(get_url, headers=headers)
+                    
+                    if get_response.status_code != 200:
+                        raise Exception(f"Erro ao buscar imagem: HTTP {get_response.status_code}")
+                    
+                    image_data = get_response.json().get('image', {})
+                    
+                    # Baixar a imagem atual
+                    image_url = image.get('url') or image_data.get('src')
+                    if not image_url:
+                        raise Exception("URL da imagem não encontrada")
+                    
+                    logger.info(f"📥 Baixando imagem de: {image_url}")
+                    
+                    img_response = await client.get(image_url)
+                    if img_response.status_code != 200:
+                        raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
+                    
+                    image_content = img_response.content
+                    
+                    # Converter para base64
+                    import base64
+                    image_base64 = base64.b64encode(image_content).decode('utf-8')
+                    
+                    # Deletar a imagem antiga
+                    logger.info(f"🗑️ Deletando imagem antiga {image_id}")
+                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
+                    delete_response = await client.delete(delete_url, headers=headers)
+                    
+                    if delete_response.status_code not in [200, 204]:
+                        logger.warning(f"⚠️ Aviso ao deletar imagem antiga: HTTP {delete_response.status_code}")
+                    
+                    # Aguardar um pouco para garantir que foi deletada
+                    await asyncio.sleep(0.5)
+                    
+                    # Criar nova imagem com o novo nome
+                    logger.info(f"📤 Criando nova imagem com nome: {new_filename}")
+                    
+                    create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images.json"
+                    
+                    # Preparar dados da nova imagem
+                    new_image_data = {
+                        "image": {
+                            "attachment": image_base64,
+                            "filename": f"{new_filename}.png",
+                            "alt": image.get('alt', ''),
+                            "position": image.get('position', 1)
+                        }
+                    }
+                    
+                    # Se tem variantes associadas, adicionar
+                    if image.get('variant_ids'):
+                        new_image_data["image"]["variant_ids"] = image.get('variant_ids')
+                    
+                    create_response = await client.post(
+                        create_url,
+                        headers=headers,
+                        json=new_image_data
+                    )
+                    
+                    if create_response.status_code in [200, 201]:
+                        created_image = create_response.json().get('image', {})
+                        logger.info(f"✅ Imagem renomeada com sucesso! Nova ID: {created_image.get('id')}")
+                        successful += 1
+                        
+                        # Preparar dados da imagem atualizada
+                        updated_image = {
+                            'id': created_image.get('id'),
+                            'product_id': product_id,
+                            'position': created_image.get('position'),
+                            'alt': created_image.get('alt'),
+                            'width': created_image.get('width'),
+                            'height': created_image.get('height'),
+                            'src': created_image.get('src'),
+                            'filename': f"{new_filename}.png",
+                            'variant_ids': created_image.get('variant_ids', [])
+                        }
+                        
+                        results.append({
+                            'image_id': image.get('id'),
+                            'new_image_id': created_image.get('id'),
+                            'product_id': product_id,
+                            'status': 'success',
+                            'old_name': old_filename,
+                            'new_name': f"{new_filename}.png",
+                            'updated_image': updated_image
+                        })
+                    else:
+                        error_text = await create_response.text()
+                        raise Exception(f"Erro ao criar nova imagem: {error_text}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Erro ao renomear imagem {image.get('id')}: {str(e)}")
+                failed += 1
+                results.append({
+                    'image_id': image.get('id'),
+                    'product_id': image.get('product_id'),
+                    'status': 'failed',
+                    'error': str(e)
+                })
+            
+            # Atualizar progresso
+            processed += 1
+            percentage = round((processed / total) * 100)
+            
+            if task_id in tasks_db:
+                current_image_info = None
+                if processed < total:
+                    current_image_info = f"Imagem {image.get('id')} - {image.get('product_title', 'Produto')}"
+                
+                tasks_db[task_id]["progress"] = {
+                    "processed": processed,
+                    "total": total,
+                    "successful": successful,
+                    "failed": failed,
+                    "unchanged": unchanged,
+                    "percentage": percentage,
+                    "current_image": current_image_info
+                }
+                tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                tasks_db[task_id]["results"] = results[-50:]  # Manter apenas últimos 50 resultados
+            
+            # Verificar novamente se foi pausado/cancelado
+            if task_id in tasks_db:
+                if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
+                    logger.info(f"🛑 Parando após processar imagem {image.get('id')}")
+                    return
+            
+            # Rate limiting para não sobrecarregar a API do Shopify
+            await asyncio.sleep(0.5)
+    
+    # Finalizar tarefa
+    final_status = "completed" if failed == 0 else "completed_with_errors"
+    
+    if task_id in tasks_db:
+        tasks_db[task_id]["status"] = final_status
+        tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+        tasks_db[task_id]["results"] = results
+        tasks_db[task_id]["progress"]["current_image"] = None
+        
+        logger.info(f"🏁 RENOMEAÇÃO FINALIZADA VIA RAILWAY:")
+        logger.info(f"   ✅ Renomeados: {successful}")
+        logger.info(f"   ❌ Falhas: {failed}")
+        logger.info(f"   ⚪ Inalterados: {unchanged}")
+        logger.info(f"   📊 Total processado: {processed}/{total}")
+
+def render_rename_template(template: str, image: Dict) -> str:
+    """
+    Renderizar template de renomeação com os dados da imagem
+    Aplica todas as substituições e formatações necessárias
+    """
+    
+    result = template
+    
+    # Substituir variáveis do produto
+    result = re.sub(r'\{\{\s*product\.title\s*\}\}', image.get('product_title', ''), result)
+    result = re.sub(r'\{\{\s*product\.handle\s*\}\}', image.get('product_handle', ''), result)
+    result = re.sub(r'\{\{\s*product\.vendor\s*\}\}', image.get('product_vendor', ''), result)
+    result = re.sub(r'\{\{\s*product\.type\s*\}\}', image.get('product_type', ''), result)
+    result = re.sub(r'\{\{\s*image\.position\s*\}\}', str(image.get('position', 1)), result)
+    
+    # Substituir variáveis de variante se existirem
+    variant = None
+    if image.get('variant_associations'):
+        variant = image['variant_associations'][0] if len(image['variant_associations']) > 0 else None
+    
+    if variant:
+        result = re.sub(r'\{\{\s*variant\.name1\s*\}\}', variant.get('option1_name', ''), result)
+        result = re.sub(r'\{\{\s*variant\.name2\s*\}\}', variant.get('option2_name', ''), result)
+        result = re.sub(r'\{\{\s*variant\.name3\s*\}\}', variant.get('option3_name', ''), result)
+        result = re.sub(r'\{\{\s*variant\.value1\s*\}\}', variant.get('option1', ''), result)
+        result = re.sub(r'\{\{\s*variant\.value2\s*\}\}', variant.get('option2', ''), result)
+        result = re.sub(r'\{\{\s*variant\.value3\s*\}\}', variant.get('option3', ''), result)
+    else:
+        # Limpar variáveis de variante se não houver
+        result = re.sub(r'\{\{\s*variant\.name[1-3]\s*\}\}', '', result)
+        result = re.sub(r'\{\{\s*variant\.value[1-3]\s*\}\}', '', result)
+    
+    # Limpar e formatar o resultado final
+    result = result.strip()
+    result = re.sub(r'\s+', '-', result)  # Espaços para hífens
+    result = re.sub(r'[^a-zA-Z0-9\-]', '', result)  # Remover caracteres especiais
+    result = re.sub(r'--+', '-', result)  # Múltiplos hífens para um
+    result = re.sub(r'^-|-$', '', result)  # Remover hífens do início e fim
+    result = result.lower()  # Converter para minúsculas
+    
+    # Se o resultado estiver vazio, usar um nome padrão
+    if not result:
+        result = f"image-{image.get('id', 'unknown')}"
+    
+    return result
+
+# ==================== ENDPOINT DE AGENDAMENTO DE RENOMEAÇÃO ====================
+
+@app.post("/api/rename/schedule")
+async def schedule_rename_task(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """
+    Endpoint específico para agendar tarefas de renomeação
+    Suporta todas as funcionalidades de agendamento, notificações e execução programada
+    """
+    
+    task_id = data.get("id") or f"scheduled_rename_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    logger.info(f"📋 Recebendo agendamento de renomeação: {data.get('name')}")
+    logger.info(f"⏰ Para executar em: {data.get('scheduled_for')}")
+    
+    scheduled_for = data.get("scheduled_for", get_brazil_time_str())
+    
+    # Processar timezone corretamente
+    if scheduled_for.endswith('Z'):
+        scheduled_for_clean = scheduled_for[:-1]
+        scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+        scheduled_time_local = scheduled_time.astimezone()
+        scheduled_time_naive = scheduled_time_local.replace(tzinfo=None)
+    else:
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_for)
+            if scheduled_time.tzinfo is not None:
+                scheduled_time_naive = scheduled_time.replace(tzinfo=None)
+            else:
+                scheduled_time_naive = scheduled_time
+        except:
+            scheduled_time_naive = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+    
+    now = datetime.now()
+    
+    logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
+    logger.info(f"📅 Horário atual do servidor: {now}")
+    
+    # Processar notificações se configuradas
+    notification_scheduled_for = None
+    notification_config = data.get("notifications", {})
+    
+    if notification_config and notification_config.get("before_execution"):
+        notification_time_minutes = notification_config.get("notification_time", 30)
+        
+        # Calcular horário da notificação
+        notification_datetime = scheduled_time_naive - timedelta(minutes=notification_time_minutes)
+        notification_scheduled_for = notification_datetime.isoformat()
+        
+        logger.info(f"📱 Notificação configurada para: {notification_datetime}")
+        logger.info(f"   ({notification_time_minutes} minutos antes da execução)")
+    
+    # Verificar se deve executar imediatamente ou agendar
+    if scheduled_time_naive <= now:
+        logger.info(f"📅 Tarefa de renomeação {task_id} agendada para horário passado, executando imediatamente!")
+        
+        # Criar tarefa com status processing
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Renomeação de Imagens"),
+            "task_type": "rename_images",
+            "status": "processing",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,
+            "started_at": get_brazil_time_str(),
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": {
+                **data.get("config", {}),
+                "notifications": notification_config
+            },
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "unchanged": 0,
+                "percentage": 0,
+                "current_image": None
+            },
+            "results": []
+        }
+        
+        tasks_db[task_id] = task
+        
+        # Processar imediatamente em background
+        config = task.get("config", {})
+        background_tasks.add_task(
+            process_rename_images_background,
+            task_id,
+            config.get("template", ""),
+            config.get("images", []),
+            config.get("storeName", ""),
+            config.get("accessToken", "")
+        )
+        
+        logger.info(f"▶️ Tarefa de renomeação {task_id} iniciada imediatamente")
+        
+        return {
+            "success": True,
+            "taskId": task_id,
+            "task": task,
+            "message": "Tarefa iniciada imediatamente (horário já passou)",
+            "execution": "immediate"
+        }
+    else:
+        # Agendar para execução futura
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Renomeação de Imagens"),
+            "task_type": "rename_images",
+            "status": "scheduled",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": {
+                **data.get("config", {}),
+                "notifications": notification_config
+            },
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "unchanged": 0,
+                "percentage": 0,
+                "current_image": None
+            },
+            "results": []
+        }
+        
+        tasks_db[task_id] = task
+        
+        # Calcular tempo restante
+        diff = (scheduled_time_naive - now).total_seconds()
+        hours = int(diff // 3600)
+        minutes = int((diff % 3600) // 60)
+        
+        time_msg = f"{hours}h {minutes}min" if hours > 0 else f"{minutes} minutos"
+        
+        logger.info(f"📅 Tarefa de renomeação {task_id} agendada para {scheduled_time_naive}")
+        logger.info(f"⏱️ Será executada em {time_msg}")
+        
+        return {
+            "success": True,
+            "taskId": task_id,
+            "task": task,
+            "message": f"Tarefa agendada com sucesso para execução em {time_msg}",
+            "execution": "scheduled",
+            "scheduled_time": scheduled_time_naive.isoformat(),
+            "time_remaining": {
+                "seconds": int(diff),
+                "minutes": minutes + (hours * 60),
+                "hours": hours,
+                "formatted": time_msg
+            }
+        }
+
 # ==================== ENDPOINTS DE NOTIFICAÇÕES (NOVOS) ====================
 
 @app.get("/api/notifications/pending")
@@ -1947,7 +2462,7 @@ async def pause_task(task_id: str):
 
 @app.post("/api/tasks/resume/{task_id}")
 async def resume_task(task_id: str, background_tasks: BackgroundTasks):
-    """Retomar uma tarefa pausada - VERSÃO MELHORADA COM SUPORTE A VARIANTES"""
+    """Retomar uma tarefa pausada - VERSÃO MELHORADA COM SUPORTE A VARIANTES E RENOMEAÇÃO"""
     
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
@@ -2005,6 +2520,85 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
             }
         else:
             # Se não há produtos restantes, marcar como completa
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
+    elif task_type == "alt_text":
+        # RETOMAR ALT-TEXT
+        all_images = config.get("csvData", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_images = all_images[processed_count:]
+        
+        logger.info(f"   Total de imagens: {len(all_images)}")
+        logger.info(f"   Já processadas: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_images)}")
+        
+        if len(remaining_images) > 0:
+            background_tasks.add_task(
+                process_alt_text_background,
+                task_id,
+                remaining_images,
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True
+            )
+            
+            logger.info(f"✅ Tarefa de alt-text {task_id} retomada com {len(remaining_images)} imagens")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de alt-text retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_images)
+            }
+        else:
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
+    elif task_type == "rename_images":
+        # RETOMAR RENOMEAÇÃO DE IMAGENS
+        all_images = config.get("images", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_images = all_images[processed_count:]
+        
+        logger.info(f"📸 Retomando renomeação de imagens:")
+        logger.info(f"   Total de imagens: {len(all_images)}")
+        logger.info(f"   Já processadas: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_images)}")
+        
+        if len(remaining_images) > 0:
+            # Retomar processamento das imagens restantes
+            background_tasks.add_task(
+                process_rename_images_background,
+                task_id,
+                config.get("template", ""),
+                remaining_images,
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True
+            )
+            
+            logger.info(f"✅ Tarefa de renomeação {task_id} retomada com {len(remaining_images)} imagens")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de renomeação retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_images),
+                "progress": task.get("progress")
+            }
+        else:
+            # Se não há imagens restantes, marcar como completa
             task["status"] = "completed"
             task["completed_at"] = get_brazil_time_str()
             
@@ -2653,6 +3247,19 @@ async def check_and_execute_scheduled_tasks():
                                 process_alt_text_background(
                                     task_id,
                                     config.get("csvData", []),
+                                    config.get("storeName", ""),
+                                    config.get("accessToken", "")
+                                )
+                            )
+                        elif task.get("task_type") == "rename_images":
+                            # Processar renomeação de imagens
+                            logger.info(f"🖼️ Executando tarefa agendada de renomeação: {task_id}")
+                            
+                            asyncio.create_task(
+                                process_rename_images_background(
+                                    task_id,
+                                    config.get("template", ""),
+                                    config.get("images", []),
                                     config.get("storeName", ""),
                                     config.get("accessToken", "")
                                 )
