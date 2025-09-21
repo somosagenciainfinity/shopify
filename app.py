@@ -701,7 +701,7 @@ async def process_rename_images_background(
 ):
     """
     Processa "renomeação" de imagens: Download -> Reupload -> Delete
-    MANTÉM o alt text original!
+    MANTÉM o alt text original E o formato original (PNG, JPG, WEBP, GIF)!
     """
     
     try:
@@ -750,7 +750,7 @@ async def process_rename_images_background(
                     return
                 
                 try:
-                    # Gerar novo nome
+                    # Gerar novo nome (SEM extensão ainda)
                     new_filename = render_rename_template(template, image)
                     
                     # Pegar nome atual
@@ -766,10 +766,35 @@ async def process_rename_images_background(
                             file_part = url_parts[-1].split('?')[0]
                             current_filename = file_part
                     
-                    logger.info(f"📝 Imagem {image.get('id')}: {current_filename} → {new_filename}.jpg")
+                    # IMPORTANTE: Detectar a extensão ORIGINAL do arquivo
+                    file_extension = '.jpg'  # Padrão
+                    if current_filename:
+                        current_lower = current_filename.lower()
+                        if '.png' in current_lower:
+                            file_extension = '.png'
+                        elif '.webp' in current_lower:
+                            file_extension = '.webp'
+                        elif '.gif' in current_lower:
+                            file_extension = '.gif'
+                        elif '.jpeg' in current_lower or '.jpg' in current_lower:
+                            file_extension = '.jpg'
+                    
+                    # Se não conseguiu detectar pelo nome, tentar pela URL
+                    if file_extension == '.jpg' and image_url:
+                        url_lower = image_url.lower()
+                        if '.png' in url_lower and '.png?' in url_lower:
+                            file_extension = '.png'
+                        elif '.webp' in url_lower and '.webp?' in url_lower:
+                            file_extension = '.webp'
+                        elif '.gif' in url_lower and '.gif?' in url_lower:
+                            file_extension = '.gif'
+                    
+                    logger.info(f"📝 Imagem {image.get('id')}: {current_filename} → {new_filename}{file_extension}")
+                    logger.info(f"📄 Formato detectado: {file_extension}")
                     
                     # Verificar se já tem o nome correto
-                    if new_filename in current_filename or f"{new_filename}.jpg" == current_filename or f"{new_filename}.png" == current_filename:
+                    final_new_name = f"{new_filename}{file_extension}"
+                    if new_filename in current_filename or final_new_name == current_filename:
                         logger.info(f"ℹ️ Imagem {image.get('id')} já tem o nome correto")
                         unchanged += 1
                         results.append({
@@ -777,7 +802,7 @@ async def process_rename_images_background(
                             'product_id': image.get('product_id'),
                             'status': 'unchanged',
                             'old_name': current_filename,
-                            'new_name': f"{new_filename}.jpg"
+                            'new_name': final_new_name
                         })
                         processed += 1
                         continue
@@ -786,7 +811,6 @@ async def process_rename_images_background(
                     image_id = image.get('id')
                     
                     # PASSO 1: Baixar a imagem atual
-                    # CORREÇÃO: Usar 'src' que vem do frontend
                     if not image_url:
                         # Se não tem src/url, buscar da API do Shopify
                         logger.info(f"🔍 Buscando URL da imagem {image_id} via API...")
@@ -801,6 +825,17 @@ async def process_rename_images_background(
                         if img_data_response.status_code == 200:
                             img_data = img_data_response.json()
                             image_url = img_data.get('image', {}).get('src')
+                            
+                            # Tentar detectar formato pela URL retornada
+                            if image_url:
+                                url_lower = image_url.lower()
+                                if '.png' in url_lower:
+                                    file_extension = '.png'
+                                elif '.webp' in url_lower:
+                                    file_extension = '.webp'
+                                elif '.gif' in url_lower:
+                                    file_extension = '.gif'
+                            
                             logger.info(f"✅ URL encontrada: {image_url[:50]}...")
                         else:
                             raise Exception(f"Não foi possível obter URL da imagem via API")
@@ -810,13 +845,35 @@ async def process_rename_images_background(
                     
                     logger.info(f"📥 Baixando imagem de: {image_url[:50]}...")
                     
-                    # Baixar a imagem
+                    # Baixar a imagem PRESERVANDO O FORMATO ORIGINAL
                     img_response = await client.get(image_url, timeout=30.0)
                     if img_response.status_code != 200:
                         raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
                     
                     image_content = img_response.content
-                    logger.info(f"✅ Imagem baixada: {len(image_content)} bytes")
+                    
+                    # IMPORTANTE: Detectar o formato real pelos bytes da imagem
+                    # PNG começa com: 89 50 4E 47
+                    # JPG começa com: FF D8 FF
+                    # GIF começa com: 47 49 46 38
+                    # WebP começa com: 52 49 46 46 ... 57 45 42 50
+                    
+                    if len(image_content) > 4:
+                        header = image_content[:12]
+                        if header[:4] == b'\x89PNG':
+                            file_extension = '.png'
+                            logger.info(f"✅ Formato detectado pelos bytes: PNG (transparência preservada)")
+                        elif header[:3] == b'\xff\xd8\xff':
+                            file_extension = '.jpg'
+                            logger.info(f"✅ Formato detectado pelos bytes: JPEG")
+                        elif header[:4] == b'GIF8':
+                            file_extension = '.gif'
+                            logger.info(f"✅ Formato detectado pelos bytes: GIF")
+                        elif header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+                            file_extension = '.webp'
+                            logger.info(f"✅ Formato detectado pelos bytes: WebP")
+                    
+                    logger.info(f"✅ Imagem baixada: {len(image_content)} bytes - Formato: {file_extension}")
                     
                     # Converter para base64
                     import base64
@@ -829,8 +886,9 @@ async def process_rename_images_background(
                     
                     logger.info(f"📋 Preservando: Alt='{original_alt}', Posição={original_position}")
                     
-                    # PASSO 2: Criar nova imagem com novo nome
-                    logger.info(f"📤 Criando nova imagem com nome: {new_filename}.jpg")
+                    # PASSO 2: Criar nova imagem com novo nome E FORMATO ORIGINAL
+                    final_new_name = f"{new_filename}{file_extension}"
+                    logger.info(f"📤 Criando nova imagem com nome: {final_new_name}")
                     
                     create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images.json"
                     
@@ -839,20 +897,11 @@ async def process_rename_images_background(
                         'Content-Type': 'application/json'
                     }
                     
-                    # Determinar extensão do arquivo
-                    file_extension = '.jpg'
-                    if current_filename.lower().endswith('.png'):
-                        file_extension = '.png'
-                    elif current_filename.lower().endswith('.webp'):
-                        file_extension = '.webp'
-                    elif current_filename.lower().endswith('.gif'):
-                        file_extension = '.gif'
-                    
-                    # Dados da nova imagem - MANTENDO ALT TEXT ORIGINAL!
+                    # Dados da nova imagem - MANTENDO ALT TEXT E FORMATO ORIGINAL!
                     new_image_data = {
                         "image": {
                             "attachment": image_base64,
-                            "filename": f"{new_filename}{file_extension}",
+                            "filename": final_new_name,
                             "alt": original_alt,  # MANTÉM O ALT TEXT ORIGINAL!
                             "position": original_position
                         }
@@ -901,7 +950,7 @@ async def process_rename_images_background(
                         'height': created_image.get('height'),
                         'src': created_image.get('src'),
                         'url': created_image.get('src'),
-                        'filename': f"{new_filename}{file_extension}",
+                        'filename': final_new_name,
                         'variant_ids': created_image.get('variant_ids', [])
                     }
                     
@@ -911,7 +960,7 @@ async def process_rename_images_background(
                         'product_id': product_id,
                         'status': 'success',
                         'old_name': current_filename,
-                        'new_name': f"{new_filename}{file_extension}",
+                        'new_name': final_new_name,
                         'updated_image': updated_image
                     })
                     
@@ -926,7 +975,7 @@ async def process_rename_images_background(
                         'status': 'failed',
                         'error': str(e),
                         'old_name': current_filename if 'current_filename' in locals() else 'unknown',
-                        'new_name': f"{new_filename}.jpg" if 'new_filename' in locals() else 'unknown'
+                        'new_name': f"{new_filename}{file_extension}" if 'new_filename' in locals() and 'file_extension' in locals() else 'unknown'
                     })
                 
                 # Atualizar progresso
