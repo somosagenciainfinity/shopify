@@ -611,6 +611,7 @@ async def process_rename_images(data: Dict[str, Any], background_tasks: Backgrou
     """
     Endpoint para "renomear" imagens no Shopify
     Como não é possível renomear diretamente, fazemos: download -> reupload com novo nome -> delete antiga
+    AGORA USANDO ATTACHMENTS DO FRONTEND!
     """
     
     try:
@@ -636,7 +637,10 @@ async def process_rename_images(data: Dict[str, Any], background_tasks: Backgrou
         if not access_token:
             raise HTTPException(status_code=400, detail="Token de acesso não fornecido")
         
-        logger.info(f"✅ Validação concluída - criando tarefa {task_id}")
+        # Contar imagens com attachment
+        images_with_attachment = sum(1 for img in images if img.get('attachment'))
+        logger.info(f"✅ Validação concluída - {images_with_attachment}/{len(images)} imagens com attachment")
+        logger.info(f"✅ Criando tarefa {task_id}")
         
         # Salvar tarefa na memória
         tasks_db[task_id] = {
@@ -701,7 +705,7 @@ async def process_rename_images_background(
 ):
     """
     Processa "renomeação" de imagens: Download -> Processar com Pillow -> Reupload -> Delete
-    PRESERVA transparência usando Pillow para garantir formato correto!
+    AGORA USANDO ATTACHMENTS DO FRONTEND!
     """
     
     try:
@@ -712,12 +716,16 @@ async def process_rename_images_background(
         
         if not is_resume:
             logger.info(f"🚀 INICIANDO PROCESSO DE RENOMEAÇÃO: {task_id}")
-            logger.info(f"🎨 Usando Pillow para preservar transparência")
+            logger.info(f"🎨 Usando attachments do frontend + Pillow para preservar transparência")
         else:
             logger.info(f"▶️ RETOMANDO RENOMEAÇÃO: {task_id}")
         
         logger.info(f"📸 Template: {template}")
         logger.info(f"📸 Total de imagens: {len(images)}")
+        
+        # Contar imagens com attachment
+        images_with_attachment = sum(1 for img in images if img.get('attachment'))
+        logger.info(f"📎 Imagens com attachment: {images_with_attachment}/{len(images)}")
         
         # Limpar nome da loja
         clean_store = store_name.replace('.myshopify.com', '').strip()
@@ -761,47 +769,49 @@ async def process_rename_images_background(
                     # Pegar nome atual
                     current_filename = image.get('filename', '')
                     
-                    # CORREÇÃO: Usar 'src' ao invés de 'url'
-                    image_url = image.get('src') or image.get('url')
+                    # USAR ATTACHMENT SE DISPONÍVEL
+                    attachment_base64 = image.get('attachment')
                     
-                    if not current_filename and image_url:
-                        # Extrair nome do URL
-                        url_parts = image_url.split('/')
-                        if url_parts:
-                            file_part = url_parts[-1].split('?')[0]
-                            current_filename = file_part
-                    
-                    # PASSO 1: Baixar a imagem atual
-                    if not image_url:
-                        # Se não tem src/url, buscar da API do Shopify
-                        logger.info(f"🔍 Buscando URL da imagem {image.get('id')} via API...")
+                    if attachment_base64:
+                        logger.info(f"✅ Usando attachment do frontend para imagem {image.get('id')}")
+                        image_content = base64.b64decode(attachment_base64)
+                    else:
+                        # FALLBACK: Baixar da URL se não tiver attachment
+                        logger.info(f"⚠️ Sem attachment, baixando imagem {image.get('id')} da URL")
                         
-                        get_image_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
-                        headers = {
-                            'X-Shopify-Access-Token': access_token,
-                            'Content-Type': 'application/json'
-                        }
+                        image_url = image.get('src') or image.get('url')
                         
-                        img_data_response = await client.get(get_image_url, headers=headers)
-                        if img_data_response.status_code == 200:
-                            img_data = img_data_response.json()
-                            image_url = img_data.get('image', {}).get('src')
-                            logger.info(f"✅ URL encontrada: {image_url[:50]}...")
-                        else:
-                            raise Exception(f"Não foi possível obter URL da imagem via API")
+                        if not image_url:
+                            # Se não tem src/url, buscar da API do Shopify
+                            logger.info(f"🔍 Buscando URL da imagem {image.get('id')} via API...")
+                            
+                            get_image_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
+                            headers = {
+                                'X-Shopify-Access-Token': access_token,
+                                'Content-Type': 'application/json'
+                            }
+                            
+                            img_data_response = await client.get(get_image_url, headers=headers)
+                            if img_data_response.status_code == 200:
+                                img_data = img_data_response.json()
+                                image_url = img_data.get('image', {}).get('src')
+                                logger.info(f"✅ URL encontrada: {image_url[:50]}...")
+                            else:
+                                raise Exception(f"Não foi possível obter URL da imagem via API")
+                        
+                        if not image_url:
+                            raise Exception("URL da imagem não encontrada e sem attachment")
+                        
+                        logger.info(f"📥 Baixando imagem de: {image_url[:50]}...")
+                        
+                        # Baixar a imagem
+                        img_response = await client.get(image_url, timeout=30.0)
+                        if img_response.status_code != 200:
+                            raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
+                        
+                        image_content = img_response.content
                     
-                    if not image_url:
-                        raise Exception("URL da imagem não encontrada")
-                    
-                    logger.info(f"📥 Baixando imagem de: {image_url[:50]}...")
-                    
-                    # Baixar a imagem
-                    img_response = await client.get(image_url, timeout=30.0)
-                    if img_response.status_code != 200:
-                        raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
-                    
-                    image_content = img_response.content
-                    logger.info(f"✅ Imagem baixada: {len(image_content)} bytes")
+                    logger.info(f"✅ Imagem obtida: {len(image_content)} bytes")
                     
                     # PASSO 2: Processar com Pillow para detectar e preservar formato
                     img_buffer = io.BytesIO(image_content)
@@ -858,7 +868,7 @@ async def process_rename_images_background(
                             # Converter RGBA para RGB se não tem transparência real
                             pil_image = pil_image.convert('RGB')
                             logger.info(f"🔄 Convertido RGBA→RGB (sem transparência real)")
-                        save_format = original_format
+                        save_format = original_format if original_format in ['JPEG', 'PNG', 'GIF', 'WEBP'] else 'JPEG'
                     
                     # Nome final com extensão correta
                     final_new_name = f"{new_filename}{file_extension}"
@@ -945,7 +955,7 @@ async def process_rename_images_background(
                     )
                     
                     if create_response.status_code not in [200, 201]:
-                        error_text = await create_response.text()
+                        error_text = create_response.text
                         raise Exception(f"Erro ao criar imagem: {error_text}")
                     
                     created_image = create_response.json().get('image', {})
@@ -987,7 +997,8 @@ async def process_rename_images_background(
                         'filename': final_new_name,
                         'variant_ids': created_image.get('variant_ids', []),
                         'has_transparency': has_transparency,
-                        'original_format': original_format
+                        'original_format': original_format,
+                        'used_attachment': bool(attachment_base64)
                     }
                     
                     results.append({
@@ -998,10 +1009,11 @@ async def process_rename_images_background(
                         'old_name': current_filename,
                         'new_name': final_new_name,
                         'updated_image': updated_image,
-                        'transparency_preserved': has_transparency
+                        'transparency_preserved': has_transparency,
+                        'used_attachment': bool(attachment_base64)
                     })
                     
-                    logger.info(f"✅ Renomeação concluída para imagem {image.get('id')}")
+                    logger.info(f"✅ Renomeação concluída para imagem {image.get('id')} (attachment: {bool(attachment_base64)})")
                     
                     # Limpar memória
                     pil_image.close()
@@ -1059,10 +1071,14 @@ async def process_rename_images_background(
             tasks_db[task_id]["results"] = results
             tasks_db[task_id]["progress"]["current_image"] = None
             
+            # Estatísticas de attachments
+            attachments_used = sum(1 for r in results if r.get('used_attachment'))
+            
             logger.info(f"🏁 PROCESSO DE RENOMEAÇÃO FINALIZADO:")
             logger.info(f"   ✅ Renomeados: {successful}")
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   ⚪ Inalterados: {unchanged}")
+            logger.info(f"   📎 Usaram attachment: {attachments_used}/{processed}")
             logger.info(f"   📊 Total: {processed}/{total}")
             
     except Exception as e:
