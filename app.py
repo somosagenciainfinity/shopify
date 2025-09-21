@@ -604,14 +604,14 @@ async def process_alt_text_background(
         
         logger.info(f"🏁 ALT-TEXT FINALIZADO: ✅ {successful} | ❌ {failed} | ⚪ {unchanged}")
 
-# ==================== ENDPOINT DE RENOMEAÇÃO DE IMAGENS - MÉTODO CORRETO ====================
+# ==================== ENDPOINT DE RENOMEAÇÃO DE IMAGENS - VERSÃO DIRETA SEM ATTACHMENT ====================
 
 @app.post("/api/rename/process")
 async def process_rename_images(data: Dict[str, Any], background_tasks: BackgroundTasks):
     """
     Endpoint para "renomear" imagens no Shopify
     Como não é possível renomear diretamente, fazemos: download -> reupload com novo nome -> delete antiga
-    AGORA USANDO ATTACHMENTS DO FRONTEND!
+    AGORA USANDO URLs DIRETAS DO FRONTEND!
     """
     
     try:
@@ -637,9 +637,7 @@ async def process_rename_images(data: Dict[str, Any], background_tasks: Backgrou
         if not access_token:
             raise HTTPException(status_code=400, detail="Token de acesso não fornecido")
         
-        # Contar imagens com attachment
-        images_with_attachment = sum(1 for img in images if img.get('attachment'))
-        logger.info(f"✅ Validação concluída - {images_with_attachment}/{len(images)} imagens com attachment")
+        logger.info(f"✅ Validação concluída - {len(images)} imagens para processar")
         logger.info(f"✅ Criando tarefa {task_id}")
         
         # Salvar tarefa na memória
@@ -705,7 +703,7 @@ async def process_rename_images_background(
 ):
     """
     Processa "renomeação" de imagens: Download -> Processar com Pillow -> Reupload -> Delete
-    AGORA USANDO ATTACHMENTS DO FRONTEND!
+    AGORA USANDO URLs DIRETAS DO FRONTEND!
     """
     
     try:
@@ -716,16 +714,12 @@ async def process_rename_images_background(
         
         if not is_resume:
             logger.info(f"🚀 INICIANDO PROCESSO DE RENOMEAÇÃO: {task_id}")
-            logger.info(f"🎨 Usando attachments do frontend + Pillow para preservar transparência")
+            logger.info(f"🎨 Usando URLs diretas do frontend + Pillow para preservar transparência")
         else:
             logger.info(f"▶️ RETOMANDO RENOMEAÇÃO: {task_id}")
         
         logger.info(f"📸 Template: {template}")
         logger.info(f"📸 Total de imagens: {len(images)}")
-        
-        # Contar imagens com attachment
-        images_with_attachment = sum(1 for img in images if img.get('attachment'))
-        logger.info(f"📎 Imagens com attachment: {images_with_attachment}/{len(images)}")
         
         # Limpar nome da loja
         clean_store = store_name.replace('.myshopify.com', '').strip()
@@ -769,49 +763,21 @@ async def process_rename_images_background(
                     # Pegar nome atual
                     current_filename = image.get('filename', '')
                     
-                    # USAR ATTACHMENT SE DISPONÍVEL
-                    attachment_base64 = image.get('attachment')
+                    # USAR URL DIRETA DO FRONTEND
+                    image_url = image.get('src') or image.get('url')
                     
-                    if attachment_base64:
-                        logger.info(f"✅ Usando attachment do frontend para imagem {image.get('id')}")
-                        image_content = base64.b64decode(attachment_base64)
-                    else:
-                        # FALLBACK: Baixar da URL se não tiver attachment
-                        logger.info(f"⚠️ Sem attachment, baixando imagem {image.get('id')} da URL")
-                        
-                        image_url = image.get('src') or image.get('url')
-                        
-                        if not image_url:
-                            # Se não tem src/url, buscar da API do Shopify
-                            logger.info(f"🔍 Buscando URL da imagem {image.get('id')} via API...")
-                            
-                            get_image_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
-                            headers = {
-                                'X-Shopify-Access-Token': access_token,
-                                'Content-Type': 'application/json'
-                            }
-                            
-                            img_data_response = await client.get(get_image_url, headers=headers)
-                            if img_data_response.status_code == 200:
-                                img_data = img_data_response.json()
-                                image_url = img_data.get('image', {}).get('src')
-                                logger.info(f"✅ URL encontrada: {image_url[:50]}...")
-                            else:
-                                raise Exception(f"Não foi possível obter URL da imagem via API")
-                        
-                        if not image_url:
-                            raise Exception("URL da imagem não encontrada e sem attachment")
-                        
-                        logger.info(f"📥 Baixando imagem de: {image_url[:50]}...")
-                        
-                        # Baixar a imagem
-                        img_response = await client.get(image_url, timeout=30.0)
-                        if img_response.status_code != 200:
-                            raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
-                        
-                        image_content = img_response.content
+                    if not image_url:
+                        raise Exception(f"URL da imagem não fornecida para imagem {image.get('id')}")
                     
-                    logger.info(f"✅ Imagem obtida: {len(image_content)} bytes")
+                    logger.info(f"📥 Baixando imagem de: {image_url[:100]}...")
+                    
+                    # PASSO 1: Baixar a imagem da URL original
+                    img_response = await client.get(image_url, timeout=30.0)
+                    if img_response.status_code != 200:
+                        raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
+                    
+                    image_content = img_response.content
+                    logger.info(f"✅ Imagem baixada: {len(image_content)} bytes")
                     
                     # PASSO 2: Processar com Pillow para detectar e preservar formato
                     img_buffer = io.BytesIO(image_content)
@@ -825,33 +791,50 @@ async def process_rename_images_background(
                     has_transparency = False
                     file_extension = '.jpg'  # Padrão
                     
-                    if original_format == 'PNG':
-                        # Verificar se tem canal alpha ou transparência
-                        if pil_image.mode in ('RGBA', 'LA') or (pil_image.mode == 'P' and 'transparency' in pil_image.info):
-                            has_transparency = True
-                            file_extension = '.png'
-                            logger.info(f"✅ PNG com TRANSPARÊNCIA detectada! Mode: {pil_image.mode}")
-                        else:
-                            # PNG mas sem transparência
-                            file_extension = '.png'
-                            logger.info(f"📄 PNG sem transparência. Mode: {pil_image.mode}")
-                    elif original_format == 'GIF':
-                        if 'transparency' in pil_image.info:
-                            has_transparency = True
-                        file_extension = '.gif'
-                        logger.info(f"📄 GIF detectado. Transparência: {has_transparency}")
-                    elif original_format == 'WEBP':
+                    # IMPORTANTE: Verificar pela URL original primeiro
+                    if '.png' in image_url.lower():
+                        file_extension = '.png'
+                        has_transparency = True  # Assumir que PNGs têm transparência
+                        logger.info(f"✅ URL indica PNG - preservando como PNG")
+                    elif '.webp' in image_url.lower():
+                        file_extension = '.webp'
                         if pil_image.mode == 'RGBA':
                             has_transparency = True
-                        file_extension = '.webp'
-                        logger.info(f"📄 WebP detectado. Mode: {pil_image.mode}")
+                        logger.info(f"📄 URL indica WebP - Mode: {pil_image.mode}")
+                    elif '.gif' in image_url.lower():
+                        file_extension = '.gif'
+                        if 'transparency' in pil_image.info:
+                            has_transparency = True
+                        logger.info(f"📄 URL indica GIF")
                     else:
-                        # JPEG ou outro formato sem transparência
-                        file_extension = '.jpg'
-                        logger.info(f"📄 Formato {original_format} detectado")
+                        # Verificar pelo formato detectado pelo Pillow
+                        if original_format == 'PNG':
+                            # Verificar se tem canal alpha ou transparência
+                            if pil_image.mode in ('RGBA', 'LA') or (pil_image.mode == 'P' and 'transparency' in pil_image.info):
+                                has_transparency = True
+                                file_extension = '.png'
+                                logger.info(f"✅ PNG com TRANSPARÊNCIA detectada! Mode: {pil_image.mode}")
+                            else:
+                                # PNG mas sem transparência
+                                file_extension = '.png'
+                                logger.info(f"📄 PNG sem transparência. Mode: {pil_image.mode}")
+                        elif original_format == 'GIF':
+                            if 'transparency' in pil_image.info:
+                                has_transparency = True
+                            file_extension = '.gif'
+                            logger.info(f"📄 GIF detectado. Transparência: {has_transparency}")
+                        elif original_format == 'WEBP':
+                            if pil_image.mode == 'RGBA':
+                                has_transparency = True
+                            file_extension = '.webp'
+                            logger.info(f"📄 WebP detectado. Mode: {pil_image.mode}")
+                        else:
+                            # JPEG ou outro formato sem transparência
+                            file_extension = '.jpg'
+                            logger.info(f"📄 Formato {original_format} detectado")
                     
                     # Se tem transparência, garantir que seja preservada
-                    if has_transparency:
+                    if has_transparency or file_extension == '.png':
                         logger.info(f"🎨 PRESERVANDO TRANSPARÊNCIA")
                         
                         # Garantir modo RGBA para preservar canal alpha
@@ -886,6 +869,21 @@ async def process_rename_images_background(
                             'new_name': final_new_name
                         })
                         processed += 1
+                        
+                        # Atualizar progresso
+                        percentage = round((processed / total) * 100)
+                        if task_id in tasks_db:
+                            tasks_db[task_id]["progress"] = {
+                                "processed": processed,
+                                "total": total,
+                                "successful": successful,
+                                "failed": failed,
+                                "unchanged": unchanged,
+                                "percentage": percentage,
+                                "current_image": f"Imagem {image.get('id')}" if i < len(images)-1 else None
+                            }
+                            tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                        
                         continue
                     
                     # PASSO 3: Salvar imagem processada em buffer
@@ -998,7 +996,7 @@ async def process_rename_images_background(
                         'variant_ids': created_image.get('variant_ids', []),
                         'has_transparency': has_transparency,
                         'original_format': original_format,
-                        'used_attachment': bool(attachment_base64)
+                        'original_url': image_url
                     }
                     
                     results.append({
@@ -1009,11 +1007,10 @@ async def process_rename_images_background(
                         'old_name': current_filename,
                         'new_name': final_new_name,
                         'updated_image': updated_image,
-                        'transparency_preserved': has_transparency,
-                        'used_attachment': bool(attachment_base64)
+                        'transparency_preserved': has_transparency
                     })
                     
-                    logger.info(f"✅ Renomeação concluída para imagem {image.get('id')} (attachment: {bool(attachment_base64)})")
+                    logger.info(f"✅ Renomeação concluída para imagem {image.get('id')}")
                     
                     # Limpar memória
                     pil_image.close()
@@ -1071,14 +1068,10 @@ async def process_rename_images_background(
             tasks_db[task_id]["results"] = results
             tasks_db[task_id]["progress"]["current_image"] = None
             
-            # Estatísticas de attachments
-            attachments_used = sum(1 for r in results if r.get('used_attachment'))
-            
             logger.info(f"🏁 PROCESSO DE RENOMEAÇÃO FINALIZADO:")
             logger.info(f"   ✅ Renomeados: {successful}")
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   ⚪ Inalterados: {unchanged}")
-            logger.info(f"   📎 Usaram attachment: {attachments_used}/{processed}")
             logger.info(f"   📊 Total: {processed}/{total}")
             
     except Exception as e:
