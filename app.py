@@ -755,9 +755,13 @@ async def process_rename_images_background(
                     
                     # Pegar nome atual
                     current_filename = image.get('filename', '')
-                    if not current_filename and image.get('url'):
+                    
+                    # CORREÇÃO: Usar 'src' ao invés de 'url'
+                    image_url = image.get('src') or image.get('url')
+                    
+                    if not current_filename and image_url:
                         # Extrair nome do URL
-                        url_parts = image['url'].split('/')
+                        url_parts = image_url.split('/')
                         if url_parts:
                             file_part = url_parts[-1].split('?')[0]
                             current_filename = file_part
@@ -782,17 +786,37 @@ async def process_rename_images_background(
                     image_id = image.get('id')
                     
                     # PASSO 1: Baixar a imagem atual
-                    image_url = image.get('url')
+                    # CORREÇÃO: Usar 'src' que vem do frontend
+                    if not image_url:
+                        # Se não tem src/url, buscar da API do Shopify
+                        logger.info(f"🔍 Buscando URL da imagem {image_id} via API...")
+                        
+                        get_image_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
+                        headers = {
+                            'X-Shopify-Access-Token': access_token,
+                            'Content-Type': 'application/json'
+                        }
+                        
+                        img_data_response = await client.get(get_image_url, headers=headers)
+                        if img_data_response.status_code == 200:
+                            img_data = img_data_response.json()
+                            image_url = img_data.get('image', {}).get('src')
+                            logger.info(f"✅ URL encontrada: {image_url[:50]}...")
+                        else:
+                            raise Exception(f"Não foi possível obter URL da imagem via API")
+                    
                     if not image_url:
                         raise Exception("URL da imagem não encontrada")
                     
-                    logger.info(f"📥 Baixando imagem...")
+                    logger.info(f"📥 Baixando imagem de: {image_url[:50]}...")
                     
+                    # Baixar a imagem
                     img_response = await client.get(image_url, timeout=30.0)
                     if img_response.status_code != 200:
                         raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
                     
                     image_content = img_response.content
+                    logger.info(f"✅ Imagem baixada: {len(image_content)} bytes")
                     
                     # Converter para base64
                     import base64
@@ -815,11 +839,20 @@ async def process_rename_images_background(
                         'Content-Type': 'application/json'
                     }
                     
+                    # Determinar extensão do arquivo
+                    file_extension = '.jpg'
+                    if current_filename.lower().endswith('.png'):
+                        file_extension = '.png'
+                    elif current_filename.lower().endswith('.webp'):
+                        file_extension = '.webp'
+                    elif current_filename.lower().endswith('.gif'):
+                        file_extension = '.gif'
+                    
                     # Dados da nova imagem - MANTENDO ALT TEXT ORIGINAL!
                     new_image_data = {
                         "image": {
                             "attachment": image_base64,
-                            "filename": f"{new_filename}.jpg",
+                            "filename": f"{new_filename}{file_extension}",
                             "alt": original_alt,  # MANTÉM O ALT TEXT ORIGINAL!
                             "position": original_position
                         }
@@ -853,6 +886,8 @@ async def process_rename_images_background(
                     if delete_response.status_code not in [200, 204]:
                         logger.warning(f"⚠️ Aviso ao deletar imagem antiga: HTTP {delete_response.status_code}")
                         # Não falhar se não conseguir deletar, a nova já foi criada
+                    else:
+                        logger.info(f"✅ Imagem antiga deletada")
                     
                     successful += 1
                     
@@ -866,7 +901,7 @@ async def process_rename_images_background(
                         'height': created_image.get('height'),
                         'src': created_image.get('src'),
                         'url': created_image.get('src'),
-                        'filename': f"{new_filename}.jpg",
+                        'filename': f"{new_filename}{file_extension}",
                         'variant_ids': created_image.get('variant_ids', [])
                     }
                     
@@ -876,7 +911,7 @@ async def process_rename_images_background(
                         'product_id': product_id,
                         'status': 'success',
                         'old_name': current_filename,
-                        'new_name': f"{new_filename}.jpg",
+                        'new_name': f"{new_filename}{file_extension}",
                         'updated_image': updated_image
                     })
                     
@@ -889,7 +924,9 @@ async def process_rename_images_background(
                         'image_id': image.get('id'),
                         'product_id': image.get('product_id'),
                         'status': 'failed',
-                        'error': str(e)
+                        'error': str(e),
+                        'old_name': current_filename if 'current_filename' in locals() else 'unknown',
+                        'new_name': f"{new_filename}.jpg" if 'new_filename' in locals() else 'unknown'
                     })
                 
                 # Atualizar progresso
@@ -952,11 +989,11 @@ def render_rename_template(template: str, image: Dict) -> str:
     try:
         result = template
         
-        # Substituir variáveis do produto
-        result = re.sub(r'\{\{\s*product\.title\s*\}\}', image.get('product_title', ''), result)
-        result = re.sub(r'\{\{\s*product\.handle\s*\}\}', image.get('product_handle', ''), result)
-        result = re.sub(r'\{\{\s*product\.vendor\s*\}\}', image.get('product_vendor', ''), result)
-        result = re.sub(r'\{\{\s*product\.type\s*\}\}', image.get('product_type', ''), result)
+        # Substituir variáveis do produto (com valores padrão se não existirem)
+        result = re.sub(r'\{\{\s*product\.title\s*\}\}', image.get('product_title', 'produto'), result)
+        result = re.sub(r'\{\{\s*product\.handle\s*\}\}', image.get('product_handle', 'produto'), result)
+        result = re.sub(r'\{\{\s*product\.vendor\s*\}\}', image.get('product_vendor', 'vendor'), result)
+        result = re.sub(r'\{\{\s*product\.type\s*\}\}', image.get('product_type', 'type'), result)
         result = re.sub(r'\{\{\s*image\.position\s*\}\}', str(image.get('position', 1)), result)
         
         # Substituir variáveis de variante se existirem
@@ -992,7 +1029,8 @@ def render_rename_template(template: str, image: Dict) -> str:
         
     except Exception as e:
         logger.error(f"❌ Erro ao renderizar template: {str(e)}")
-        return f"image-{image.get('id', 'unknown')}"
+        # Retornar um nome seguro em caso de erro
+        return f"image-{image.get('id', 'unknown')}-{int(datetime.now().timestamp())}"
 
 # ==================== ENDPOINT DE AGENDAMENTO DE RENOMEAÇÃO ====================
 
