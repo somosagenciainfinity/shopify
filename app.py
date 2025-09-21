@@ -2862,8 +2862,55 @@ async def cancel_task_alt(task_id: str):
 
 @app.get("/tasks")
 async def list_tasks_simple():
-    """Endpoint simples /tasks para compatibilidade"""
-    tasks_list = list(tasks_db.values())
+    """Endpoint simples /tasks para compatibilidade - OTIMIZADO PARA TASKSRUNNING"""
+    # RETORNAR APENAS TAREFAS ATIVAS E RECENTES!
+    active_tasks = []
+    recent_completed = []
+    
+    now = datetime.now()
+    
+    for task_id, task in tasks_db.items():
+        status = task.get("status")
+        
+        # Sempre incluir tarefas ativas
+        if status in ["processing", "running", "paused", "scheduled"]:
+            active_tasks.append(task)
+        # Incluir tarefas completadas das últimas 2 horas apenas
+        elif status in ["completed", "completed_with_errors", "failed", "cancelled"]:
+            completed_at = task.get("completed_at") or task.get("updated_at")
+            if completed_at:
+                try:
+                    completed_time = datetime.fromisoformat(completed_at.replace('Z', ''))
+                    # Só incluir se foi completada nas últimas 2 horas
+                    if (now - completed_time).total_seconds() < 7200:  # 2 horas
+                        # Criar versão simplificada da tarefa completada
+                        simplified_task = {
+                            "id": task["id"],
+                            "name": task.get("name"),
+                            "status": task["status"],
+                            "task_type": task.get("task_type", "bulk_edit"),
+                            "progress": task.get("progress", {}),
+                            "started_at": task.get("started_at"),
+                            "completed_at": task.get("completed_at"),
+                            "updated_at": task.get("updated_at"),
+                            # NÃO incluir config completo ou results grandes
+                            "config": {
+                                "itemCount": task.get("config", {}).get("itemCount", 0)
+                            },
+                            # Limitar results a 5 últimos
+                            "results": task.get("results", [])[-5:] if "results" in task else []
+                        }
+                        recent_completed.append(simplified_task)
+                except:
+                    pass
+    
+    # Combinar tarefas ativas e recentes
+    tasks_list = active_tasks + recent_completed
+    
+    # Ordenar por updated_at
+    tasks_list.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    
+    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas e {len(recent_completed)} recentes")
     
     return {
         "success": True,
@@ -2873,30 +2920,88 @@ async def list_tasks_simple():
 
 @app.get("/api/tasks/all")
 async def get_all_tasks():
-    """Retornar TODAS as tarefas com estatísticas"""
-    all_tasks = list(tasks_db.values())
+    """Retornar TODAS as tarefas com estatísticas - OTIMIZADO"""
+    all_tasks = []
+    stats = {
+        "scheduled": 0,
+        "processing": 0,
+        "paused": 0,
+        "completed": 0,
+        "completed_with_errors": 0,
+        "failed": 0,
+        "cancelled": 0
+    }
+    
+    for task_id, task in tasks_db.items():
+        status = task.get("status")
+        
+        # Atualizar estatísticas
+        if status == "scheduled":
+            stats["scheduled"] += 1
+        elif status in ["processing", "running"]:
+            stats["processing"] += 1
+        elif status == "paused":
+            stats["paused"] += 1
+        elif status == "completed":
+            stats["completed"] += 1
+        elif status == "completed_with_errors":
+            stats["completed_with_errors"] += 1
+        elif status == "failed":
+            stats["failed"] += 1
+        elif status == "cancelled":
+            stats["cancelled"] += 1
+        
+        # Para tarefas completadas, criar versão simplificada
+        if status in ["completed", "completed_with_errors", "failed", "cancelled"]:
+            simplified_task = {
+                "id": task["id"],
+                "name": task.get("name"),
+                "status": status,
+                "task_type": task.get("task_type", "bulk_edit"),
+                "priority": task.get("priority", "medium"),
+                "progress": {
+                    "processed": task.get("progress", {}).get("processed", 0),
+                    "total": task.get("progress", {}).get("total", 0),
+                    "successful": task.get("progress", {}).get("successful", 0),
+                    "failed": task.get("progress", {}).get("failed", 0),
+                    "percentage": task.get("progress", {}).get("percentage", 0)
+                },
+                "started_at": task.get("started_at"),
+                "completed_at": task.get("completed_at"),
+                "updated_at": task.get("updated_at"),
+                "created_at": task.get("created_at"),
+                # Dados mínimos de config
+                "config": {
+                    "itemCount": task.get("config", {}).get("itemCount", 0),
+                    "storeName": task.get("config", {}).get("storeName", "")
+                },
+                # Sem results completos
+                "results_count": len(task.get("results", []))
+            }
+            all_tasks.append(simplified_task)
+        else:
+            # Tarefas ativas podem ter mais detalhes
+            all_tasks.append(task)
     
     # Ordenar por updated_at mais recente
     all_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     
+    # Limitar a 100 tarefas mais recentes para evitar sobrecarga
+    if len(all_tasks) > 100:
+        all_tasks = all_tasks[:100]
+        logger.info(f"⚠️ Limitando resposta a 100 tarefas mais recentes (total no DB: {len(tasks_db)})")
+    
     return {
         "success": True,
         "total": len(all_tasks),
+        "total_in_db": len(tasks_db),
         "tasks": all_tasks,
-        "stats": {
-            "scheduled": sum(1 for t in all_tasks if t["status"] == "scheduled"),
-            "processing": sum(1 for t in all_tasks if t["status"] in ["processing", "running"]),
-            "paused": sum(1 for t in all_tasks if t["status"] == "paused"),
-            "completed": sum(1 for t in all_tasks if t["status"] == "completed"),
-            "completed_with_errors": sum(1 for t in all_tasks if t["status"] == "completed_with_errors"),
-            "failed": sum(1 for t in all_tasks if t["status"] == "failed"),
-            "cancelled": sum(1 for t in all_tasks if t["status"] == "cancelled")
-        }
+        "stats": stats
     }
 
 @app.get("/api/tasks/scheduled")
 async def get_scheduled_tasks():
-    """Retornar APENAS tarefas agendadas"""
+    """Retornar APENAS tarefas agendadas - JÁ OTIMIZADO"""
     scheduled_tasks = []
     
     for task_id, task in tasks_db.items():
@@ -2916,12 +3021,29 @@ async def get_scheduled_tasks():
 
 @app.get("/api/tasks/running")
 async def get_running_tasks():
-    """Retornar tarefas em execução e pausadas"""
+    """Retornar tarefas em execução e pausadas - OTIMIZADO"""
     active_tasks = []
     
     for task_id, task in tasks_db.items():
         if task.get("status") in ["processing", "running", "paused"]:
-            active_tasks.append(task)
+            # Para tarefas de renomeação com muitas imagens, simplificar
+            if task.get("task_type") == "rename_images" and len(task.get("config", {}).get("images", [])) > 50:
+                # Criar versão simplificada
+                simplified_task = dict(task)  # Cópia do task
+                # Reduzir config
+                simplified_task["config"] = {
+                    "template": task.get("config", {}).get("template"),
+                    "itemCount": task.get("config", {}).get("itemCount", 0),
+                    "storeName": task.get("config", {}).get("storeName"),
+                    "accessToken": task.get("config", {}).get("accessToken"),
+                    # NÃO incluir array completo de images
+                }
+                # Limitar results
+                if "results" in simplified_task:
+                    simplified_task["results"] = simplified_task["results"][-10:]
+                active_tasks.append(simplified_task)
+            else:
+                active_tasks.append(task)
     
     # Ordenar por progresso
     active_tasks.sort(key=lambda x: x.get("progress", {}).get("percentage", 0))
@@ -2933,6 +3055,77 @@ async def get_running_tasks():
         "total": len(active_tasks),
         "tasks": active_tasks
     }
+
+# ==================== LIMPEZA AUTOMÁTICA DE MEMÓRIA ====================
+
+async def cleanup_old_tasks():
+    """Limpar tarefas antigas da memória para evitar acúmulo"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Aguardar 5 minutos
+            
+            now = datetime.now()
+            tasks_to_remove = []
+            tasks_to_simplify = []
+            
+            for task_id, task in tasks_db.items():
+                status = task.get("status")
+                
+                # Remover tarefas completadas há mais de 24 horas
+                if status in ["completed", "failed", "cancelled", "completed_with_errors"]:
+                    completed_at = task.get("completed_at") or task.get("updated_at")
+                    if completed_at:
+                        try:
+                            completed_time = datetime.fromisoformat(completed_at.replace('Z', ''))
+                            hours_passed = (now - completed_time).total_seconds() / 3600
+                            
+                            if hours_passed > 24:  # Mais de 24 horas
+                                tasks_to_remove.append(task_id)
+                            elif hours_passed > 2:  # Entre 2 e 24 horas - simplificar
+                                tasks_to_simplify.append(task_id)
+                        except:
+                            pass
+            
+            # Remover tarefas muito antigas
+            for task_id in tasks_to_remove:
+                del tasks_db[task_id]
+                logger.info(f"🗑️ Tarefa antiga removida da memória: {task_id}")
+            
+            # Simplificar tarefas completadas recentes (liberar memória mas manter registro)
+            for task_id in tasks_to_simplify:
+                if task_id in tasks_db:
+                    task = tasks_db[task_id]
+                    # Manter apenas informações essenciais
+                    tasks_db[task_id] = {
+                        "id": task["id"],
+                        "name": task.get("name"),
+                        "status": task["status"],
+                        "task_type": task.get("task_type"),
+                        "progress": task.get("progress"),
+                        "started_at": task.get("started_at"),
+                        "completed_at": task.get("completed_at"),
+                        "updated_at": task.get("updated_at"),
+                        "config": {
+                            "itemCount": task.get("config", {}).get("itemCount", 0)
+                        },
+                        "results": []  # Limpar results
+                    }
+            
+            if tasks_to_remove or tasks_to_simplify:
+                logger.info(f"🧹 Limpeza: {len(tasks_to_remove)} removidas, {len(tasks_to_simplify)} simplificadas")
+                logger.info(f"📊 Total de tarefas na memória: {len(tasks_db)}")
+            
+        except Exception as e:
+            logger.error(f"❌ Erro na limpeza automática: {e}")
+
+# Atualizar o startup event
+@app.on_event("startup")
+async def startup_event():
+    """Iniciar verificador de tarefas agendadas e limpeza automática"""
+    asyncio.create_task(check_and_execute_scheduled_tasks())
+    asyncio.create_task(cleanup_old_tasks())  # NOVO: Limpeza automática
+    logger.info("⏰ Verificador de tarefas agendadas iniciado")
+    logger.info("🧹 Sistema de limpeza automática de memória iniciado")
 
 # ==================== STATUS E ATUALIZAÇÃO ====================
 
