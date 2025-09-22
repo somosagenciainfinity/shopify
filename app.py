@@ -640,7 +640,8 @@ async def process_rename_images(data: Dict[str, Any], background_tasks: Backgrou
         logger.info(f"✅ Validação concluída - {len(images)} imagens para processar")
         logger.info(f"✅ Criando tarefa {task_id}")
         
-        # Salvar tarefa na memória
+        # OTIMIZAÇÃO 1: NÃO ARMAZENAR ARRAY COMPLETO NO CONFIG
+        # Salvar tarefa na memória - SEM O ARRAY DE IMAGENS
         tasks_db[task_id] = {
             "id": task_id,
             "name": f"Renomeação - {len(images)} imagens",
@@ -659,12 +660,12 @@ async def process_rename_images(data: Dict[str, Any], background_tasks: Backgrou
             "updated_at": get_brazil_time_str(),
             "config": {
                 "template": template,
-                "images": images,
+                # REMOVIDO: "images": images,  # NÃO ARMAZENAR ARRAY COMPLETO!
                 "storeName": store_name,
                 "accessToken": access_token,
                 "itemCount": len(images)
             },
-            "results": []
+            "results": []  # Será limitado durante o processo
         }
         
         logger.info(f"✅ Tarefa {task_id} criada com {len(images)} imagens")
@@ -857,34 +858,11 @@ async def process_rename_images_background(
                     final_new_name = f"{new_filename}{file_extension}"
                     logger.info(f"📝 Nome final: {current_filename} → {final_new_name}")
                     
-                    # Verificar se já tem o nome correto
+                    # CORREÇÃO: NÃO PULAR MESMO SE JÁ TIVER O NOME CORRETO
+                    # SEMPRE PROCESSAR TODAS AS IMAGENS
                     if new_filename in current_filename or final_new_name == current_filename:
-                        logger.info(f"ℹ️ Imagem {image.get('id')} já tem o nome correto")
-                        unchanged += 1
-                        results.append({
-                            'image_id': image.get('id'),
-                            'product_id': image.get('product_id'),
-                            'status': 'unchanged',
-                            'old_name': current_filename,
-                            'new_name': final_new_name
-                        })
-                        processed += 1
-                        
-                        # Atualizar progresso
-                        percentage = round((processed / total) * 100)
-                        if task_id in tasks_db:
-                            tasks_db[task_id]["progress"] = {
-                                "processed": processed,
-                                "total": total,
-                                "successful": successful,
-                                "failed": failed,
-                                "unchanged": unchanged,
-                                "percentage": percentage,
-                                "current_image": f"Imagem {image.get('id')}" if i < len(images)-1 else None
-                            }
-                            tasks_db[task_id]["updated_at"] = get_brazil_time_str()
-                        
-                        continue
+                        logger.info(f"ℹ️ Imagem {image.get('id')} já tem o nome correto, mas será reprocessada mesmo assim")
+                        # NÃO FAZ CONTINUE! CONTINUA O PROCESSAMENTO NORMAL
                     
                     # PASSO 3: Salvar imagem processada em buffer
                     output_buffer = io.BytesIO()
@@ -995,8 +973,8 @@ async def process_rename_images_background(
                         'filename': final_new_name,
                         'variant_ids': created_image.get('variant_ids', []),
                         'has_transparency': has_transparency,
-                        'original_format': original_format,
-                        'original_url': image_url
+                        'original_format': original_format
+                        # REMOVIDO: 'original_url': image_url  # NÃO ARMAZENAR URL ORIGINAL
                     }
                     
                     results.append({
@@ -1048,7 +1026,12 @@ async def process_rename_images_background(
                         "current_image": current_image_info
                     }
                     tasks_db[task_id]["updated_at"] = get_brazil_time_str()
-                    tasks_db[task_id]["results"] = results[-50:]
+                    
+                    # OTIMIZAÇÃO 2: LIMITAR RESULTS DURANTE O PROCESSO
+                    if len(results) > 20:
+                        tasks_db[task_id]["results"] = results[-20:]
+                    else:
+                        tasks_db[task_id]["results"] = results.copy()
                 
                 # Verificar novamente se foi pausado/cancelado
                 if task_id in tasks_db:
@@ -1065,7 +1048,20 @@ async def process_rename_images_background(
         if task_id in tasks_db:
             tasks_db[task_id]["status"] = final_status
             tasks_db[task_id]["completed_at"] = get_brazil_time_str()
-            tasks_db[task_id]["results"] = results
+            
+            # OTIMIZAÇÃO 3: LIMPAR DADOS APÓS CONCLUSÃO
+            # Manter apenas últimos 10 results para tarefas completadas
+            tasks_db[task_id]["results"] = results[-10:]
+            
+            # Limpar config desnecessário
+            if "config" in tasks_db[task_id]:
+                tasks_db[task_id]["config"] = {
+                    "template": tasks_db[task_id]["config"].get("template"),
+                    "itemCount": tasks_db[task_id]["config"].get("itemCount"),
+                    "storeName": tasks_db[task_id]["config"].get("storeName")
+                    # REMOVIDO accessToken e outros dados sensíveis
+                }
+            
             tasks_db[task_id]["progress"]["current_image"] = None
             
             logger.info(f"🏁 PROCESSO DE RENOMEAÇÃO FINALIZADO:")
@@ -1080,6 +1076,13 @@ async def process_rename_images_background(
             tasks_db[task_id]["status"] = "failed"
             tasks_db[task_id]["error"] = str(e)
             tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+            
+            # OTIMIZAÇÃO 3: LIMPAR DADOS EM CASO DE ERRO TAMBÉM
+            if "config" in tasks_db[task_id]:
+                tasks_db[task_id]["config"] = {
+                    "itemCount": tasks_db[task_id]["config"].get("itemCount", 0)
+                }
+            tasks_db[task_id]["results"] = []  # Limpar results em caso de erro
 
 def render_rename_template(template: str, image: Dict) -> str:
     """
