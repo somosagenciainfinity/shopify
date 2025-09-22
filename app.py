@@ -1092,25 +1092,24 @@ def render_rename_template(template: str, image: Dict) -> str:
     try:
         result = template
         
-        # Substituir variáveis do produto (com valores padrão se não existirem)
+        # Substituir variáveis do produto
         result = re.sub(r'\{\{\s*product\.title\s*\}\}', image.get('product_title', 'produto'), result)
         result = re.sub(r'\{\{\s*product\.handle\s*\}\}', image.get('product_handle', 'produto'), result)
         result = re.sub(r'\{\{\s*product\.vendor\s*\}\}', image.get('product_vendor', 'vendor'), result)
         result = re.sub(r'\{\{\s*product\.type\s*\}\}', image.get('product_type', 'type'), result)
         result = re.sub(r'\{\{\s*image\.position\s*\}\}', str(image.get('position', 1)), result)
         
-        # Substituir variáveis de variante se existirem
-        variant = None
-        if image.get('variant_associations'):
-            variant = image['variant_associations'][0] if len(image['variant_associations']) > 0 else None
+        # CORREÇÃO: USAR variant_data QUE O FRONTEND ESTÁ ENVIANDO!
+        variant_data = image.get('variant_data', {})
         
-        if variant:
-            result = re.sub(r'\{\{\s*variant\.name1\s*\}\}', variant.get('option1_name', ''), result)
-            result = re.sub(r'\{\{\s*variant\.name2\s*\}\}', variant.get('option2_name', ''), result)
-            result = re.sub(r'\{\{\s*variant\.name3\s*\}\}', variant.get('option3_name', ''), result)
-            result = re.sub(r'\{\{\s*variant\.value1\s*\}\}', variant.get('option1', ''), result)
-            result = re.sub(r'\{\{\s*variant\.value2\s*\}\}', variant.get('option2', ''), result)
-            result = re.sub(r'\{\{\s*variant\.value3\s*\}\}', variant.get('option3', ''), result)
+        if variant_data:
+            # Usar os dados corretos enviados pelo frontend
+            result = re.sub(r'\{\{\s*variant\.name1\s*\}\}', variant_data.get('name1', ''), result)
+            result = re.sub(r'\{\{\s*variant\.name2\s*\}\}', variant_data.get('name2', ''), result)
+            result = re.sub(r'\{\{\s*variant\.name3\s*\}\}', variant_data.get('name3', ''), result)
+            result = re.sub(r'\{\{\s*variant\.value1\s*\}\}', variant_data.get('value1', ''), result)
+            result = re.sub(r'\{\{\s*variant\.value2\s*\}\}', variant_data.get('value2', ''), result)
+            result = re.sub(r'\{\{\s*variant\.value3\s*\}\}', variant_data.get('value3', ''), result)
         else:
             # Limpar variáveis de variante se não houver
             result = re.sub(r'\{\{\s*variant\.name[1-3]\s*\}\}', '', result)
@@ -1132,7 +1131,6 @@ def render_rename_template(template: str, image: Dict) -> str:
         
     except Exception as e:
         logger.error(f"❌ Erro ao renderizar template: {str(e)}")
-        # Retornar um nome seguro em caso de erro
         return f"image-{image.get('id', 'unknown')}-{int(datetime.now().timestamp())}"
 
 # ==================== ENDPOINT DE AGENDAMENTO DE RENOMEAÇÃO ====================
