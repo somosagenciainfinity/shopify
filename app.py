@@ -1297,6 +1297,524 @@ async def schedule_rename_task(data: Dict[str, Any], background_tasks: Backgroun
             }
         }
 
+# ==================== ENDPOINTS DE OTIMIZAÇÃO DE IMAGENS ====================
+
+@app.post("/api/images/optimize")
+async def optimize_images(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """
+    Endpoint para otimizar imagens (redimensionar mantendo proporção)
+    Preserva: nome do arquivo, transparência, alt-text, ordem das imagens
+    """
+    
+    task_id = data.get("id") or f"optimize_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    logger.info(f"📋 Nova tarefa de otimização de imagens {task_id}")
+    logger.info(f"🎯 Altura alvo: {data.get('targetHeight', 800)}px")
+    logger.info(f"📸 Imagens para processar: {len(data.get('images', []))}")
+    
+    images = data.get("images", [])
+    target_height = data.get("targetHeight", 800)
+    store_name = data.get("storeName", "")
+    access_token = data.get("accessToken", "")
+    
+    if not images:
+        raise HTTPException(status_code=400, detail="Nenhuma imagem para otimizar")
+    if not store_name or not access_token:
+        raise HTTPException(status_code=400, detail="Credenciais da loja não fornecidas")
+    
+    # Salvar tarefa na memória
+    tasks_db[task_id] = {
+        "id": task_id,
+        "name": f"Otimização - {len(images)} imagens para {target_height}px",
+        "status": "processing",
+        "task_type": "image_optimization",
+        "progress": {
+            "processed": 0,
+            "total": len(images),
+            "successful": 0,
+            "failed": 0,
+            "percentage": 0,
+            "current_image": None
+        },
+        "started_at": get_brazil_time_str(),
+        "updated_at": get_brazil_time_str(),
+        "config": {
+            "targetHeight": target_height,
+            "storeName": store_name,
+            "accessToken": access_token,
+            "itemCount": len(images)
+        },
+        "settings": {
+            "targetHeight": target_height
+        },
+        "results": []
+    }
+    
+    logger.info(f"✅ Tarefa de otimização {task_id} iniciada")
+    
+    # Processar em background
+    background_tasks.add_task(
+        process_image_optimization_background,
+        task_id,
+        images,
+        target_height,
+        store_name,
+        access_token
+    )
+    
+    return {
+        "success": True,
+        "message": f"Otimização iniciada para {len(images)} imagens",
+        "taskId": task_id,
+        "estimatedTime": f"{len(images) * 2:.1f} segundos",
+        "mode": "background_processing"
+    }
+
+async def process_image_optimization_background(
+    task_id: str,
+    images: List[Dict],
+    target_height: int,
+    store_name: str,
+    access_token: str,
+    is_resume: bool = False
+):
+    """
+    Processar otimização de imagens em background
+    Download -> Redimensionar com Pillow -> Upload -> Deletar original
+    """
+    
+    try:
+        from PIL import Image
+        import io
+        import base64
+        
+        if not is_resume:
+            logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DE IMAGENS: {task_id}")
+        else:
+            logger.info(f"▶️ RETOMANDO OTIMIZAÇÃO: {task_id}")
+        
+        logger.info(f"🎯 Altura alvo: {target_height}px")
+        logger.info(f"📸 Total de imagens: {len(images)}")
+        
+        clean_store = store_name.replace('.myshopify.com', '').strip()
+        api_version = '2024-01'
+        
+        # Se for retomada, pegar progresso existente
+        if is_resume and task_id in tasks_db:
+            task = tasks_db[task_id]
+            processed = task["progress"]["processed"]
+            successful = task["progress"]["successful"]
+            failed = task["progress"]["failed"]
+            results = task.get("results", [])
+            total = task["progress"]["total"]
+        else:
+            processed = 0
+            successful = 0
+            failed = 0
+            results = []
+            total = len(images)
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for i, image in enumerate(images[processed:], start=processed):
+                # Verificar se foi pausada ou cancelada
+                if task_id not in tasks_db:
+                    logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
+                    return
+                
+                current_status = tasks_db[task_id].get("status")
+                if current_status in ["paused", "cancelled"]:
+                    logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
+                    return
+                
+                try:
+                    # Informações da imagem original
+                    image_url = image.get('src') or image.get('url')
+                    original_filename = image.get('filename', '')
+                    original_alt = image.get('alt', '')
+                    original_position = image.get('position', 1)
+                    original_width = image.get('dimensions', {}).get('width', 0)
+                    original_height = image.get('dimensions', {}).get('height', 0)
+                    
+                    logger.info(f"📥 Processando imagem {image.get('id')}: {original_filename}")
+                    logger.info(f"   Dimensões originais: {original_width}x{original_height}px")
+                    
+                    # Verificar se precisa otimização
+                    if original_height <= target_height:
+                        logger.info(f"ℹ️ Imagem já está otimizada (altura: {original_height}px)")
+                        processed += 1
+                        continue
+                    
+                    # PASSO 1: Baixar imagem original
+                    img_response = await client.get(image_url, timeout=30.0)
+                    if img_response.status_code != 200:
+                        raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
+                    
+                    image_content = img_response.content
+                    logger.info(f"✅ Imagem baixada: {len(image_content)} bytes")
+                    
+                    # PASSO 2: Processar com Pillow
+                    img_buffer = io.BytesIO(image_content)
+                    pil_image = Image.open(img_buffer)
+                    
+                    # Detectar formato e transparência
+                    original_format = pil_image.format or 'PNG'
+                    has_transparency = False
+                    
+                    # Verificar transparência
+                    if pil_image.mode in ('RGBA', 'LA'):
+                        has_transparency = True
+                        logger.info(f"✅ Transparência detectada (mode: {pil_image.mode})")
+                    elif pil_image.mode == 'P' and 'transparency' in pil_image.info:
+                        has_transparency = True
+                        logger.info(f"✅ Transparência detectada (palette)")
+                    
+                    # Calcular novas dimensões mantendo proporção
+                    ratio = original_width / original_height
+                    new_height = target_height
+                    new_width = int(new_height * ratio)
+                    
+                    logger.info(f"🔄 Redimensionando: {original_width}x{original_height} → {new_width}x{new_height}")
+                    
+                    # Redimensionar imagem
+                    if has_transparency:
+                        # Preservar canal alpha
+                        if pil_image.mode != 'RGBA':
+                            pil_image = pil_image.convert('RGBA')
+                        resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        save_format = 'PNG'
+                        file_extension = '.png'
+                    else:
+                        # Converter para RGB se necessário
+                        if pil_image.mode != 'RGB':
+                            pil_image = pil_image.convert('RGB')
+                        resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        save_format = 'JPEG'
+                        file_extension = '.jpg'
+                    
+                    # PASSO 3: Salvar imagem otimizada
+                    output_buffer = io.BytesIO()
+                    
+                    save_kwargs = {
+                        'format': save_format,
+                        'optimize': True
+                    }
+                    
+                    if save_format == 'PNG':
+                        save_kwargs['compress_level'] = 6
+                        if has_transparency:
+                            save_kwargs['transparency'] = pil_image.info.get('transparency', None)
+                        logger.info(f"💎 Salvando PNG com transparência preservada")
+                    else:
+                        save_kwargs['quality'] = 90  # Alta qualidade para JPG
+                        logger.info(f"📸 Salvando JPEG com qualidade 90")
+                    
+                    resized_image.save(output_buffer, **save_kwargs)
+                    output_buffer.seek(0)
+                    
+                    # Converter para base64
+                    optimized_image_bytes = output_buffer.getvalue()
+                    image_base64 = base64.b64encode(optimized_image_bytes).decode('utf-8')
+                    
+                    # Calcular economia
+                    original_size = len(image_content)
+                    optimized_size = len(optimized_image_bytes)
+                    savings_percentage = round(((original_size - optimized_size) / original_size) * 100)
+                    
+                    logger.info(f"✅ Imagem otimizada: {len(optimized_image_bytes)} bytes ({savings_percentage}% menor)")
+                    
+                    # PASSO 4: Criar nova imagem no Shopify (mesma posição)
+                    create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images.json"
+                    
+                    headers = {
+                        'X-Shopify-Access-Token': access_token,
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    # Manter o mesmo nome de arquivo
+                    new_filename = original_filename
+                    if not new_filename.endswith(file_extension):
+                        # Ajustar extensão se mudou o formato
+                        base_name = new_filename.rsplit('.', 1)[0] if '.' in new_filename else new_filename
+                        new_filename = f"{base_name}{file_extension}"
+                    
+                    new_image_data = {
+                        "image": {
+                            "attachment": image_base64,
+                            "filename": new_filename,  # Manter mesmo nome
+                            "alt": original_alt,  # Manter mesmo alt-text
+                            "position": original_position  # Manter mesma posição
+                        }
+                    }
+                    
+                    # Manter variantes associadas se houver
+                    if image.get('variant_ids'):
+                        new_image_data["image"]["variant_ids"] = image['variant_ids']
+                    
+                    create_response = await client.post(
+                        create_url,
+                        headers=headers,
+                        json=new_image_data
+                    )
+                    
+                    if create_response.status_code not in [200, 201]:
+                        error_text = create_response.text
+                        raise Exception(f"Erro ao criar imagem otimizada: {error_text}")
+                    
+                    created_image = create_response.json().get('image', {})
+                    new_image_id = created_image.get('id')
+                    
+                    logger.info(f"✅ Nova imagem otimizada criada com ID: {new_image_id}")
+                    
+                    # PASSO 5: Deletar imagem original
+                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
+                    delete_response = await client.delete(delete_url, headers=headers)
+                    
+                    if delete_response.status_code not in [200, 204]:
+                        logger.warning(f"⚠️ Aviso ao deletar imagem original: HTTP {delete_response.status_code}")
+                    else:
+                        logger.info(f"✅ Imagem original removida")
+                    
+                    successful += 1
+                    
+                    results.append({
+                        'image_id': image.get('id'),
+                        'new_image_id': new_image_id,
+                        'product_id': image.get('product_id'),
+                        'status': 'success',
+                        'original_dimensions': f"{original_width}x{original_height}",
+                        'new_dimensions': f"{new_width}x{new_height}",
+                        'savings_percentage': savings_percentage,
+                        'transparency_preserved': has_transparency
+                    })
+                    
+                    # Limpar memória
+                    pil_image.close()
+                    resized_image.close()
+                    img_buffer.close()
+                    output_buffer.close()
+                    
+                except Exception as e:
+                    logger.error(f"❌ Erro ao otimizar imagem {image.get('id')}: {str(e)}")
+                    failed += 1
+                    results.append({
+                        'image_id': image.get('id'),
+                        'product_id': image.get('product_id'),
+                        'status': 'failed',
+                        'error': str(e)
+                    })
+                
+                # Atualizar progresso
+                processed += 1
+                percentage = round((processed / total) * 100)
+                
+                if task_id in tasks_db:
+                    tasks_db[task_id]["progress"] = {
+                        "processed": processed,
+                        "total": total,
+                        "successful": successful,
+                        "failed": failed,
+                        "percentage": percentage,
+                        "current_image": f"Imagem {image.get('id')}" if i < len(images)-1 else None
+                    }
+                    tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                    tasks_db[task_id]["results"] = results[-20:]
+                
+                # Verificar novamente se foi pausada/cancelada
+                if task_id in tasks_db:
+                    if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
+                        logger.info(f"🛑 Parando após processar imagem {image.get('id')}")
+                        return
+                
+                # Rate limiting
+                await asyncio.sleep(0.8)
+        
+        # Finalizar tarefa
+        final_status = "completed" if failed == 0 else "completed_with_errors"
+        
+        if task_id in tasks_db:
+            tasks_db[task_id]["status"] = final_status
+            tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+            tasks_db[task_id]["results"] = results[-10:]
+            tasks_db[task_id]["progress"]["current_image"] = None
+            
+            logger.info(f"🏁 OTIMIZAÇÃO FINALIZADA:")
+            logger.info(f"   ✅ Otimizadas: {successful}")
+            logger.info(f"   ❌ Falhas: {failed}")
+            logger.info(f"   📊 Total: {processed}/{total}")
+            
+    except Exception as e:
+        logger.error(f"❌ Erro crítico na otimização: {str(e)}")
+        if task_id in tasks_db:
+            tasks_db[task_id]["status"] = "failed"
+            tasks_db[task_id]["error"] = str(e)
+            tasks_db[task_id]["completed_at"] = get_brazil_time_str()
+
+@app.post("/api/images/schedule-optimization")
+async def schedule_image_optimization(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """
+    Agendar tarefa de otimização de imagens
+    Suporta todas as funcionalidades de agendamento e notificações
+    """
+    
+    task_id = data.get("id") or f"scheduled_optimize_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    
+    logger.info(f"📋 Recebendo agendamento de otimização: {data.get('name')}")
+    logger.info(f"⏰ Para executar em: {data.get('scheduled_for')}")
+    
+    scheduled_for = data.get("scheduled_for", get_brazil_time_str())
+    
+    # Processar timezone
+    if scheduled_for.endswith('Z'):
+        scheduled_for_clean = scheduled_for[:-1]
+        scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+        scheduled_time_local = scheduled_time.astimezone()
+        scheduled_time_naive = scheduled_time_local.replace(tzinfo=None)
+    else:
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_for)
+            if scheduled_time.tzinfo is not None:
+                scheduled_time_naive = scheduled_time.replace(tzinfo=None)
+            else:
+                scheduled_time_naive = scheduled_time
+        except:
+            scheduled_time_naive = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+    
+    now = datetime.now()
+    
+    logger.info(f"📅 Horário convertido para local: {scheduled_time_naive}")
+    logger.info(f"📅 Horário atual do servidor: {now}")
+    
+    # Processar notificações se configuradas
+    notification_scheduled_for = None
+    notification_config = data.get("notifications", {})
+    
+    if notification_config and notification_config.get("before_execution"):
+        notification_time_minutes = notification_config.get("notification_time", 30)
+        
+        # Calcular horário da notificação
+        notification_datetime = scheduled_time_naive - timedelta(minutes=notification_time_minutes)
+        notification_scheduled_for = notification_datetime.isoformat()
+        
+        logger.info(f"📱 Notificação configurada para: {notification_datetime}")
+        logger.info(f"   ({notification_time_minutes} minutos antes da execução)")
+    
+    # Verificar se deve executar imediatamente ou agendar
+    if scheduled_time_naive <= now:
+        logger.info(f"📅 Tarefa de otimização {task_id} agendada para horário passado, executando imediatamente!")
+        
+        # Criar tarefa com status processing
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Otimização de Imagens"),
+            "task_type": "image_optimization",
+            "status": "processing",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,
+            "started_at": get_brazil_time_str(),
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": {
+                **data.get("config", {}),
+                "notifications": notification_config
+            },
+            "settings": {
+                "targetHeight": data.get("config", {}).get("targetHeight", 800)
+            },
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0,
+                "current_image": None
+            },
+            "results": []
+        }
+        
+        tasks_db[task_id] = task
+        
+        # Processar imediatamente em background
+        config = task.get("config", {})
+        background_tasks.add_task(
+            process_image_optimization_background,
+            task_id,
+            config.get("images", []),
+            config.get("targetHeight", 800),
+            config.get("storeName", ""),
+            config.get("accessToken", "")
+        )
+        
+        logger.info(f"▶️ Tarefa de otimização {task_id} iniciada imediatamente")
+        
+        return {
+            "success": True,
+            "taskId": task_id,
+            "task": task,
+            "message": "Tarefa iniciada imediatamente (horário já passou)",
+            "execution": "immediate"
+        }
+    else:
+        # Agendar para execução futura
+        task = {
+            "id": task_id,
+            "name": data.get("name", "Otimização de Imagens"),
+            "task_type": "image_optimization",
+            "status": "scheduled",
+            "scheduled_for": scheduled_for,
+            "scheduled_for_local": scheduled_time_naive.isoformat(),
+            "notification_scheduled_for": notification_scheduled_for,
+            "priority": data.get("priority", "medium"),
+            "description": data.get("description", ""),
+            "config": {
+                **data.get("config", {}),
+                "notifications": notification_config
+            },
+            "settings": {
+                "targetHeight": data.get("config", {}).get("targetHeight", 800)
+            },
+            "created_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "progress": {
+                "processed": 0,
+                "total": data.get("config", {}).get("itemCount", 0),
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0,
+                "current_image": None
+            },
+            "results": []
+        }
+        
+        tasks_db[task_id] = task
+        
+        # Calcular tempo restante
+        diff = (scheduled_time_naive - now).total_seconds()
+        hours = int(diff // 3600)
+        minutes = int((diff % 3600) // 60)
+        
+        time_msg = f"{hours}h {minutes}min" if hours > 0 else f"{minutes} minutos"
+        
+        logger.info(f"📅 Tarefa de otimização {task_id} agendada para {scheduled_time_naive}")
+        logger.info(f"⏱️ Será executada em {time_msg}")
+        
+        return {
+            "success": True,
+            "taskId": task_id,
+            "task": task,
+            "message": f"Tarefa agendada com sucesso para execução em {time_msg}",
+            "execution": "scheduled",
+            "scheduled_time": scheduled_time_naive.isoformat(),
+            "time_remaining": {
+                "seconds": int(diff),
+                "minutes": minutes + (hours * 60),
+                "hours": hours,
+                "formatted": time_msg
+            }
+        }
+
 # ==================== ENDPOINTS DE NOTIFICAÇÕES (NOVOS) ====================
 
 @app.get("/api/notifications/pending")
@@ -2823,6 +3341,46 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
                 "message": "Tarefa já estava completa",
                 "task": task
             }
+elif task_type == "image_optimization":
+    # RETOMAR OTIMIZAÇÃO DE IMAGENS
+    all_images = config.get("images", [])
+    processed_count = task.get("progress", {}).get("processed", 0)
+    remaining_images = all_images[processed_count:]
+    
+    logger.info(f"🖼️ Retomando otimização de imagens:")
+    logger.info(f"   Total de imagens: {len(all_images)}")
+    logger.info(f"   Já processadas: {processed_count}")
+    logger.info(f"   Restantes: {len(remaining_images)}")
+    
+    if len(remaining_images) > 0:
+        background_tasks.add_task(
+            process_image_optimization_background,
+            task_id,
+            remaining_images,
+            config.get("targetHeight", 800),
+            config.get("storeName", ""),
+            config.get("accessToken", ""),
+            is_resume=True
+        )
+        
+        logger.info(f"✅ Tarefa de otimização {task_id} retomada com {len(remaining_images)} imagens")
+        
+        return {
+            "success": True,
+            "message": f"Tarefa de otimização retomada com sucesso",
+            "task": task,
+            "remaining": len(remaining_images),
+            "progress": task.get("progress")
+        }
+    else:
+        task["status"] = "completed"
+        task["completed_at"] = get_brazil_time_str()
+        
+        return {
+            "success": True,
+            "message": "Tarefa já estava completa",
+            "task": task
+        }
 
 # ==================== CANCELAR TAREFAS ====================
 
@@ -3646,6 +4204,19 @@ async def check_and_execute_scheduled_tasks():
                                     config.get("accessToken", "")
                                 )
                             )
+elif task.get("task_type") == "image_optimization":
+    # Processar otimização de imagens
+    logger.info(f"🖼️ Executando tarefa agendada de otimização: {task_id}")
+    
+    asyncio.create_task(
+        process_image_optimization_background(
+            task_id,
+            config.get("images", []),
+            config.get("targetHeight", 800),
+            config.get("storeName", ""),
+            config.get("accessToken", "")
+        )
+    )
             
             # Verificar a cada 20 segundos
             await asyncio.sleep(20)
