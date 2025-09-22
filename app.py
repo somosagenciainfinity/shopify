@@ -1308,12 +1308,16 @@ async def optimize_images(data: Dict[str, Any], background_tasks: BackgroundTask
     
     task_id = data.get("id") or f"optimize_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
     
+    # PEGAR targetHeight DO FRONTEND!
+    target_height = data.get("targetHeight")
+    if not target_height:
+        raise HTTPException(status_code=400, detail="targetHeight não fornecido")
+    
     logger.info(f"📋 Nova tarefa de otimização de imagens {task_id}")
-    logger.info(f"🎯 Altura alvo: {data.get('targetHeight', 800)}px")
+    logger.info(f"🎯 Altura alvo: {target_height}px (recebido do frontend)")
     logger.info(f"📸 Imagens para processar: {len(data.get('images', []))}")
     
     images = data.get("images", [])
-    target_height = data.get("targetHeight", 800)
     store_name = data.get("storeName", "")
     access_token = data.get("accessToken", "")
     
@@ -1342,7 +1346,8 @@ async def optimize_images(data: Dict[str, Any], background_tasks: BackgroundTask
             "targetHeight": target_height,
             "storeName": store_name,
             "accessToken": access_token,
-            "itemCount": len(images)
+            "itemCount": len(images),
+            "images": images  # IMPORTANTE: Salvar imagens no config para retomada
         },
         "settings": {
             "targetHeight": target_height
@@ -1698,6 +1703,11 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
         logger.info(f"📱 Notificação configurada para: {notification_datetime}")
         logger.info(f"   ({notification_time_minutes} minutos antes da execução)")
     
+    # PEGAR targetHeight DO CONFIG!
+    target_height = data.get("config", {}).get("targetHeight")
+    if not target_height:
+        raise HTTPException(status_code=400, detail="targetHeight não fornecido no config")
+    
     # Verificar se deve executar imediatamente ou agendar
     if scheduled_time_naive <= now:
         logger.info(f"📅 Tarefa de otimização {task_id} agendada para horário passado, executando imediatamente!")
@@ -1719,7 +1729,7 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
                 "notifications": notification_config
             },
             "settings": {
-                "targetHeight": data.get("config", {}).get("targetHeight", 800)
+                "targetHeight": target_height
             },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
@@ -1742,7 +1752,7 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
             process_image_optimization_background,
             task_id,
             config.get("images", []),
-            config.get("targetHeight", 800),
+            target_height,  # USAR O targetHeight DO CONFIG
             config.get("storeName", ""),
             config.get("accessToken", "")
         )
@@ -1773,7 +1783,7 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
                 "notifications": notification_config
             },
             "settings": {
-                "targetHeight": data.get("config", {}).get("targetHeight", 800)
+                "targetHeight": target_height
             },
             "created_at": get_brazil_time_str(),
             "updated_at": get_brazil_time_str(),
@@ -3303,6 +3313,56 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
                 "message": "Tarefa já estava completa",
                 "task": task
             }
+    elif task_type == "image_optimization":
+        # RETOMAR OTIMIZAÇÃO DE IMAGENS
+        all_images = config.get("images", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_images = all_images[processed_count:]
+        
+        # PEGAR targetHeight DO CONFIG!
+        target_height = config.get("targetHeight")
+        if not target_height:
+            logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
+            return {
+                "success": False,
+                "message": "targetHeight não configurado na tarefa"
+            }
+        
+        logger.info(f"🖼️ Retomando otimização de imagens:")
+        logger.info(f"   Total de imagens: {len(all_images)}")
+        logger.info(f"   Já processadas: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_images)}")
+        logger.info(f"   Altura alvo: {target_height}px")
+        
+        if len(remaining_images) > 0:
+            background_tasks.add_task(
+                process_image_optimization_background,
+                task_id,
+                remaining_images,
+                target_height,  # USAR O targetHeight DO CONFIG
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True
+            )
+            
+            logger.info(f"✅ Tarefa de otimização {task_id} retomada com {len(remaining_images)} imagens")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de otimização retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_images),
+                "progress": task.get("progress")
+            }
+        else:
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
     else:
         # RETOMAR BULK EDIT NORMAL
         all_product_ids = config.get("productIds", [])
@@ -3341,46 +3401,6 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
                 "message": "Tarefa já estava completa",
                 "task": task
             }
-elif task_type == "image_optimization":
-    # RETOMAR OTIMIZAÇÃO DE IMAGENS
-    all_images = config.get("images", [])
-    processed_count = task.get("progress", {}).get("processed", 0)
-    remaining_images = all_images[processed_count:]
-    
-    logger.info(f"🖼️ Retomando otimização de imagens:")
-    logger.info(f"   Total de imagens: {len(all_images)}")
-    logger.info(f"   Já processadas: {processed_count}")
-    logger.info(f"   Restantes: {len(remaining_images)}")
-    
-    if len(remaining_images) > 0:
-        background_tasks.add_task(
-            process_image_optimization_background,
-            task_id,
-            remaining_images,
-            config.get("targetHeight", 800),
-            config.get("storeName", ""),
-            config.get("accessToken", ""),
-            is_resume=True
-        )
-        
-        logger.info(f"✅ Tarefa de otimização {task_id} retomada com {len(remaining_images)} imagens")
-        
-        return {
-            "success": True,
-            "message": f"Tarefa de otimização retomada com sucesso",
-            "task": task,
-            "remaining": len(remaining_images),
-            "progress": task.get("progress")
-        }
-    else:
-        task["status"] = "completed"
-        task["completed_at"] = get_brazil_time_str()
-        
-        return {
-            "success": True,
-            "message": "Tarefa já estava completa",
-            "task": task
-        }
 
 # ==================== CANCELAR TAREFAS ====================
 
@@ -4193,6 +4213,27 @@ async def check_and_execute_scheduled_tasks():
                                     config.get("accessToken", "")
                                 )
                             )
+                        elif task.get("task_type") == "image_optimization":
+                            # Processar otimização de imagens
+                            logger.info(f"🖼️ Executando tarefa agendada de otimização: {task_id}")
+                            
+                            # PEGAR targetHeight DO CONFIG!
+                            target_height = config.get("targetHeight")
+                            if not target_height:
+                                logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
+                                task["status"] = "failed"
+                                task["error"] = "targetHeight não configurado"
+                                continue
+                            
+                            asyncio.create_task(
+                                process_image_optimization_background(
+                                    task_id,
+                                    config.get("images", []),
+                                    target_height,  # USAR O targetHeight DO CONFIG
+                                    config.get("storeName", ""),
+                                    config.get("accessToken", "")
+                                )
+                            )
                         else:
                             # Processar edição em massa normal
                             asyncio.create_task(
@@ -4204,19 +4245,6 @@ async def check_and_execute_scheduled_tasks():
                                     config.get("accessToken", "")
                                 )
                             )
-elif task.get("task_type") == "image_optimization":
-    # Processar otimização de imagens
-    logger.info(f"🖼️ Executando tarefa agendada de otimização: {task_id}")
-    
-    asyncio.create_task(
-        process_image_optimization_background(
-            task_id,
-            config.get("images", []),
-            config.get("targetHeight", 800),
-            config.get("storeName", ""),
-            config.get("accessToken", "")
-        )
-    )
             
             # Verificar a cada 20 segundos
             await asyncio.sleep(20)
