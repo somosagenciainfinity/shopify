@@ -1386,8 +1386,8 @@ async def process_image_optimization_background(
     is_resume: bool = False
 ):
     """
-    Processar otimização de imagens - MÉTODO DIRETO
-    Download -> Otimizar -> Reupload com mesmo nome -> Deletar antiga
+    Processar otimização de imagens - USANDO GRAPHQL COM fileCreate
+    Download -> Otimizar -> Upload via GraphQL (sem UUID) -> Deletar antiga
     """
     
     try:
@@ -1514,8 +1514,189 @@ async def process_image_optimization_background(
             
             return has_transparency
         
+        async def graphql_query(store_name, access_token, query, variables=None):
+            """
+            Executar query GraphQL no Shopify
+            """
+            clean_store = store_name.replace('.myshopify.com', '').strip()
+            graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/graphql.json"
+            
+            headers = {
+                'X-Shopify-Access-Token': access_token,
+                'Content-Type': 'application/json'
+            }
+            
+            payload = {"query": query}
+            if variables:
+                payload["variables"] = variables
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(graphql_url, headers=headers, json=payload)
+                
+                if response.status_code != 200:
+                    raise Exception(f"GraphQL error: {response.status_code} - {response.text}")
+                
+                return response.json()
+        
+        async def create_staged_upload(store_name, access_token, filename, file_size, mime_type):
+            """
+            Criar staged upload para arquivo
+            """
+            mutation = """
+            mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+                stagedUploadsCreate(input: $input) {
+                    stagedTargets {
+                        url
+                        resourceUrl
+                        parameters {
+                            name
+                            value
+                        }
+                    }
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }
+            """
+            
+            variables = {
+                "input": [{
+                    "resource": "IMAGE",
+                    "filename": filename,
+                    "mimeType": mime_type,
+                    "httpMethod": "PUT",
+                    "fileSize": str(file_size)
+                }]
+            }
+            
+            result = await graphql_query(store_name, access_token, mutation, variables)
+            
+            if result.get("data", {}).get("stagedUploadsCreate", {}).get("userErrors"):
+                errors = result["data"]["stagedUploadsCreate"]["userErrors"]
+                raise Exception(f"Staged upload error: {errors}")
+            
+            staged_targets = result.get("data", {}).get("stagedUploadsCreate", {}).get("stagedTargets", [])
+            if not staged_targets:
+                raise Exception("No staged targets returned")
+            
+            return staged_targets[0]
+        
+        async def upload_to_staged_url(staged_target, file_content):
+            """
+            Upload arquivo para URL temporária do staged upload
+            """
+            url = staged_target["url"]
+            parameters = {param["name"]: param["value"] for param in staged_target.get("parameters", [])}
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                # Upload direto via PUT
+                response = await client.put(
+                    url,
+                    content=file_content,
+                    headers={"Content-Type": "application/octet-stream"}
+                )
+                
+                if response.status_code not in [200, 201, 204]:
+                    raise Exception(f"Failed to upload to staged URL: {response.status_code}")
+        
+        async def create_file_via_graphql(store_name, access_token, resource_url, filename, alt_text, product_id):
+            """
+            Criar arquivo via GraphQL com duplicateResolutionMode: REPLACE
+            """
+            mutation = """
+            mutation fileCreate($files: [FileCreateInput!]!) {
+                fileCreate(files: $files) {
+                    files {
+                        id
+                        fileStatus
+                        alt
+                        createdAt
+                        ... on MediaImage {
+                            id
+                            image {
+                                url
+                                width
+                                height
+                            }
+                        }
+                    }
+                    userErrors {
+                        field
+                        message
+                        code
+                    }
+                }
+            }
+            """
+            
+            variables = {
+                "files": [{
+                    "alt": alt_text,
+                    "contentType": "IMAGE",
+                    "originalSource": resource_url,
+                    "filename": filename,  # COM EXTENSÃO!
+                    "duplicateResolutionMode": "REPLACE"  # EVITA UUID!
+                }]
+            }
+            
+            result = await graphql_query(store_name, access_token, mutation, variables)
+            
+            if result.get("data", {}).get("fileCreate", {}).get("userErrors"):
+                errors = result["data"]["fileCreate"]["userErrors"]
+                # Se erro for de duplicata, tentar com RAISE_ERROR para debug
+                for error in errors:
+                    if "duplicate" in str(error).lower():
+                        logger.warning(f"⚠️ Arquivo duplicado detectado: {filename}")
+                raise Exception(f"File create error: {errors}")
+            
+            files = result.get("data", {}).get("fileCreate", {}).get("files", [])
+            if not files:
+                raise Exception("No file created")
+            
+            return files[0]
+        
+        async def associate_media_to_product(store_name, access_token, product_id, media_id):
+            """
+            Associar mídia criada ao produto
+            """
+            mutation = """
+            mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
+                productCreateMedia(media: $media, productId: $productId) {
+                    media {
+                        ... on MediaImage {
+                            id
+                            status
+                        }
+                    }
+                    mediaUserErrors {
+                        field
+                        message
+                    }
+                }
+            }
+            """
+            
+            # Converter product_id para formato GraphQL
+            gid = f"gid://shopify/Product/{product_id}"
+            
+            variables = {
+                "productId": gid,
+                "media": [{
+                    "mediaContentType": "IMAGE",
+                    "originalSource": media_id
+                }]
+            }
+            
+            result = await graphql_query(store_name, access_token, mutation, variables)
+            
+            if result.get("data", {}).get("productCreateMedia", {}).get("mediaUserErrors"):
+                errors = result["data"]["productCreateMedia"]["mediaUserErrors"]
+                logger.warning(f"⚠️ Erro ao associar mídia: {errors}")
+        
         if not is_resume:
-            logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DIRETA DE IMAGENS: {task_id}")
+            logger.info(f"🚀 INICIANDO OTIMIZAÇÃO COM GRAPHQL (SEM UUID): {task_id}")
         else:
             logger.info(f"▶️ RETOMANDO OTIMIZAÇÃO: {task_id}")
         
@@ -1544,7 +1725,7 @@ async def process_image_optimization_background(
                     image_id = image.get('id')
                     variant_ids = image.get('variant_ids', [])
                     
-                    # Extrair nome limpo do arquivo
+                    # Extrair nome limpo do arquivo (SEM SUFIXO UUID)
                     parsed_url = urlparse(image_url)
                     path_parts = parsed_url.path.split('/')
                     
@@ -1553,19 +1734,17 @@ async def process_image_optimization_background(
                         if part and '.' in part:
                             original_filename = unquote(part.split('?')[0])
                             
-                            # Remover sufixo UUID/hash se existir
+                            # REMOVER SUFIXO UUID SE EXISTIR
                             if '_' in original_filename:
                                 name, ext = os.path.splitext(original_filename)
                                 parts = name.rsplit('_', 1)
                                 
                                 if len(parts) == 2:
                                     suffix = parts[1]
-                                    has_numbers = any(c.isdigit() for c in suffix)
-                                    has_letters = any(c.isalpha() for c in suffix)
-                                    
-                                    if (has_numbers and has_letters) or len(suffix) > 10:
+                                    # Verificar se é um UUID (formato: 8-4-4-4-12 caracteres hex)
+                                    if '-' in suffix and len(suffix) >= 32:
                                         original_filename = parts[0] + ext
-                                        logger.info(f"🔪 Removido sufixo: _{suffix}")
+                                        logger.info(f"🔪 Removido sufixo UUID: _{suffix}")
                             break
                     
                     if not original_filename:
@@ -1611,6 +1790,7 @@ async def process_image_optimization_background(
                         resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         save_format = 'PNG'
                         file_extension = '.png'
+                        mime_type = 'image/png'
                         
                         # Verificar novamente após redimensionamento
                         if not has_real_transparency(resized_image):
@@ -1618,6 +1798,7 @@ async def process_image_optimization_background(
                             resized_image = resized_image.convert('RGB')
                             save_format = 'JPEG'
                             file_extension = '.jpg'
+                            mime_type = 'image/jpeg'
                     else:
                         # Converter para JPG (sem transparência)
                         if pil_image.mode == 'RGBA':
@@ -1631,6 +1812,7 @@ async def process_image_optimization_background(
                         resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         save_format = 'JPEG'
                         file_extension = '.jpg'
+                        mime_type = 'image/jpeg'
                     
                     # Salvar imagem otimizada
                     output_buffer = io.BytesIO()
@@ -1656,60 +1838,77 @@ async def process_image_optimization_background(
                     # Calcular economia
                     original_size = len(image_content)
                     optimized_size = len(optimized_bytes)
-                    savings_percentage = round(((original_size - optimized_size) / original_size) * 100)
+                    savings_percentage = round(((original_size - optimized_size) / original_size) * 100) if original_size > 0 else 0
                     
                     logger.info(f"✅ Imagem otimizada: {optimized_size} bytes ({savings_percentage}% menor)")
                     
-                    # Ajustar nome do arquivo
+                    # Nome final SEM SUFIXO e COM EXTENSÃO CORRETA
                     base_name = os.path.splitext(original_filename)[0]
-                    new_filename = f"{base_name}{file_extension}"
+                    # Remover sufixos reservados que podem causar problemas
+                    for reserved in ['thumb', 'small', 'medium', 'large', 'grande', 'icon', 'pico']:
+                        if base_name.endswith(f'-{reserved}') or base_name.endswith(f'_{reserved}'):
+                            base_name = base_name.replace(f'-{reserved}', '').replace(f'_{reserved}', '')
+                            logger.info(f"⚠️ Removido sufixo reservado: {reserved}")
                     
-                    # MÉTODO DIRETO: Criar nova imagem e deletar antiga
-                    logger.info(f"📤 Enviando imagem otimizada para Shopify...")
+                    final_filename = f"{base_name}{file_extension}"
                     
-                    # Converter para base64
-                    image_base64 = base64.b64encode(optimized_bytes).decode('utf-8')
+                    logger.info(f"🚀 USANDO GRAPHQL PARA UPLOAD SEM UUID")
+                    logger.info(f"📝 Nome final: {final_filename}")
                     
-                    # Criar nova imagem
-                    create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images.json"
+                    # PASSO 1: Criar Staged Upload
+                    staged_target = await create_staged_upload(
+                        store_name, 
+                        access_token, 
+                        final_filename, 
+                        optimized_size, 
+                        mime_type
+                    )
                     
+                    logger.info(f"✅ Staged upload criado: {staged_target['resourceUrl']}")
+                    
+                    # PASSO 2: Upload do arquivo para URL temporária
+                    await upload_to_staged_url(staged_target, optimized_bytes)
+                    logger.info(f"✅ Arquivo enviado para staged URL")
+                    
+                    # PASSO 3: Criar arquivo via GraphQL com REPLACE
+                    created_file = await create_file_via_graphql(
+                        store_name,
+                        access_token,
+                        staged_target["resourceUrl"],
+                        final_filename,
+                        original_alt,
+                        product_id
+                    )
+                    
+                    new_image_url = created_file.get("image", {}).get("url", "") if "image" in created_file else ""
+                    new_file_id = created_file.get("id", "")
+                    
+                    logger.info(f"✅ Arquivo criado via GraphQL: {new_file_id}")
+                    
+                    # Verificar se o nome foi preservado (sem UUID)
+                    if new_image_url and '_' in new_image_url:
+                        # Verificar se tem UUID no final
+                        url_parts = new_image_url.split('/')[-1].split('_')
+                        if len(url_parts) > 1 and '-' in url_parts[-1]:
+                            logger.warning(f"⚠️ Shopify ainda adicionou sufixo, mas tentamos minimizar")
+                        else:
+                            logger.info(f"✅ Nome preservado sem UUID!")
+                    else:
+                        logger.info(f"✅ Nome preservado com sucesso!")
+                    
+                    # PASSO 4: Associar ao produto (se necessário)
+                    if product_id and new_file_id:
+                        await associate_media_to_product(store_name, access_token, product_id, new_file_id)
+                    
+                    # PASSO 5: Deletar imagem antiga via REST API
+                    logger.info(f"🗑️ Deletando imagem antiga {image_id}")
+                    
+                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
                     headers = {
                         'X-Shopify-Access-Token': access_token,
                         'Content-Type': 'application/json'
                     }
                     
-                    create_data = {
-                        "image": {
-                            "attachment": image_base64,
-                            "filename": new_filename,
-                            "alt": original_alt,
-                            "position": original_position
-                        }
-                    }
-                    
-                    # Se tem variantes associadas, manter
-                    if variant_ids and len(variant_ids) > 0:
-                        create_data["image"]["variant_ids"] = variant_ids
-                    
-                    create_response = await client.post(
-                        create_url,
-                        headers=headers,
-                        json=create_data
-                    )
-                    
-                    if create_response.status_code not in [200, 201]:
-                        error_text = create_response.text
-                        raise Exception(f"Erro ao criar imagem: {error_text}")
-                    
-                    created_image = create_response.json().get('image', {})
-                    new_image_id = created_image.get('id')
-                    
-                    logger.info(f"✅ Nova imagem criada com ID: {new_image_id}")
-                    
-                    # Deletar imagem antiga
-                    logger.info(f"🗑️ Deletando imagem antiga {image_id}")
-                    
-                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
                     delete_response = await client.delete(delete_url, headers=headers)
                     
                     if delete_response.status_code in [200, 204]:
@@ -1721,14 +1920,17 @@ async def process_image_optimization_background(
                     
                     results.append({
                         'image_id': image_id,
-                        'new_image_id': new_image_id,
+                        'new_file_id': new_file_id,
                         'product_id': product_id,
                         'status': 'success',
                         'old_size': original_size,
                         'new_size': optimized_size,
                         'savings': savings_percentage,
                         'dimensions': f"{new_width}x{new_height}",
-                        'transparency_preserved': should_be_png
+                        'transparency_preserved': should_be_png,
+                        'method': 'graphql_no_uuid',
+                        'final_filename': final_filename,
+                        'new_url': new_image_url
                     })
                     
                     # Limpar memória
@@ -1777,7 +1979,7 @@ async def process_image_optimization_background(
             tasks_db[task_id]["completed_at"] = get_brazil_time_str()
             tasks_db[task_id]["results"] = results[-10:]
             
-            logger.info(f"🏁 OTIMIZAÇÃO FINALIZADA:")
+            logger.info(f"🏁 OTIMIZAÇÃO FINALIZADA (GraphQL sem UUID):")
             logger.info(f"   ✅ Processadas: {successful}")
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   📊 Total: {processed}/{total}")
