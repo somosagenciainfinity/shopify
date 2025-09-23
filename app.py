@@ -1567,7 +1567,7 @@ async def process_image_optimization_background(
                     new_image_data = {
                         "image": {
                             "attachment": image_base64,
-                            "filename": f"temp_{desired_filename}",  # Nome temporário
+                            "filename": desired_filename,  # SEM O PREFIXO temp_
                             "alt": original_alt,
                             "position": original_position
                         }
