@@ -1392,6 +1392,8 @@ async def process_image_optimization_background(
         from PIL import Image
         import io
         import base64
+        from urllib.parse import urlparse, unquote
+        import os
         
         if not is_resume:
             logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DE IMAGENS: {task_id}")
@@ -1434,13 +1436,36 @@ async def process_image_optimization_background(
                 try:
                     # Informações da imagem original
                     image_url = image.get('src') or image.get('url')
-                    original_filename = image.get('filename', '')
                     original_alt = image.get('alt', '')
                     original_position = image.get('position', 1)
                     original_width = image.get('dimensions', {}).get('width', 0)
                     original_height = image.get('dimensions', {}).get('height', 0)
                     
+                    # EXTRAIR NOME REAL DO ARQUIVO DA URL DA SHOPIFY
+                    parsed_url = urlparse(image_url)
+                    path_parts = parsed_url.path.split('/')
+                    
+                    # Procurar pelo nome do arquivo na URL
+                    # URLs da Shopify geralmente têm formato: .../files/nome-do-arquivo.jpg?v=123456
+                    original_filename = None
+                    for part in reversed(path_parts):
+                        if part and '.' in part:
+                            # Remover parâmetros de query se houver
+                            original_filename = part.split('?')[0]
+                            # Decodificar URL encoding se houver
+                            original_filename = unquote(original_filename)
+                            break
+                    
+                    # Se não encontrou nome na URL, tentar pegar do campo filename
+                    if not original_filename:
+                        original_filename = image.get('filename', '')
+                        # Se ainda não tem, usar o ID como fallback
+                        if not original_filename or original_filename.startswith('image-'):
+                            original_filename = f"product-image-{image.get('id')}.jpg"
+                    
                     logger.info(f"📥 Processando imagem {image.get('id')}: {original_filename}")
+                    logger.info(f"   URL original: {image_url}")
+                    logger.info(f"   Nome extraído: {original_filename}")
                     logger.info(f"   Dimensões originais: {original_width}x{original_height}px")
                     
                     # Verificar se precisa otimização
@@ -1535,17 +1560,29 @@ async def process_image_optimization_background(
                         'Content-Type': 'application/json'
                     }
                     
-                    # Manter o mesmo nome de arquivo
-                    new_filename = original_filename
-                    if not new_filename.endswith(file_extension):
-                        # Ajustar extensão se mudou o formato
-                        base_name = new_filename.rsplit('.', 1)[0] if '.' in new_filename else new_filename
+                    # USAR O NOME ORIGINAL EXTRAÍDO DA URL
+                    # Preservar o nome base mas ajustar a extensão se necessário
+                    base_name, current_ext = os.path.splitext(original_filename)
+                    
+                    # Se não tem extensão, adicionar
+                    if not current_ext:
+                        new_filename = f"{original_filename}{file_extension}"
+                    # Se mudou o formato (ex: de JPG para PNG por causa de transparência)
+                    elif has_transparency and current_ext.lower() not in ['.png', '.webp']:
                         new_filename = f"{base_name}{file_extension}"
+                    # Se não tem transparência e era PNG, pode converter para JPG
+                    elif not has_transparency and current_ext.lower() in ['.png', '.webp']:
+                        new_filename = f"{base_name}{file_extension}"
+                    else:
+                        # Manter o nome original completo
+                        new_filename = original_filename
+                    
+                    logger.info(f"📝 Nome final do arquivo: {new_filename}")
                     
                     new_image_data = {
                         "image": {
                             "attachment": image_base64,
-                            "filename": new_filename,  # Manter mesmo nome
+                            "filename": new_filename,  # Nome extraído da URL original
                             "alt": original_alt,  # Manter mesmo alt-text
                             "position": original_position  # Manter mesma posição
                         }
@@ -1569,6 +1606,7 @@ async def process_image_optimization_background(
                     new_image_id = created_image.get('id')
                     
                     logger.info(f"✅ Nova imagem otimizada criada com ID: {new_image_id}")
+                    logger.info(f"   Nome preservado: {new_filename}")
                     
                     # PASSO 5: Deletar imagem original
                     delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
@@ -1589,7 +1627,8 @@ async def process_image_optimization_background(
                         'original_dimensions': f"{original_width}x{original_height}",
                         'new_dimensions': f"{new_width}x{new_height}",
                         'savings_percentage': savings_percentage,
-                        'transparency_preserved': has_transparency
+                        'transparency_preserved': has_transparency,
+                        'filename_preserved': new_filename
                     })
                     
                     # Limpar memória
