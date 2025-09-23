@@ -14,6 +14,7 @@ import logging
 import re
 import csv
 import io
+import base64
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
