@@ -1375,6 +1375,83 @@ async def optimize_images(data: Dict[str, Any], background_tasks: BackgroundTask
         "mode": "background_processing"
     }
 
+async def upload_image_via_files_api(
+    image_bytes: bytes,
+    filename: str,
+    store_name: str,
+    access_token: str
+) -> str:
+    """
+    Upload via Files API do Shopify (GraphQL)
+    Retorna a URL da imagem hospedada
+    """
+    
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    
+    # PASSO 1: Criar staged upload
+    graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/graphql.json"
+    
+    # Mutation para criar staged upload
+    create_staged_upload = """
+    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) {
+            stagedTargets {
+                url
+                resourceUrl
+                parameters {
+                    name
+                    value
+                }
+            }
+        }
+    }
+    """
+    
+    variables = {
+        "input": [{
+            "resource": "IMAGE",
+            "filename": filename,
+            "mimeType": "image/jpeg" if filename.endswith('.jpg') else "image/png",
+            "fileSize": str(len(image_bytes))
+        }]
+    }
+    
+    headers = {
+        'X-Shopify-Access-Token': access_token,
+        'Content-Type': 'application/json'
+    }
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Criar staged upload
+        response = await client.post(
+            graphql_url,
+            headers=headers,
+            json={"query": create_staged_upload, "variables": variables}
+        )
+        
+        result = response.json()
+        staged_target = result['data']['stagedUploadsCreate']['stagedTargets'][0]
+        upload_url = staged_target['url']
+        resource_url = staged_target['resourceUrl']
+        parameters = {p['name']: p['value'] for p in staged_target['parameters']}
+        
+        # PASSO 2: Upload do arquivo
+        files = {
+            'file': (filename, image_bytes)
+        }
+        
+        upload_response = await client.post(
+            upload_url,
+            data=parameters,
+            files=files
+        )
+        
+        if upload_response.status_code not in [200, 201, 204]:
+            raise Exception(f"Erro no upload: {upload_response.status_code}")
+        
+        logger.info(f"✅ Imagem uploaded via Files API: {resource_url}")
+        return resource_url
+
 async def process_image_optimization_background(
     task_id: str,
     images: List[Dict],
@@ -1385,7 +1462,7 @@ async def process_image_optimization_background(
 ):
     """
     Processar otimização de imagens em background
-    AGORA COM RENOMEAÇÃO AUTOMÁTICA APÓS OTIMIZAÇÃO!
+    COM DETECÇÃO INTELIGENTE DE TRANSPARÊNCIA e UPLOAD VIA FILES API
     """
     
     try:
@@ -1394,9 +1471,140 @@ async def process_image_optimization_background(
         import base64
         from urllib.parse import urlparse, unquote
         import os
+        import numpy as np
+        
+        def has_real_transparency(pil_image):
+            """
+            Detecta se a imagem tem TRANSPARÊNCIA REAL (não apenas um canal alpha)
+            Analisa se existem pixels realmente transparentes sendo usados
+            """
+            
+            # Se não tem canal alpha, não tem transparência
+            if pil_image.mode not in ('RGBA', 'LA', 'PA'):
+                return False
+            
+            # Converter para RGBA se necessário
+            if pil_image.mode != 'RGBA':
+                pil_image = pil_image.convert('RGBA')
+            
+            # Converter para numpy array
+            img_array = np.array(pil_image)
+            
+            # Pegar o canal alpha
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                alpha_channel = img_array[:, :, 3]
+            else:
+                return False
+            
+            # Análises do canal alpha
+            unique_alpha_values = np.unique(alpha_channel)
+            
+            # Se todos os pixels são 100% opacos (255), não tem transparência real
+            if len(unique_alpha_values) == 1 and unique_alpha_values[0] == 255:
+                logger.info("❌ Falso positivo: Imagem tem canal alpha mas todos pixels são opacos")
+                return False
+            
+            # Calcular porcentagem de pixels transparentes/semi-transparentes
+            total_pixels = alpha_channel.size
+            transparent_pixels = np.sum(alpha_channel < 255)
+            transparency_ratio = transparent_pixels / total_pixels
+            
+            logger.info(f"📊 Análise de transparência:")
+            logger.info(f"   - Valores alpha únicos: {unique_alpha_values[:10]}...")
+            logger.info(f"   - Pixels transparentes: {transparent_pixels}/{total_pixels} ({transparency_ratio*100:.1f}%)")
+            
+            # Se menos de 1% dos pixels são transparentes, provavelmente é ruído
+            if transparency_ratio < 0.01:
+                logger.info("❌ Transparência insignificante (<1%), tratando como opaca")
+                return False
+            
+            # Verificar se a transparência forma uma "moldura" (comum em logos/ícones)
+            # Checar as bordas
+            edge_alpha = np.concatenate([
+                alpha_channel[0, :],      # topo
+                alpha_channel[-1, :],     # baixo
+                alpha_channel[:, 0],      # esquerda
+                alpha_channel[:, -1]      # direita
+            ])
+            
+            edge_transparent = np.sum(edge_alpha < 255) / edge_alpha.size
+            
+            # Se mais de 50% das bordas são transparentes, provavelmente é transparência real
+            if edge_transparent > 0.5:
+                logger.info("✅ Transparência real detectada (bordas transparentes)")
+                return True
+            
+            # Verificar padrão de transparência (não é apenas um retângulo)
+            # Analisar se há "ilhas" de opacidade (como o logo da Puma)
+            # Isso indica um objeto isolado com fundo transparente
+            
+            # Criar máscara binária
+            opaque_mask = alpha_channel == 255
+            
+            # Contar regiões conectadas (simplified check)
+            # Se tem muitas mudanças entre opaco/transparente, é complexo
+            horizontal_changes = np.sum(np.diff(opaque_mask.astype(int), axis=1) != 0)
+            vertical_changes = np.sum(np.diff(opaque_mask.astype(int), axis=0) != 0)
+            
+            total_changes = horizontal_changes + vertical_changes
+            complexity_ratio = total_changes / total_pixels
+            
+            logger.info(f"   - Complexidade da transparência: {complexity_ratio:.4f}")
+            
+            # Se a transparência é muito complexa, provavelmente é intencional
+            if complexity_ratio > 0.001:
+                logger.info("✅ Transparência complexa detectada (provavelmente intencional)")
+                return True
+            
+            # Caso contrário, verificar se é um fundo sólido com pequenos artefatos
+            # Se a maioria é opaca e a transparência está dispersa, ignorar
+            if transparency_ratio < 0.1:
+                logger.info("❌ Pouca transparência, tratando como imagem opaca")
+                return False
+            
+            logger.info("✅ Transparência significativa detectada")
+            return True
+        
+        def should_preserve_as_png(pil_image, image_url):
+            """
+            Decide se deve preservar como PNG baseado em análise inteligente
+            """
+            
+            # Verificar extensão original
+            is_png_originally = '.png' in image_url.lower()
+            
+            # Verificar se tem transparência REAL
+            has_transparency = has_real_transparency(pil_image)
+            
+            # Se era PNG mas não tem transparência real, pode converter para JPG
+            if is_png_originally and not has_transparency:
+                logger.info("🔄 PNG original mas sem transparência real - convertendo para JPG")
+                return False
+            
+            # Se tem transparência real, manter como PNG
+            if has_transparency:
+                logger.info("💎 Mantendo como PNG - transparência real detectada")
+                return True
+            
+            # Verificar se é uma imagem de produto (geralmente não precisa transparência)
+            # vs. logo/ícone (geralmente precisa)
+            width, height = pil_image.size
+            aspect_ratio = width / height if height > 0 else 1
+            
+            # Imagens quadradas pequenas são geralmente logos/ícones
+            if width < 500 and height < 500 and 0.8 < aspect_ratio < 1.2:
+                logger.info("🎨 Possível logo/ícone detectado - verificando transparência")
+                return has_transparency
+            
+            # Imagens grandes de produto geralmente não precisam transparência
+            if width > 1000 or height > 1000:
+                logger.info("📸 Imagem grande de produto - usando JPG")
+                return False
+            
+            return has_transparency
         
         if not is_resume:
-            logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DE IMAGENS: {task_id}")
+            logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DE IMAGENS COM DETECÇÃO INTELIGENTE: {task_id}")
         else:
             logger.info(f"▶️ RETOMANDO OTIMIZAÇÃO: {task_id}")
         
@@ -1421,9 +1629,6 @@ async def process_image_optimization_background(
             results = []
             total = len(images)
         
-        # Lista para armazenar imagens que precisam renomeação
-        images_to_rename = []
-        
         async with httpx.AsyncClient(timeout=60.0) as client:
             for i, image in enumerate(images[processed:], start=processed):
                 # Verificar se foi pausada ou cancelada
@@ -1444,33 +1649,58 @@ async def process_image_optimization_background(
                     original_width = image.get('dimensions', {}).get('width', 0)
                     original_height = image.get('dimensions', {}).get('height', 0)
                     
-                    # EXTRAIR NOME DESEJADO (sem UUID)
+                    # EXTRAIR NOME REAL DO ARQUIVO DA URL DA SHOPIFY
                     parsed_url = urlparse(image_url)
                     path_parts = parsed_url.path.split('/')
                     
-                    desired_filename = None
+                    # Procurar pelo nome do arquivo na URL
+                    original_filename = None
                     for part in reversed(path_parts):
                         if part and '.' in part:
-                            desired_filename = unquote(part.split('?')[0])
+                            # Remover parâmetros de query e decodificar
+                            original_filename = unquote(part.split('?')[0])
                             
-                            # REMOVER SUFIXO UUID para ter o nome desejado
-                            if '_' in desired_filename:
-                                name, ext = os.path.splitext(desired_filename)
-                                parts = name.rsplit('_', 1)
+                            # REMOVER SUFIXO UUID DIRETAMENTE
+                            # jersey-name_uuid.ext -> jersey-name.ext
+                            if '_' in original_filename:
+                                name, ext = os.path.splitext(original_filename)
+                                parts = name.rsplit('_', 1)  # Split apenas no ÚLTIMO underscore
+                                
+                                # Se a última parte parece um UUID/hash
                                 if len(parts) == 2:
                                     suffix = parts[1]
                                     has_numbers = any(c.isdigit() for c in suffix)
                                     has_letters = any(c.isalpha() for c in suffix)
                                     
                                     if (has_numbers and has_letters) or len(suffix) > 10:
-                                        desired_filename = parts[0] + ext
+                                        original_filename = parts[0] + ext
+                                        logger.info(f"🔪 Removido sufixo: _{suffix}")
                             break
                     
-                    if not desired_filename:
-                        desired_filename = f"product-image-{image.get('id')}.jpg"
+                    # Se não encontrou, tentar do campo filename
+                    if not original_filename:
+                        original_filename = image.get('filename', '')
+                        
+                        # Aplicar mesma limpeza
+                        if original_filename and '_' in original_filename:
+                            name, ext = os.path.splitext(original_filename)
+                            parts = name.rsplit('_', 1)
+                            if len(parts) == 2:
+                                suffix = parts[1]
+                                has_numbers = any(c.isdigit() for c in suffix)
+                                has_letters = any(c.isalpha() for c in suffix)
+                                
+                                if (has_numbers and has_letters) or len(suffix) > 10:
+                                    original_filename = parts[0] + ext
+                                    logger.info(f"🔪 Removido sufixo do filename: _{suffix}")
+                        
+                        # Fallback
+                        if not original_filename or original_filename.startswith('image-'):
+                            original_filename = f"product-image-{image.get('id')}.jpg"
                     
-                    logger.info(f"📥 Processando imagem {image.get('id')}")
-                    logger.info(f"   Nome desejado: {desired_filename}")
+                    logger.info(f"📥 Processando imagem {image.get('id')}: {original_filename}")
+                    logger.info(f"   URL original: {image_url}")
+                    logger.info(f"   Nome limpo: {original_filename}")
                     logger.info(f"   Dimensões originais: {original_width}x{original_height}px")
                     
                     # Verificar se precisa otimização
@@ -1491,17 +1721,9 @@ async def process_image_optimization_background(
                     img_buffer = io.BytesIO(image_content)
                     pil_image = Image.open(img_buffer)
                     
-                    # Detectar formato e transparência
-                    original_format = pil_image.format or 'PNG'
-                    has_transparency = False
-                    
-                    # Verificar transparência
-                    if pil_image.mode in ('RGBA', 'LA'):
-                        has_transparency = True
-                        logger.info(f"✅ Transparência detectada (mode: {pil_image.mode})")
-                    elif pil_image.mode == 'P' and 'transparency' in pil_image.info:
-                        has_transparency = True
-                        logger.info(f"✅ Transparência detectada (palette)")
+                    # ANÁLISE INTELIGENTE DE TRANSPARÊNCIA
+                    logger.info(f"🔍 Analisando transparência da imagem...")
+                    should_be_png = should_preserve_as_png(pil_image, image_url)
                     
                     # Calcular novas dimensões mantendo proporção
                     ratio = original_width / original_height
@@ -1510,16 +1732,31 @@ async def process_image_optimization_background(
                     
                     logger.info(f"🔄 Redimensionando: {original_width}x{original_height} → {new_width}x{new_height}")
                     
-                    # Redimensionar imagem
-                    if has_transparency:
+                    # Redimensionar imagem baseado na análise
+                    if should_be_png:
+                        # Preservar transparência
                         if pil_image.mode != 'RGBA':
                             pil_image = pil_image.convert('RGBA')
                         resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         save_format = 'PNG'
                         file_extension = '.png'
+                        
+                        # Verificar novamente após redimensionamento
+                        if not has_real_transparency(resized_image):
+                            logger.info("⚠️ Transparência perdida no redimensionamento, convertendo para JPG")
+                            resized_image = resized_image.convert('RGB')
+                            save_format = 'JPEG'
+                            file_extension = '.jpg'
                     else:
-                        if pil_image.mode != 'RGB':
+                        # Converter para JPG (sem transparência)
+                        if pil_image.mode == 'RGBA':
+                            # Criar fundo branco para áreas transparentes
+                            background = Image.new('RGB', pil_image.size, (255, 255, 255))
+                            background.paste(pil_image, mask=pil_image.split()[3] if len(pil_image.split()) > 3 else None)
+                            pil_image = background
+                        elif pil_image.mode != 'RGB':
                             pil_image = pil_image.convert('RGB')
+                        
                         resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         save_format = 'JPEG'
                         file_extension = '.jpg'
@@ -1534,19 +1771,18 @@ async def process_image_optimization_background(
                     
                     if save_format == 'PNG':
                         save_kwargs['compress_level'] = 6
-                        if has_transparency:
+                        if should_be_png:
                             save_kwargs['transparency'] = pil_image.info.get('transparency', None)
-                        logger.info(f"💎 Salvando PNG com transparência preservada")
+                        logger.info(f"💎 Salvando como PNG com transparência real preservada")
                     else:
-                        save_kwargs['quality'] = 90
-                        logger.info(f"📸 Salvando JPEG com qualidade 90")
+                        save_kwargs['quality'] = 90  # Alta qualidade para JPG
+                        logger.info(f"📸 Salvando como JPEG (sem transparência desnecessária)")
                     
                     resized_image.save(output_buffer, **save_kwargs)
                     output_buffer.seek(0)
                     
-                    # Converter para base64
+                    # Converter para bytes
                     optimized_image_bytes = output_buffer.getvalue()
-                    image_base64 = base64.b64encode(optimized_image_bytes).decode('utf-8')
                     
                     # Calcular economia
                     original_size = len(image_content)
@@ -1555,7 +1791,34 @@ async def process_image_optimization_background(
                     
                     logger.info(f"✅ Imagem otimizada: {len(optimized_image_bytes)} bytes ({savings_percentage}% menor)")
                     
-                    # PASSO 4: Upload SEM SE PREOCUPAR COM O NOME (vai ter UUID)
+                    # Preparar nome final
+                    base_name, current_ext = os.path.splitext(original_filename)
+                    
+                    # Se não tem extensão, adicionar
+                    if not current_ext:
+                        new_filename = f"{original_filename}{file_extension}"
+                    # Se mudou o formato (ex: de JPG para PNG por causa de transparência)
+                    elif should_be_png and current_ext.lower() not in ['.png', '.webp']:
+                        new_filename = f"{base_name}{file_extension}"
+                    # Se não tem transparência e era PNG, pode converter para JPG
+                    elif not should_be_png and current_ext.lower() in ['.png', '.webp']:
+                        new_filename = f"{base_name}{file_extension}"
+                    else:
+                        # Manter o nome original completo
+                        new_filename = original_filename
+                    
+                    # PASSO 4: Upload via Files API primeiro
+                    logger.info(f"📤 Uploading via Files API com nome: {new_filename}")
+                    
+                    # Upload para Files API
+                    file_url = await upload_image_via_files_api(
+                        optimized_image_bytes,
+                        new_filename,
+                        store_name,
+                        access_token
+                    )
+                    
+                    # PASSO 5: Criar imagem no produto usando a URL (não attachment!)
                     create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images.json"
                     
                     headers = {
@@ -1563,11 +1826,11 @@ async def process_image_optimization_background(
                         'Content-Type': 'application/json'
                     }
                     
-                    # Upload com nome temporário - não importa, vamos renomear depois
+                    # USAR SRC em vez de ATTACHMENT!
                     new_image_data = {
                         "image": {
-                            "attachment": image_base64,
-                            "filename": desired_filename,  # SEM O PREFIXO temp_
+                            "src": file_url,  # URL do Files API
+                            "filename": new_filename,  # Nome desejado
                             "alt": original_alt,
                             "position": original_position
                         }
@@ -1584,15 +1847,15 @@ async def process_image_optimization_background(
                     
                     if create_response.status_code not in [200, 201]:
                         error_text = create_response.text
-                        raise Exception(f"Erro ao criar imagem otimizada: {error_text}")
+                        raise Exception(f"Erro ao criar imagem: {error_text}")
                     
                     created_image = create_response.json().get('image', {})
                     new_image_id = created_image.get('id')
-                    new_image_url = created_image.get('src')
                     
-                    logger.info(f"✅ Nova imagem otimizada criada com ID: {new_image_id}")
+                    logger.info(f"✅ Imagem criada COM NOME CORRETO: {new_filename}")
+                    logger.info(f"   ID: {new_image_id}")
                     
-                    # PASSO 5: Deletar imagem original
+                    # PASSO 6: Deletar imagem original
                     delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
                     delete_response = await client.delete(delete_url, headers=headers)
                     
@@ -1600,29 +1863,6 @@ async def process_image_optimization_background(
                         logger.warning(f"⚠️ Aviso ao deletar imagem original: HTTP {delete_response.status_code}")
                     else:
                         logger.info(f"✅ Imagem original removida")
-                    
-                    # PASSO 6: ADICIONAR À LISTA PARA RENOMEAÇÃO POSTERIOR
-                    # Ajustar extensão do nome desejado se necessário
-                    base_name, current_ext = os.path.splitext(desired_filename)
-                    if not current_ext:
-                        final_desired_name = f"{desired_filename}{file_extension}"
-                    elif has_transparency and current_ext.lower() not in ['.png', '.webp']:
-                        final_desired_name = f"{base_name}{file_extension}"
-                    elif not has_transparency and current_ext.lower() in ['.png', '.webp']:
-                        final_desired_name = f"{base_name}{file_extension}"
-                    else:
-                        final_desired_name = desired_filename
-                    
-                    images_to_rename.append({
-                        'id': new_image_id,
-                        'product_id': image.get('product_id'),
-                        'src': new_image_url,
-                        'url': new_image_url,
-                        'desired_name': final_desired_name,
-                        'alt': original_alt,
-                        'position': original_position,
-                        'variant_ids': image.get('variant_ids', [])
-                    })
                     
                     successful += 1
                     
@@ -1634,9 +1874,8 @@ async def process_image_optimization_background(
                         'original_dimensions': f"{original_width}x{original_height}",
                         'new_dimensions': f"{new_width}x{new_height}",
                         'savings_percentage': savings_percentage,
-                        'transparency_preserved': has_transparency,
-                        'desired_filename': final_desired_name,
-                        'needs_rename': True
+                        'transparency_preserved': should_be_png,
+                        'filename_preserved': new_filename
                     })
                     
                     # Limpar memória
@@ -1680,57 +1919,6 @@ async def process_image_optimization_background(
                 # Rate limiting
                 await asyncio.sleep(0.8)
         
-        # ETAPA FINAL: RENOMEAR TODAS AS IMAGENS OTIMIZADAS
-        if images_to_rename:
-            logger.info(f"🔄 INICIANDO RENOMEAÇÃO DE {len(images_to_rename)} IMAGENS OTIMIZADAS")
-            
-            rename_task_id = f"rename_after_optimize_{task_id}"
-            
-            # Criar template baseado no nome desejado
-            for img_to_rename in images_to_rename:
-                try:
-                    logger.info(f"📝 Renomeando imagem {img_to_rename['id']} para: {img_to_rename['desired_name']}")
-                    
-                    # Baixar a imagem otimizada
-                    img_response = await client.get(img_to_rename['url'], timeout=30.0)
-                    if img_response.status_code != 200:
-                        raise Exception(f"Erro ao baixar imagem para renomear")
-                    
-                    # Upload com o nome correto usando mesma lógica do endpoint de renomeação
-                    rename_data = {
-                        "image": {
-                            "attachment": base64.b64encode(img_response.content).decode('utf-8'),
-                            "filename": img_to_rename['desired_name'],
-                            "alt": img_to_rename['alt'],
-                            "position": img_to_rename['position']
-                        }
-                    }
-                    
-                    if img_to_rename.get('variant_ids'):
-                        rename_data["image"]["variant_ids"] = img_to_rename['variant_ids']
-                    
-                    # Criar nova imagem com nome correto
-                    create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{img_to_rename['product_id']}/images.json"
-                    rename_response = await client.post(
-                        create_url,
-                        headers=headers,
-                        json=rename_data
-                    )
-                    
-                    if rename_response.status_code in [200, 201]:
-                        final_image = rename_response.json().get('image', {})
-                        
-                        # Deletar a imagem temporária
-                        delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{img_to_rename['product_id']}/images/{img_to_rename['id']}.json"
-                        await client.delete(delete_url, headers=headers)
-                        
-                        logger.info(f"✅ Imagem renomeada com sucesso: {img_to_rename['desired_name']}")
-                    
-                    await asyncio.sleep(1.0)  # Rate limiting
-                    
-                except Exception as e:
-                    logger.error(f"❌ Erro ao renomear imagem {img_to_rename['id']}: {str(e)}")
-        
         # Finalizar tarefa
         final_status = "completed" if failed == 0 else "completed_with_errors"
         
@@ -1740,8 +1928,8 @@ async def process_image_optimization_background(
             tasks_db[task_id]["results"] = results[-10:]
             tasks_db[task_id]["progress"]["current_image"] = None
             
-            logger.info(f"🏁 OTIMIZAÇÃO E RENOMEAÇÃO FINALIZADAS:")
-            logger.info(f"   ✅ Otimizadas e renomeadas: {successful}")
+            logger.info(f"🏁 OTIMIZAÇÃO FINALIZADA:")
+            logger.info(f"   ✅ Otimizadas: {successful}")
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   📊 Total: {processed}/{total}")
             
