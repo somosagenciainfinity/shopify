@@ -1657,20 +1657,28 @@ async def process_image_optimization_background(
             
             return files[0]
         
-        async def associate_media_to_product(store_name, access_token, product_id, media_id):
+        async def update_product_with_new_image(store_name, access_token, product_id, file_id, position, alt_text):
             """
-            Associar mídia criada ao produto
+            Atualizar produto com nova imagem usando productSet
             """
             mutation = """
-            mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
-                productCreateMedia(media: $media, productId: $productId) {
-                    media {
-                        ... on MediaImage {
-                            id
-                            status
+            mutation productSet($input: ProductSetInput!) {
+                productSet(input: $input) {
+                    product {
+                        id
+                        media(first: 10) {
+                            nodes {
+                                ... on MediaImage {
+                                    id
+                                    image {
+                                        url
+                                    }
+                                    alt
+                                }
+                            }
                         }
                     }
-                    mediaUserErrors {
+                    userErrors {
                         field
                         message
                     }
@@ -1678,22 +1686,28 @@ async def process_image_optimization_background(
             }
             """
             
-            # Converter product_id para formato GraphQL
-            gid = f"gid://shopify/Product/{product_id}"
+            product_gid = f"gid://shopify/Product/{product_id}"
             
             variables = {
-                "productId": gid,
-                "media": [{
-                    "mediaContentType": "IMAGE",
-                    "originalSource": media_id
-                }]
+                "input": {
+                    "id": product_gid,
+                    "media": [{
+                        "id": file_id,
+                        "alt": alt_text,
+                        "position": position
+                    }]
+                }
             }
             
             result = await graphql_query(store_name, access_token, mutation, variables)
             
-            if result.get("data", {}).get("productCreateMedia", {}).get("mediaUserErrors"):
-                errors = result["data"]["productCreateMedia"]["mediaUserErrors"]
-                logger.warning(f"⚠️ Erro ao associar mídia: {errors}")
+            if result.get("data", {}).get("productSet", {}).get("userErrors"):
+                errors = result["data"]["productSet"]["userErrors"]
+                logger.error(f"❌ Erro no productSet: {errors}")
+                return False
+            
+            logger.info(f"✅ Produto atualizado com nova imagem!")
+            return True
         
         if not is_resume:
             logger.info(f"🚀 INICIANDO OTIMIZAÇÃO COM GRAPHQL (SEM UUID): {task_id}")
@@ -1896,25 +1910,43 @@ async def process_image_optimization_background(
                     else:
                         logger.info(f"✅ Nome preservado com sucesso!")
                     
-                    # PASSO 4: Associar ao produto (se necessário)
+                    # PASSO 4: Associar ao produto usando productSet
                     if product_id and new_file_id:
-                        await associate_media_to_product(store_name, access_token, product_id, new_file_id)
-                    
-                    # PASSO 5: Deletar imagem antiga via REST API
-                    logger.info(f"🗑️ Deletando imagem antiga {image_id}")
-                    
-                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
-                    headers = {
-                        'X-Shopify-Access-Token': access_token,
-                        'Content-Type': 'application/json'
-                    }
-                    
-                    delete_response = await client.delete(delete_url, headers=headers)
-                    
-                    if delete_response.status_code in [200, 204]:
-                        logger.info(f"✅ Imagem antiga deletada")
-                    else:
-                        logger.warning(f"⚠️ Aviso ao deletar imagem antiga: HTTP {delete_response.status_code}")
+                        logger.info(f"🔗 Associando imagem ao produto {product_id}")
+                        
+                        # Aguardar o arquivo estar pronto
+                        await asyncio.sleep(2)
+                        
+                        # Usar a nova função productSet
+                        update_success = await update_product_with_new_image(
+                            store_name,
+                            access_token,
+                            product_id,
+                            new_file_id,
+                            original_position,
+                            original_alt
+                        )
+                        
+                        if update_success:
+                            logger.info(f"✅ Imagem associada ao produto com sucesso!")
+                            
+                            # PASSO 5: Agora sim, deletar a imagem antiga
+                            logger.info(f"🗑️ Deletando imagem antiga {image_id}")
+                            
+                            delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
+                            headers = {
+                                'X-Shopify-Access-Token': access_token,
+                                'Content-Type': 'application/json'
+                            }
+                            
+                            delete_response = await client.delete(delete_url, headers=headers)
+                            
+                            if delete_response.status_code in [200, 204]:
+                                logger.info(f"✅ Imagem antiga deletada")
+                            else:
+                                logger.warning(f"⚠️ Aviso ao deletar imagem antiga: HTTP {delete_response.status_code}")
+                        else:
+                            logger.error(f"❌ Falha ao associar imagem ao produto - NÃO deletando a antiga!")
                     
                     successful += 1
                     
