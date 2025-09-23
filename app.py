@@ -1375,6 +1375,234 @@ async def optimize_images(data: Dict[str, Any], background_tasks: BackgroundTask
         "mode": "background_processing"
     }
 
+async def upload_temp_image(image_bytes: bytes, filename: str, store_name: str, access_token: str) -> str:
+    """
+    Upload temporário para obter URL
+    """
+    # Opção 1: Usar um serviço de hospedagem temporária gratuito
+    # Como: tmpfiles.org, file.io, etc.
+    
+    async with httpx.AsyncClient() as client:
+        # Exemplo com file.io
+        files = {'file': (filename, image_bytes)}
+        response = await client.post('https://file.io', files=files)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['link']
+    
+    # Fallback: usar data URL
+    base64_str = base64.b64encode(image_bytes).decode('utf-8')
+    mime_type = 'image/png' if filename.endswith('.png') else 'image/jpeg'
+    return f"data:{mime_type};base64,{base64_str}"
+
+def generate_product_feed_csv(images_data: List[Dict]) -> str:
+    """
+    Gerar CSV no formato do Shopify
+    """
+    import csv
+    import io
+    
+    output = io.StringIO()
+    
+    # Cabeçalhos do CSV do Shopify
+    fieldnames = [
+        'Handle',
+        'Title',
+        'Body (HTML)',
+        'Vendor',
+        'Type',
+        'Tags',
+        'Published',
+        'Option1 Name',
+        'Option1 Value',
+        'Option2 Name',
+        'Option2 Value',
+        'Option3 Name',
+        'Option3 Value',
+        'Variant SKU',
+        'Variant Grams',
+        'Variant Inventory Tracker',
+        'Variant Inventory Qty',
+        'Variant Inventory Policy',
+        'Variant Fulfillment Service',
+        'Variant Price',
+        'Variant Compare At Price',
+        'Variant Requires Shipping',
+        'Variant Taxable',
+        'Variant Barcode',
+        'Image Src',
+        'Image Position',
+        'Image Alt Text',
+        'Gift Card',
+        'SEO Title',
+        'SEO Description',
+        'Google Shopping / Google Product Category',
+        'Google Shopping / Gender',
+        'Google Shopping / Age Group',
+        'Google Shopping / MPN',
+        'Google Shopping / AdWords Grouping',
+        'Google Shopping / AdWords Labels',
+        'Google Shopping / Condition',
+        'Google Shopping / Custom Product',
+        'Google Shopping / Custom Label 0',
+        'Google Shopping / Custom Label 1',
+        'Google Shopping / Custom Label 2',
+        'Google Shopping / Custom Label 3',
+        'Google Shopping / Custom Label 4',
+        'Variant Image',
+        'Variant Weight Unit',
+        'Variant Tax Code',
+        'Cost per item',
+        'Status'
+    ]
+    
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    
+    # Agrupar imagens por produto
+    products_images = {}
+    for img in images_data:
+        product_id = img['product_id']
+        if product_id not in products_images:
+            products_images[product_id] = []
+        products_images[product_id].append(img)
+    
+    # Criar linhas do CSV
+    for product_id, images in products_images.items():
+        # Primeira linha com dados do produto
+        first_image = images[0]
+        
+        row = {
+            'Handle': f'product-{product_id}',
+            'Title': '',  # Deixar vazio para não sobrescrever
+            'Published': 'TRUE',
+            'Image Src': first_image['url'],
+            'Image Position': str(first_image['position']),
+            'Image Alt Text': first_image['alt']
+        }
+        
+        writer.writerow(row)
+        
+        # Linhas adicionais para outras imagens
+        for img in images[1:]:
+            row = {
+                'Handle': f'product-{product_id}',
+                'Image Src': img['url'],
+                'Image Position': str(img['position']),
+                'Image Alt Text': img['alt']
+            }
+            writer.writerow(row)
+    
+    return output.getvalue()
+
+async def import_product_feed(csv_content: str, store_name: str, access_token: str) -> bool:
+    """
+    Importar CSV via Shopify API
+    """
+    
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    
+    # Usar GraphQL para importar
+    graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/graphql.json"
+    
+    # Criar staged upload para CSV
+    mutation = """
+    mutation {
+        stagedUploadsCreate(input: [{
+            resource: BULK_MUTATION_VARIABLES,
+            filename: "product_images.csv",
+            mimeType: "text/csv",
+            fileSize: "%s"
+        }]) {
+            stagedTargets {
+                url
+                resourceUrl
+                parameters {
+                    name
+                    value
+                }
+            }
+        }
+    }
+    """ % len(csv_content.encode('utf-8'))
+    
+    headers = {
+        'X-Shopify-Access-Token': access_token,
+        'Content-Type': 'application/json'
+    }
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Criar staged upload
+        response = await client.post(
+            graphql_url,
+            headers=headers,
+            json={"query": mutation}
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Erro ao criar staged upload: {response.text}")
+            return False
+        
+        result = response.json()
+        
+        # Verificar se tem erros
+        if 'errors' in result:
+            logger.error(f"Erro GraphQL: {result['errors']}")
+            return False
+            
+        if 'data' not in result or not result['data']:
+            logger.error(f"Resposta inválida: {result}")
+            return False
+            
+        staged_target = result['data']['stagedUploadsCreate']['stagedTargets'][0]
+        upload_url = staged_target['url']
+        resource_url = staged_target['resourceUrl']
+        parameters = {p['name']: p['value'] for p in staged_target['parameters']}
+        
+        # Upload do CSV
+        files = {
+            'file': ('products.csv', csv_content.encode('utf-8'))
+        }
+        
+        upload_response = await client.post(
+            upload_url,
+            data=parameters,
+            files=files
+        )
+        
+        if upload_response.status_code not in [200, 201, 204]:
+            logger.error(f"Erro no upload do CSV: {upload_response.status_code}")
+            return False
+        
+        # Executar importação
+        import_mutation = """
+        mutation {
+            bulkOperationRunMutation(
+                mutation: "mutation call($input: ProductInput!) { productUpdate(input: $input) { product { id } } }",
+                stagedUploadPath: "%s"
+            ) {
+                bulkOperation {
+                    id
+                    status
+                }
+            }
+        }
+        """ % resource_url
+        
+        import_response = await client.post(
+            graphql_url,
+            headers=headers,
+            json={"query": import_mutation}
+        )
+        
+        if import_response.status_code == 200:
+            logger.info("✅ Importação iniciada com sucesso!")
+            return True
+        else:
+            logger.error(f"Erro na importação: {import_response.text}")
+            return False
+
 async def process_image_optimization_background(
     task_id: str,
     images: List[Dict],
