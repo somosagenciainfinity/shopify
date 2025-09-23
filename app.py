@@ -1394,7 +1394,6 @@ async def process_image_optimization_background(
         import base64
         from urllib.parse import urlparse, unquote
         import os
-        import re  # ADICIONAR IMPORT DO RE
         
         if not is_resume:
             logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DE IMAGENS: {task_id}")
@@ -1442,36 +1441,6 @@ async def process_image_optimization_background(
                     original_width = image.get('dimensions', {}).get('width', 0)
                     original_height = image.get('dimensions', {}).get('height', 0)
                     
-                    # FUNÇÃO PARA LIMPAR NOME DO ARQUIVO
-                    def clean_filename(filename):
-                        """Remove sufixo UUID do nome do arquivo"""
-                        if not filename:
-                            return filename
-                        
-                        # Separar nome e extensão
-                        name_parts = os.path.splitext(filename)
-                        name_without_ext = name_parts[0]
-                        extension = name_parts[1] if len(name_parts) > 1 else ''
-                        
-                        # Procurar pelo último underscore
-                        last_underscore = name_without_ext.rfind('_')
-                        
-                        if last_underscore > -1:
-                            # Pegar o que vem depois do underscore
-                            suffix = name_without_ext[last_underscore + 1:]
-                            
-                            # Verificar se é um UUID (formato: 8-4-4-4-12 caracteres hex)
-                            uuid_pattern = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
-                            
-                            if re.match(uuid_pattern, suffix, re.IGNORECASE):
-                                # Remover o underscore e o UUID
-                                name_without_ext = name_without_ext[:last_underscore]
-                            # Verificar também se é um hash longo (32+ caracteres)
-                            elif len(suffix) >= 32 and re.match(r'^[a-f0-9-]+$', suffix, re.IGNORECASE):
-                                name_without_ext = name_without_ext[:last_underscore]
-                        
-                        return name_without_ext + extension
-                    
                     # EXTRAIR NOME REAL DO ARQUIVO DA URL DA SHOPIFY
                     parsed_url = urlparse(image_url)
                     path_parts = parsed_url.path.split('/')
@@ -1480,21 +1449,32 @@ async def process_image_optimization_background(
                     original_filename = None
                     for part in reversed(path_parts):
                         if part and '.' in part:
-                            # Remover parâmetros de query se houver
-                            original_filename = part.split('?')[0]
-                            # Decodificar URL encoding se houver
-                            original_filename = unquote(original_filename)
-                            # LIMPAR O NOME REMOVENDO UUID
-                            original_filename = clean_filename(original_filename)
+                            # Remover parâmetros de query e decodificar
+                            original_filename = unquote(part.split('?')[0])
+                            
+                            # REMOVER SUFIXO UUID DIRETAMENTE
+                            # jersey-name_uuid.ext -> jersey-name.ext
+                            if '_' in original_filename:
+                                name, ext = os.path.splitext(original_filename)
+                                parts = name.rsplit('_', 1)  # Split apenas no ÚLTIMO underscore
+                                
+                                # Se a última parte parece um UUID/hash
+                                if len(parts) == 2 and len(parts[1]) >= 32 and '-' in parts[1]:
+                                    original_filename = parts[0] + ext
                             break
                     
-                    # Se não encontrou nome na URL, tentar pegar do campo filename
+                    # Se não encontrou, tentar do campo filename
                     if not original_filename:
                         original_filename = image.get('filename', '')
-                        # LIMPAR O NOME SE VIER DO FRONTEND TAMBÉM
-                        original_filename = clean_filename(original_filename)
                         
-                        # Se ainda não tem, usar o ID como fallback
+                        # Aplicar mesma limpeza
+                        if original_filename and '_' in original_filename:
+                            name, ext = os.path.splitext(original_filename)
+                            parts = name.rsplit('_', 1)
+                            if len(parts) == 2 and len(parts[1]) >= 32 and '-' in parts[1]:
+                                original_filename = parts[0] + ext
+                        
+                        # Fallback
                         if not original_filename or original_filename.startswith('image-'):
                             original_filename = f"product-image-{image.get('id')}.jpg"
                     
