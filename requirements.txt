@@ -6,3 +6,4 @@ python-multipart
 websockets
 pytz
 pillow
+numpy
