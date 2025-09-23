@@ -3510,56 +3510,56 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
                 "task": task
             }
     elif task_type == "image_optimization":
-    # RETOMAR OTIMIZAÇÃO DE IMAGENS
-    all_images = config.get("images", [])
-    processed_count = task.get("progress", {}).get("processed", 0)
-    remaining_count = len(all_images) - processed_count
-    
-    # PEGAR targetHeight DO CONFIG!
-    target_height = config.get("targetHeight")
-    if not target_height:
-        logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
-        return {
-            "success": False,
-            "message": "targetHeight não configurado na tarefa"
-        }
-    
-    logger.info(f"🖼️ Retomando otimização de imagens:")
-    logger.info(f"   Total de imagens: {len(all_images)}")
-    logger.info(f"   Já processadas: {processed_count}")
-    logger.info(f"   Restantes: {remaining_count}")
-    logger.info(f"   Altura alvo: {target_height}px")
-    
-    if remaining_count > 0:
-        # IMPORTANTE: Passar TODAS as imagens, não apenas as restantes
-        background_tasks.add_task(
-            process_image_optimization_background,
-            task_id,
-            all_images,  # Passar TODAS as imagens
-            target_height,
-            config.get("storeName", ""),
-            config.get("accessToken", ""),
-            is_resume=True  # Flag para indicar retomada
-        )
+        # RETOMAR OTIMIZAÇÃO DE IMAGENS
+        all_images = config.get("images", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_count = len(all_images) - processed_count
         
-        logger.info(f"✅ Tarefa de otimização {task_id} retomada com {remaining_count} imagens restantes")
+        # PEGAR targetHeight DO CONFIG!
+        target_height = config.get("targetHeight")
+        if not target_height:
+            logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
+            return {
+                "success": False,
+                "message": "targetHeight não configurado na tarefa"
+            }
         
-        return {
-            "success": True,
-            "message": f"Tarefa de otimização retomada com sucesso",
-            "task": task,
-            "remaining": remaining_count,
-            "progress": task.get("progress")
-        }
-    else:
-        task["status"] = "completed"
-        task["completed_at"] = get_brazil_time_str()
+        logger.info(f"🖼️ Retomando otimização de imagens:")
+        logger.info(f"   Total de imagens: {len(all_images)}")
+        logger.info(f"   Já processadas: {processed_count}")
+        logger.info(f"   Restantes: {remaining_count}")
+        logger.info(f"   Altura alvo: {target_height}px")
         
-        return {
-            "success": True,
-            "message": "Tarefa já estava completa",
-            "task": task
-        }
+        if remaining_count > 0:
+            # IMPORTANTE: Passar TODAS as imagens, não apenas as restantes
+            background_tasks.add_task(
+                process_image_optimization_background,
+                task_id,
+                all_images,  # Passar TODAS as imagens
+                target_height,
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True  # Flag para indicar retomada
+            )
+            
+            logger.info(f"✅ Tarefa de otimização {task_id} retomada com {remaining_count} imagens restantes")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de otimização retomada com sucesso",
+                "task": task,
+                "remaining": remaining_count,
+                "progress": task.get("progress")
+            }
+        else:
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
     else:
         # RETOMAR BULK EDIT NORMAL
         all_product_ids = config.get("productIds", [])
