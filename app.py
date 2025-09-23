@@ -1394,6 +1394,7 @@ async def process_image_optimization_background(
         import base64
         from urllib.parse import urlparse, unquote
         import os
+        import re  # ADICIONAR IMPORT DO RE
         
         if not is_resume:
             logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DE IMAGENS: {task_id}")
@@ -1441,12 +1442,41 @@ async def process_image_optimization_background(
                     original_width = image.get('dimensions', {}).get('width', 0)
                     original_height = image.get('dimensions', {}).get('height', 0)
                     
+                    # FUNÇÃO PARA LIMPAR NOME DO ARQUIVO
+                    def clean_filename(filename):
+                        """Remove sufixo UUID do nome do arquivo"""
+                        if not filename:
+                            return filename
+                        
+                        # Separar nome e extensão
+                        name_parts = os.path.splitext(filename)
+                        name_without_ext = name_parts[0]
+                        extension = name_parts[1] if len(name_parts) > 1 else ''
+                        
+                        # Procurar pelo último underscore
+                        last_underscore = name_without_ext.rfind('_')
+                        
+                        if last_underscore > -1:
+                            # Pegar o que vem depois do underscore
+                            suffix = name_without_ext[last_underscore + 1:]
+                            
+                            # Verificar se é um UUID (formato: 8-4-4-4-12 caracteres hex)
+                            uuid_pattern = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
+                            
+                            if re.match(uuid_pattern, suffix, re.IGNORECASE):
+                                # Remover o underscore e o UUID
+                                name_without_ext = name_without_ext[:last_underscore]
+                            # Verificar também se é um hash longo (32+ caracteres)
+                            elif len(suffix) >= 32 and re.match(r'^[a-f0-9-]+$', suffix, re.IGNORECASE):
+                                name_without_ext = name_without_ext[:last_underscore]
+                        
+                        return name_without_ext + extension
+                    
                     # EXTRAIR NOME REAL DO ARQUIVO DA URL DA SHOPIFY
                     parsed_url = urlparse(image_url)
                     path_parts = parsed_url.path.split('/')
                     
                     # Procurar pelo nome do arquivo na URL
-                    # URLs da Shopify geralmente têm formato: .../files/nome-do-arquivo.jpg?v=123456
                     original_filename = None
                     for part in reversed(path_parts):
                         if part and '.' in part:
@@ -1454,18 +1484,23 @@ async def process_image_optimization_background(
                             original_filename = part.split('?')[0]
                             # Decodificar URL encoding se houver
                             original_filename = unquote(original_filename)
+                            # LIMPAR O NOME REMOVENDO UUID
+                            original_filename = clean_filename(original_filename)
                             break
                     
                     # Se não encontrou nome na URL, tentar pegar do campo filename
                     if not original_filename:
                         original_filename = image.get('filename', '')
+                        # LIMPAR O NOME SE VIER DO FRONTEND TAMBÉM
+                        original_filename = clean_filename(original_filename)
+                        
                         # Se ainda não tem, usar o ID como fallback
                         if not original_filename or original_filename.startswith('image-'):
                             original_filename = f"product-image-{image.get('id')}.jpg"
                     
                     logger.info(f"📥 Processando imagem {image.get('id')}: {original_filename}")
                     logger.info(f"   URL original: {image_url}")
-                    logger.info(f"   Nome extraído: {original_filename}")
+                    logger.info(f"   Nome limpo: {original_filename}")
                     logger.info(f"   Dimensões originais: {original_width}x{original_height}px")
                     
                     # Verificar se precisa otimização
@@ -1560,7 +1595,7 @@ async def process_image_optimization_background(
                         'Content-Type': 'application/json'
                     }
                     
-                    # USAR O NOME ORIGINAL EXTRAÍDO DA URL
+                    # USAR O NOME LIMPO (JÁ SEM UUID)
                     # Preservar o nome base mas ajustar a extensão se necessário
                     base_name, current_ext = os.path.splitext(original_filename)
                     
@@ -1582,7 +1617,7 @@ async def process_image_optimization_background(
                     new_image_data = {
                         "image": {
                             "attachment": image_base64,
-                            "filename": new_filename,  # Nome extraído da URL original
+                            "filename": new_filename,  # Nome limpo sem UUID
                             "alt": original_alt,  # Manter mesmo alt-text
                             "position": original_position  # Manter mesma posição
                         }
