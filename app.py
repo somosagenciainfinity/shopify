@@ -4504,7 +4504,7 @@ async def startup_event():
     logger.info("⏰ Verificador de tarefas agendadas iniciado")
 
 if __name__ == "__main__":
-    port = 8000
+    port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Railway Shopify Processor v3.0 iniciado na porta {port}")
     logger.info(f"✅ Sistema completo de gerenciamento de tarefas ativo!")
     logger.info(f"📋 Funcionalidades: Agendar, Processar, Pausar, Retomar, Cancelar")
