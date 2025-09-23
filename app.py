@@ -1375,83 +1375,6 @@ async def optimize_images(data: Dict[str, Any], background_tasks: BackgroundTask
         "mode": "background_processing"
     }
 
-async def upload_image_via_files_api(
-    image_bytes: bytes,
-    filename: str,
-    store_name: str,
-    access_token: str
-) -> str:
-    """
-    Upload via Files API do Shopify (GraphQL)
-    Retorna a URL da imagem hospedada
-    """
-    
-    clean_store = store_name.replace('.myshopify.com', '').strip()
-    
-    # PASSO 1: Criar staged upload
-    graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/graphql.json"
-    
-    # Mutation para criar staged upload
-    create_staged_upload = """
-    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-        stagedUploadsCreate(input: $input) {
-            stagedTargets {
-                url
-                resourceUrl
-                parameters {
-                    name
-                    value
-                }
-            }
-        }
-    }
-    """
-    
-    variables = {
-        "input": [{
-            "resource": "IMAGE",
-            "filename": filename,
-            "mimeType": "image/jpeg" if filename.endswith('.jpg') else "image/png",
-            "fileSize": str(len(image_bytes))
-        }]
-    }
-    
-    headers = {
-        'X-Shopify-Access-Token': access_token,
-        'Content-Type': 'application/json'
-    }
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Criar staged upload
-        response = await client.post(
-            graphql_url,
-            headers=headers,
-            json={"query": create_staged_upload, "variables": variables}
-        )
-        
-        result = response.json()
-        staged_target = result['data']['stagedUploadsCreate']['stagedTargets'][0]
-        upload_url = staged_target['url']
-        resource_url = staged_target['resourceUrl']
-        parameters = {p['name']: p['value'] for p in staged_target['parameters']}
-        
-        # PASSO 2: Upload do arquivo
-        files = {
-            'file': (filename, image_bytes)
-        }
-        
-        upload_response = await client.post(
-            upload_url,
-            data=parameters,
-            files=files
-        )
-        
-        if upload_response.status_code not in [200, 201, 204]:
-            raise Exception(f"Erro no upload: {upload_response.status_code}")
-        
-        logger.info(f"✅ Imagem uploaded via Files API: {resource_url}")
-        return resource_url
-
 async def process_image_optimization_background(
     task_id: str,
     images: List[Dict],
@@ -1461,8 +1384,8 @@ async def process_image_optimization_background(
     is_resume: bool = False
 ):
     """
-    Processar otimização de imagens em background
-    COM DETECÇÃO INTELIGENTE DE TRANSPARÊNCIA e UPLOAD VIA FILES API
+    Processar otimização via PRODUCT FEED
+    COM DETECÇÃO INTELIGENTE DE TRANSPARÊNCIA
     """
     
     try:
@@ -1471,12 +1394,12 @@ async def process_image_optimization_background(
         import base64
         from urllib.parse import urlparse, unquote
         import os
+        import csv
         import numpy as np
         
         def has_real_transparency(pil_image):
             """
             Detecta se a imagem tem TRANSPARÊNCIA REAL (não apenas um canal alpha)
-            Analisa se existem pixels realmente transparentes sendo usados
             """
             
             # Se não tem canal alpha, não tem transparência
@@ -1510,7 +1433,6 @@ async def process_image_optimization_background(
             transparency_ratio = transparent_pixels / total_pixels
             
             logger.info(f"📊 Análise de transparência:")
-            logger.info(f"   - Valores alpha únicos: {unique_alpha_values[:10]}...")
             logger.info(f"   - Pixels transparentes: {transparent_pixels}/{total_pixels} ({transparency_ratio*100:.1f}%)")
             
             # Se menos de 1% dos pixels são transparentes, provavelmente é ruído
@@ -1519,7 +1441,6 @@ async def process_image_optimization_background(
                 return False
             
             # Verificar se a transparência forma uma "moldura" (comum em logos/ícones)
-            # Checar as bordas
             edge_alpha = np.concatenate([
                 alpha_channel[0, :],      # topo
                 alpha_channel[-1, :],     # baixo
@@ -1534,15 +1455,8 @@ async def process_image_optimization_background(
                 logger.info("✅ Transparência real detectada (bordas transparentes)")
                 return True
             
-            # Verificar padrão de transparência (não é apenas um retângulo)
-            # Analisar se há "ilhas" de opacidade (como o logo da Puma)
-            # Isso indica um objeto isolado com fundo transparente
-            
-            # Criar máscara binária
+            # Verificar complexidade da transparência
             opaque_mask = alpha_channel == 255
-            
-            # Contar regiões conectadas (simplified check)
-            # Se tem muitas mudanças entre opaco/transparente, é complexo
             horizontal_changes = np.sum(np.diff(opaque_mask.astype(int), axis=1) != 0)
             vertical_changes = np.sum(np.diff(opaque_mask.astype(int), axis=0) != 0)
             
@@ -1551,13 +1465,10 @@ async def process_image_optimization_background(
             
             logger.info(f"   - Complexidade da transparência: {complexity_ratio:.4f}")
             
-            # Se a transparência é muito complexa, provavelmente é intencional
             if complexity_ratio > 0.001:
                 logger.info("✅ Transparência complexa detectada (provavelmente intencional)")
                 return True
             
-            # Caso contrário, verificar se é um fundo sólido com pequenos artefatos
-            # Se a maioria é opaca e a transparência está dispersa, ignorar
             if transparency_ratio < 0.1:
                 logger.info("❌ Pouca transparência, tratando como imagem opaca")
                 return False
@@ -1587,7 +1498,6 @@ async def process_image_optimization_background(
                 return True
             
             # Verificar se é uma imagem de produto (geralmente não precisa transparência)
-            # vs. logo/ícone (geralmente precisa)
             width, height = pil_image.size
             aspect_ratio = width / height if height > 0 else 1
             
@@ -1604,7 +1514,7 @@ async def process_image_optimization_background(
             return has_transparency
         
         if not is_resume:
-            logger.info(f"🚀 INICIANDO OTIMIZAÇÃO DE IMAGENS COM DETECÇÃO INTELIGENTE: {task_id}")
+            logger.info(f"🚀 INICIANDO OTIMIZAÇÃO VIA PRODUCT FEED COM ANÁLISE INTELIGENTE: {task_id}")
         else:
             logger.info(f"▶️ RETOMANDO OTIMIZAÇÃO: {task_id}")
         
@@ -1614,33 +1524,18 @@ async def process_image_optimization_background(
         clean_store = store_name.replace('.myshopify.com', '').strip()
         api_version = '2024-01'
         
-        # Se for retomada, pegar progresso existente
-        if is_resume and task_id in tasks_db:
-            task = tasks_db[task_id]
-            processed = task["progress"]["processed"]
-            successful = task["progress"]["successful"]
-            failed = task["progress"]["failed"]
-            results = task.get("results", [])
-            total = task["progress"]["total"]
-        else:
-            processed = 0
-            successful = 0
-            failed = 0
-            results = []
-            total = len(images)
+        # Arrays para armazenar dados do feed
+        optimized_images = []
+        
+        processed = 0
+        successful = 0
+        failed = 0
+        results = []
+        total = len(images)
         
         async with httpx.AsyncClient(timeout=60.0) as client:
-            for i, image in enumerate(images[processed:], start=processed):
-                # Verificar se foi pausada ou cancelada
-                if task_id not in tasks_db:
-                    logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
-                    return
-                
-                current_status = tasks_db[task_id].get("status")
-                if current_status in ["paused", "cancelled"]:
-                    logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
-                    return
-                
+            # ETAPA 1: PROCESSAR E OTIMIZAR TODAS AS IMAGENS
+            for i, image in enumerate(images):
                 try:
                     # Informações da imagem original
                     image_url = image.get('src') or image.get('url')
@@ -1649,24 +1544,19 @@ async def process_image_optimization_background(
                     original_width = image.get('dimensions', {}).get('width', 0)
                     original_height = image.get('dimensions', {}).get('height', 0)
                     
-                    # EXTRAIR NOME REAL DO ARQUIVO DA URL DA SHOPIFY
+                    # Extrair nome limpo
                     parsed_url = urlparse(image_url)
                     path_parts = parsed_url.path.split('/')
                     
-                    # Procurar pelo nome do arquivo na URL
                     original_filename = None
                     for part in reversed(path_parts):
                         if part and '.' in part:
-                            # Remover parâmetros de query e decodificar
                             original_filename = unquote(part.split('?')[0])
                             
-                            # REMOVER SUFIXO UUID DIRETAMENTE
-                            # jersey-name_uuid.ext -> jersey-name.ext
                             if '_' in original_filename:
                                 name, ext = os.path.splitext(original_filename)
-                                parts = name.rsplit('_', 1)  # Split apenas no ÚLTIMO underscore
+                                parts = name.rsplit('_', 1)
                                 
-                                # Se a última parte parece um UUID/hash
                                 if len(parts) == 2:
                                     suffix = parts[1]
                                     has_numbers = any(c.isdigit() for c in suffix)
@@ -1677,39 +1567,27 @@ async def process_image_optimization_background(
                                         logger.info(f"🔪 Removido sufixo: _{suffix}")
                             break
                     
-                    # Se não encontrou, tentar do campo filename
                     if not original_filename:
-                        original_filename = image.get('filename', '')
-                        
-                        # Aplicar mesma limpeza
-                        if original_filename and '_' in original_filename:
-                            name, ext = os.path.splitext(original_filename)
-                            parts = name.rsplit('_', 1)
-                            if len(parts) == 2:
-                                suffix = parts[1]
-                                has_numbers = any(c.isdigit() for c in suffix)
-                                has_letters = any(c.isalpha() for c in suffix)
-                                
-                                if (has_numbers and has_letters) or len(suffix) > 10:
-                                    original_filename = parts[0] + ext
-                                    logger.info(f"🔪 Removido sufixo do filename: _{suffix}")
-                        
-                        # Fallback
-                        if not original_filename or original_filename.startswith('image-'):
-                            original_filename = f"product-image-{image.get('id')}.jpg"
+                        original_filename = f"product-image-{image.get('id')}.jpg"
                     
-                    logger.info(f"📥 Processando imagem {image.get('id')}: {original_filename}")
-                    logger.info(f"   URL original: {image_url}")
-                    logger.info(f"   Nome limpo: {original_filename}")
-                    logger.info(f"   Dimensões originais: {original_width}x{original_height}px")
+                    logger.info(f"📥 Processando imagem {i+1}/{total}: {original_filename}")
                     
                     # Verificar se precisa otimização
                     if original_height <= target_height:
-                        logger.info(f"ℹ️ Imagem já está otimizada (altura: {original_height}px)")
+                        # Adicionar ao feed sem otimizar
+                        optimized_images.append({
+                            'product_id': image.get('product_id'),
+                            'image_id': image.get('id'),
+                            'url': image_url,
+                            'filename': original_filename,
+                            'alt': original_alt,
+                            'position': original_position,
+                            'variant_ids': image.get('variant_ids', [])
+                        })
                         processed += 1
                         continue
                     
-                    # PASSO 1: Baixar imagem original
+                    # Baixar imagem
                     img_response = await client.get(image_url, timeout=30.0)
                     if img_response.status_code != 200:
                         raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
@@ -1717,7 +1595,7 @@ async def process_image_optimization_background(
                     image_content = img_response.content
                     logger.info(f"✅ Imagem baixada: {len(image_content)} bytes")
                     
-                    # PASSO 2: Processar com Pillow
+                    # Processar com Pillow
                     img_buffer = io.BytesIO(image_content)
                     pil_image = Image.open(img_buffer)
                     
@@ -1725,14 +1603,14 @@ async def process_image_optimization_background(
                     logger.info(f"🔍 Analisando transparência da imagem...")
                     should_be_png = should_preserve_as_png(pil_image, image_url)
                     
-                    # Calcular novas dimensões mantendo proporção
+                    # Calcular novas dimensões
                     ratio = original_width / original_height
                     new_height = target_height
                     new_width = int(new_height * ratio)
                     
                     logger.info(f"🔄 Redimensionando: {original_width}x{original_height} → {new_width}x{new_height}")
                     
-                    # Redimensionar imagem baseado na análise
+                    # Redimensionar baseado na análise
                     if should_be_png:
                         # Preservar transparência
                         if pil_image.mode != 'RGBA':
@@ -1761,7 +1639,7 @@ async def process_image_optimization_background(
                         save_format = 'JPEG'
                         file_extension = '.jpg'
                     
-                    # PASSO 3: Salvar imagem otimizada
+                    # Salvar imagem otimizada
                     output_buffer = io.BytesIO()
                     
                     save_kwargs = {
@@ -1775,108 +1653,45 @@ async def process_image_optimization_background(
                             save_kwargs['transparency'] = pil_image.info.get('transparency', None)
                         logger.info(f"💎 Salvando como PNG com transparência real preservada")
                     else:
-                        save_kwargs['quality'] = 90  # Alta qualidade para JPG
+                        save_kwargs['quality'] = 90
                         logger.info(f"📸 Salvando como JPEG (sem transparência desnecessária)")
                     
                     resized_image.save(output_buffer, **save_kwargs)
                     output_buffer.seek(0)
-                    
-                    # Converter para bytes
-                    optimized_image_bytes = output_buffer.getvalue()
+                    optimized_bytes = output_buffer.getvalue()
                     
                     # Calcular economia
                     original_size = len(image_content)
-                    optimized_size = len(optimized_image_bytes)
+                    optimized_size = len(optimized_bytes)
                     savings_percentage = round(((original_size - optimized_size) / original_size) * 100)
                     
-                    logger.info(f"✅ Imagem otimizada: {len(optimized_image_bytes)} bytes ({savings_percentage}% menor)")
+                    logger.info(f"✅ Imagem otimizada: {optimized_size} bytes ({savings_percentage}% menor)")
                     
-                    # Preparar nome final
-                    base_name, current_ext = os.path.splitext(original_filename)
+                    # Ajustar nome do arquivo
+                    base_name = os.path.splitext(original_filename)[0]
+                    new_filename = f"{base_name}{file_extension}"
                     
-                    # Se não tem extensão, adicionar
-                    if not current_ext:
-                        new_filename = f"{original_filename}{file_extension}"
-                    # Se mudou o formato (ex: de JPG para PNG por causa de transparência)
-                    elif should_be_png and current_ext.lower() not in ['.png', '.webp']:
-                        new_filename = f"{base_name}{file_extension}"
-                    # Se não tem transparência e era PNG, pode converter para JPG
-                    elif not should_be_png and current_ext.lower() in ['.png', '.webp']:
-                        new_filename = f"{base_name}{file_extension}"
-                    else:
-                        # Manter o nome original completo
-                        new_filename = original_filename
-                    
-                    # PASSO 4: Upload via Files API primeiro
-                    logger.info(f"📤 Uploading via Files API com nome: {new_filename}")
-                    
-                    # Upload para Files API
-                    file_url = await upload_image_via_files_api(
-                        optimized_image_bytes,
+                    # ETAPA 2: HOSPEDAR TEMPORARIAMENTE
+                    temp_url = await upload_temp_image(
+                        optimized_bytes,
                         new_filename,
                         store_name,
                         access_token
                     )
                     
-                    # PASSO 5: Criar imagem no produto usando a URL (não attachment!)
-                    create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images.json"
-                    
-                    headers = {
-                        'X-Shopify-Access-Token': access_token,
-                        'Content-Type': 'application/json'
-                    }
-                    
-                    # USAR SRC em vez de ATTACHMENT!
-                    new_image_data = {
-                        "image": {
-                            "src": file_url,  # URL do Files API
-                            "filename": new_filename,  # Nome desejado
-                            "alt": original_alt,
-                            "position": original_position
-                        }
-                    }
-                    
-                    if image.get('variant_ids'):
-                        new_image_data["image"]["variant_ids"] = image['variant_ids']
-                    
-                    create_response = await client.post(
-                        create_url,
-                        headers=headers,
-                        json=new_image_data
-                    )
-                    
-                    if create_response.status_code not in [200, 201]:
-                        error_text = create_response.text
-                        raise Exception(f"Erro ao criar imagem: {error_text}")
-                    
-                    created_image = create_response.json().get('image', {})
-                    new_image_id = created_image.get('id')
-                    
-                    logger.info(f"✅ Imagem criada COM NOME CORRETO: {new_filename}")
-                    logger.info(f"   ID: {new_image_id}")
-                    
-                    # PASSO 6: Deletar imagem original
-                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
-                    delete_response = await client.delete(delete_url, headers=headers)
-                    
-                    if delete_response.status_code not in [200, 204]:
-                        logger.warning(f"⚠️ Aviso ao deletar imagem original: HTTP {delete_response.status_code}")
-                    else:
-                        logger.info(f"✅ Imagem original removida")
+                    # Adicionar ao array de imagens otimizadas
+                    optimized_images.append({
+                        'product_id': image.get('product_id'),
+                        'image_id': image.get('id'),
+                        'url': temp_url,
+                        'filename': new_filename,
+                        'alt': original_alt,
+                        'position': original_position,
+                        'variant_ids': image.get('variant_ids', []),
+                        'transparency_preserved': should_be_png
+                    })
                     
                     successful += 1
-                    
-                    results.append({
-                        'image_id': image.get('id'),
-                        'new_image_id': new_image_id,
-                        'product_id': image.get('product_id'),
-                        'status': 'success',
-                        'original_dimensions': f"{original_width}x{original_height}",
-                        'new_dimensions': f"{new_width}x{new_height}",
-                        'savings_percentage': savings_percentage,
-                        'transparency_preserved': should_be_png,
-                        'filename_preserved': new_filename
-                    })
                     
                     # Limpar memória
                     pil_image.close()
@@ -1885,56 +1700,71 @@ async def process_image_optimization_background(
                     output_buffer.close()
                     
                 except Exception as e:
-                    logger.error(f"❌ Erro ao otimizar imagem {image.get('id')}: {str(e)}")
+                    logger.error(f"❌ Erro ao processar imagem: {str(e)}")
                     failed += 1
-                    results.append({
-                        'image_id': image.get('id'),
-                        'product_id': image.get('product_id'),
-                        'status': 'failed',
-                        'error': str(e)
-                    })
+                
+                processed += 1
                 
                 # Atualizar progresso
-                processed += 1
-                percentage = round((processed / total) * 100)
-                
                 if task_id in tasks_db:
+                    percentage = round((processed / total) * 100)
                     tasks_db[task_id]["progress"] = {
                         "processed": processed,
                         "total": total,
                         "successful": successful,
                         "failed": failed,
                         "percentage": percentage,
-                        "current_image": f"Imagem {image.get('id')}" if i < len(images)-1 else None
+                        "current_image": f"Processando imagens... {processed}/{total}"
                     }
                     tasks_db[task_id]["updated_at"] = get_brazil_time_str()
-                    tasks_db[task_id]["results"] = results[-20:]
+            
+            # ETAPA 3: GERAR E IMPORTAR FEED
+            logger.info(f"📝 Gerando feed CSV com {len(optimized_images)} imagens")
+            
+            csv_content = generate_product_feed_csv(optimized_images)
+            
+            logger.info(f"📤 Importando feed para Shopify")
+            
+            import_success = await import_product_feed(
+                csv_content,
+                store_name,
+                access_token
+            )
+            
+            if import_success:
+                logger.info(f"✅ Feed importado com sucesso!")
                 
-                # Verificar novamente se foi pausada/cancelada
-                if task_id in tasks_db:
-                    if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
-                        logger.info(f"🛑 Parando após processar imagem {image.get('id')}")
-                        return
-                
-                # Rate limiting
-                await asyncio.sleep(0.8)
-        
-        # Finalizar tarefa
-        final_status = "completed" if failed == 0 else "completed_with_errors"
-        
+                # ETAPA 4: DELETAR IMAGENS ANTIGAS
+                for img_data in optimized_images:
+                    try:
+                        delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{img_data['product_id']}/images/{img_data['image_id']}.json"
+                        
+                        headers = {
+                            'X-Shopify-Access-Token': access_token,
+                            'Content-Type': 'application/json'
+                        }
+                        
+                        delete_response = await client.delete(delete_url, headers=headers)
+                        
+                        if delete_response.status_code in [200, 204]:
+                            logger.info(f"✅ Imagem antiga {img_data['image_id']} removida")
+                        
+                    except Exception as e:
+                        logger.warning(f"⚠️ Erro ao deletar imagem antiga: {e}")
+            
+        # Finalizar
         if task_id in tasks_db:
-            tasks_db[task_id]["status"] = final_status
+            tasks_db[task_id]["status"] = "completed" if failed == 0 else "completed_with_errors"
             tasks_db[task_id]["completed_at"] = get_brazil_time_str()
             tasks_db[task_id]["results"] = results[-10:]
-            tasks_db[task_id]["progress"]["current_image"] = None
             
-            logger.info(f"🏁 OTIMIZAÇÃO FINALIZADA:")
-            logger.info(f"   ✅ Otimizadas: {successful}")
+            logger.info(f"🏁 OTIMIZAÇÃO VIA FEED FINALIZADA:")
+            logger.info(f"   ✅ Processadas: {successful}")
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   📊 Total: {processed}/{total}")
             
     except Exception as e:
-        logger.error(f"❌ Erro crítico na otimização: {str(e)}")
+        logger.error(f"❌ Erro crítico: {str(e)}")
         if task_id in tasks_db:
             tasks_db[task_id]["status"] = "failed"
             tasks_db[task_id]["error"] = str(e)
