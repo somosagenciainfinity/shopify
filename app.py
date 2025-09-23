@@ -1525,14 +1525,45 @@ async def process_image_optimization_background(
         clean_store = store_name.replace('.myshopify.com', '').strip()
         api_version = '2024-01'
         
-        processed = 0
-        successful = 0
-        failed = 0
-        results = []
-        total = len(images)
+        # CORREÇÃO IMPORTANTE: Gerenciar progresso corretamente
+        if is_resume and task_id in tasks_db:
+            task = tasks_db[task_id]
+            processed = task["progress"]["processed"]
+            successful = task["progress"]["successful"]
+            failed = task["progress"]["failed"]
+            results = task.get("results", [])
+            total = task["progress"]["total"]
+            
+            logger.info(f"📊 Retomando do ponto: {processed}/{total} já processadas")
+            
+            # PULAR IMAGENS JÁ PROCESSADAS
+            start_index = processed
+        else:
+            processed = 0
+            successful = 0
+            failed = 0
+            results = []
+            total = len(images)
+            start_index = 0
         
         async with httpx.AsyncClient(timeout=60.0) as client:
-            for i, image in enumerate(images):
+            # CORREÇÃO: Usar enumerate com start correto
+            for idx, image in enumerate(images):
+                # PULAR IMAGENS JÁ PROCESSADAS SE FOR RETOMADA
+                if idx < start_index:
+                    continue
+                
+                # Verificar se foi pausado/cancelado
+                if task_id not in tasks_db:
+                    logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
+                    return
+                
+                current_status = tasks_db[task_id].get("status")
+                
+                if current_status in ["paused", "cancelled"]:
+                    logger.info(f"🛑 Tarefa {task_id} foi {current_status}")
+                    return
+                
                 try:
                     # Informações da imagem original
                     image_url = image.get('src') or image.get('url')
@@ -1571,13 +1602,31 @@ async def process_image_optimization_background(
                     if not original_filename:
                         original_filename = f"product-image-{image_id}.jpg"
                     
-                    logger.info(f"📥 Processando imagem {i+1}/{total}: {original_filename}")
+                    # CORREÇÃO: Mostrar progresso correto
+                    current_progress = processed + 1
+                    logger.info(f"📥 Processando imagem {current_progress}/{total}: {original_filename}")
                     
                     # Verificar se precisa otimização
                     if original_height <= target_height:
                         logger.info(f"✅ Imagem já está no tamanho adequado ({original_height}px ≤ {target_height}px)")
                         processed += 1
                         successful += 1
+                        
+                        # Atualizar progresso
+                        if task_id in tasks_db:
+                            percentage = round((processed / total) * 100)
+                            remaining = total - processed
+                            tasks_db[task_id]["progress"] = {
+                                "processed": processed,
+                                "total": total,
+                                "successful": successful,
+                                "failed": failed,
+                                "percentage": percentage,
+                                "remaining": remaining,
+                                "current_image": f"Processando imagens... {processed}/{total}"
+                            }
+                            tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                        
                         continue
                     
                     # Baixar imagem
@@ -1747,22 +1796,34 @@ async def process_image_optimization_background(
                         'error': str(e)
                     })
                 
+                # IMPORTANTE: Incrementar processed SEMPRE
                 processed += 1
                 
                 # Atualizar progresso
                 if task_id in tasks_db:
                     percentage = round((processed / total) * 100)
+                    
+                    # Calcular restantes corretamente
+                    remaining = total - processed
+                    
                     tasks_db[task_id]["progress"] = {
                         "processed": processed,
                         "total": total,
                         "successful": successful,
                         "failed": failed,
                         "percentage": percentage,
+                        "remaining": remaining,  # Adicionar campo remaining
                         "current_image": f"Processando imagens... {processed}/{total}"
                     }
                     tasks_db[task_id]["updated_at"] = get_brazil_time_str()
+                    
+                    # Limitar results para economizar memória
+                    if len(results) > 20:
+                        tasks_db[task_id]["results"] = results[-20:]
+                    else:
+                        tasks_db[task_id]["results"] = results.copy()
                 
-                # Verificar se foi pausado/cancelado
+                # Verificar se foi pausado/cancelado novamente
                 if task_id in tasks_db:
                     if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
                         logger.info(f"🛑 Tarefa {task_id} foi {tasks_db[task_id].get('status')}")
@@ -3449,55 +3510,56 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
                 "task": task
             }
     elif task_type == "image_optimization":
-        # RETOMAR OTIMIZAÇÃO DE IMAGENS
-        all_images = config.get("images", [])
-        processed_count = task.get("progress", {}).get("processed", 0)
-        remaining_images = all_images[processed_count:]
+    # RETOMAR OTIMIZAÇÃO DE IMAGENS
+    all_images = config.get("images", [])
+    processed_count = task.get("progress", {}).get("processed", 0)
+    remaining_count = len(all_images) - processed_count
+    
+    # PEGAR targetHeight DO CONFIG!
+    target_height = config.get("targetHeight")
+    if not target_height:
+        logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
+        return {
+            "success": False,
+            "message": "targetHeight não configurado na tarefa"
+        }
+    
+    logger.info(f"🖼️ Retomando otimização de imagens:")
+    logger.info(f"   Total de imagens: {len(all_images)}")
+    logger.info(f"   Já processadas: {processed_count}")
+    logger.info(f"   Restantes: {remaining_count}")
+    logger.info(f"   Altura alvo: {target_height}px")
+    
+    if remaining_count > 0:
+        # IMPORTANTE: Passar TODAS as imagens, não apenas as restantes
+        background_tasks.add_task(
+            process_image_optimization_background,
+            task_id,
+            all_images,  # Passar TODAS as imagens
+            target_height,
+            config.get("storeName", ""),
+            config.get("accessToken", ""),
+            is_resume=True  # Flag para indicar retomada
+        )
         
-        # PEGAR targetHeight DO CONFIG!
-        target_height = config.get("targetHeight")
-        if not target_height:
-            logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
-            return {
-                "success": False,
-                "message": "targetHeight não configurado na tarefa"
-            }
+        logger.info(f"✅ Tarefa de otimização {task_id} retomada com {remaining_count} imagens restantes")
         
-        logger.info(f"🖼️ Retomando otimização de imagens:")
-        logger.info(f"   Total de imagens: {len(all_images)}")
-        logger.info(f"   Já processadas: {processed_count}")
-        logger.info(f"   Restantes: {len(remaining_images)}")
-        logger.info(f"   Altura alvo: {target_height}px")
+        return {
+            "success": True,
+            "message": f"Tarefa de otimização retomada com sucesso",
+            "task": task,
+            "remaining": remaining_count,
+            "progress": task.get("progress")
+        }
+    else:
+        task["status"] = "completed"
+        task["completed_at"] = get_brazil_time_str()
         
-        if len(remaining_images) > 0:
-            background_tasks.add_task(
-                process_image_optimization_background,
-                task_id,
-                remaining_images,
-                target_height,  # USAR O targetHeight DO CONFIG
-                config.get("storeName", ""),
-                config.get("accessToken", ""),
-                is_resume=True
-            )
-            
-            logger.info(f"✅ Tarefa de otimização {task_id} retomada com {len(remaining_images)} imagens")
-            
-            return {
-                "success": True,
-                "message": f"Tarefa de otimização retomada com sucesso",
-                "task": task,
-                "remaining": len(remaining_images),
-                "progress": task.get("progress")
-            }
-        else:
-            task["status"] = "completed"
-            task["completed_at"] = get_brazil_time_str()
-            
-            return {
-                "success": True,
-                "message": "Tarefa já estava completa",
-                "task": task
-            }
+        return {
+            "success": True,
+            "message": "Tarefa já estava completa",
+            "task": task
+        }
     else:
         # RETOMAR BULK EDIT NORMAL
         all_product_ids = config.get("productIds", [])
