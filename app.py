@@ -1385,7 +1385,7 @@ async def process_image_optimization_background(
 ):
     """
     Processar otimização de imagens em background
-    Download -> Redimensionar com Pillow -> Upload -> Deletar original
+    AGORA COM RENOMEAÇÃO AUTOMÁTICA APÓS OTIMIZAÇÃO!
     """
     
     try:
@@ -1421,6 +1421,9 @@ async def process_image_optimization_background(
             results = []
             total = len(images)
         
+        # Lista para armazenar imagens que precisam renomeação
+        images_to_rename = []
+        
         async with httpx.AsyncClient(timeout=60.0) as client:
             for i, image in enumerate(images[processed:], start=processed):
                 # Verificar se foi pausada ou cancelada
@@ -1441,46 +1444,33 @@ async def process_image_optimization_background(
                     original_width = image.get('dimensions', {}).get('width', 0)
                     original_height = image.get('dimensions', {}).get('height', 0)
                     
-                    # EXTRAIR NOME REAL DO ARQUIVO DA URL DA SHOPIFY
+                    # EXTRAIR NOME DESEJADO (sem UUID)
                     parsed_url = urlparse(image_url)
                     path_parts = parsed_url.path.split('/')
                     
-                    # Procurar pelo nome do arquivo na URL
-                    original_filename = None
+                    desired_filename = None
                     for part in reversed(path_parts):
                         if part and '.' in part:
-                            # Remover parâmetros de query e decodificar
-                            original_filename = unquote(part.split('?')[0])
+                            desired_filename = unquote(part.split('?')[0])
                             
-                            # REMOVER SUFIXO UUID DIRETAMENTE
-                            # jersey-name_uuid.ext -> jersey-name.ext
-                            if '_' in original_filename:
-                                name, ext = os.path.splitext(original_filename)
-                                parts = name.rsplit('_', 1)  # Split apenas no ÚLTIMO underscore
-                                
-                                # Se a última parte parece um UUID/hash
-                                if len(parts) == 2 and len(parts[1]) >= 32 and '-' in parts[1]:
-                                    original_filename = parts[0] + ext
+                            # REMOVER SUFIXO UUID para ter o nome desejado
+                            if '_' in desired_filename:
+                                name, ext = os.path.splitext(desired_filename)
+                                parts = name.rsplit('_', 1)
+                                if len(parts) == 2:
+                                    suffix = parts[1]
+                                    has_numbers = any(c.isdigit() for c in suffix)
+                                    has_letters = any(c.isalpha() for c in suffix)
+                                    
+                                    if (has_numbers and has_letters) or len(suffix) > 10:
+                                        desired_filename = parts[0] + ext
                             break
                     
-                    # Se não encontrou, tentar do campo filename
-                    if not original_filename:
-                        original_filename = image.get('filename', '')
-                        
-                        # Aplicar mesma limpeza
-                        if original_filename and '_' in original_filename:
-                            name, ext = os.path.splitext(original_filename)
-                            parts = name.rsplit('_', 1)
-                            if len(parts) == 2 and len(parts[1]) >= 32 and '-' in parts[1]:
-                                original_filename = parts[0] + ext
-                        
-                        # Fallback
-                        if not original_filename or original_filename.startswith('image-'):
-                            original_filename = f"product-image-{image.get('id')}.jpg"
+                    if not desired_filename:
+                        desired_filename = f"product-image-{image.get('id')}.jpg"
                     
-                    logger.info(f"📥 Processando imagem {image.get('id')}: {original_filename}")
-                    logger.info(f"   URL original: {image_url}")
-                    logger.info(f"   Nome limpo: {original_filename}")
+                    logger.info(f"📥 Processando imagem {image.get('id')}")
+                    logger.info(f"   Nome desejado: {desired_filename}")
                     logger.info(f"   Dimensões originais: {original_width}x{original_height}px")
                     
                     # Verificar se precisa otimização
@@ -1522,14 +1512,12 @@ async def process_image_optimization_background(
                     
                     # Redimensionar imagem
                     if has_transparency:
-                        # Preservar canal alpha
                         if pil_image.mode != 'RGBA':
                             pil_image = pil_image.convert('RGBA')
                         resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         save_format = 'PNG'
                         file_extension = '.png'
                     else:
-                        # Converter para RGB se necessário
                         if pil_image.mode != 'RGB':
                             pil_image = pil_image.convert('RGB')
                         resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
@@ -1550,7 +1538,7 @@ async def process_image_optimization_background(
                             save_kwargs['transparency'] = pil_image.info.get('transparency', None)
                         logger.info(f"💎 Salvando PNG com transparência preservada")
                     else:
-                        save_kwargs['quality'] = 90  # Alta qualidade para JPG
+                        save_kwargs['quality'] = 90
                         logger.info(f"📸 Salvando JPEG com qualidade 90")
                     
                     resized_image.save(output_buffer, **save_kwargs)
@@ -1567,7 +1555,7 @@ async def process_image_optimization_background(
                     
                     logger.info(f"✅ Imagem otimizada: {len(optimized_image_bytes)} bytes ({savings_percentage}% menor)")
                     
-                    # PASSO 4: Criar nova imagem no Shopify (mesma posição)
+                    # PASSO 4: Upload SEM SE PREOCUPAR COM O NOME (vai ter UUID)
                     create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images.json"
                     
                     headers = {
@@ -1575,35 +1563,16 @@ async def process_image_optimization_background(
                         'Content-Type': 'application/json'
                     }
                     
-                    # USAR O NOME LIMPO (JÁ SEM UUID)
-                    # Preservar o nome base mas ajustar a extensão se necessário
-                    base_name, current_ext = os.path.splitext(original_filename)
-                    
-                    # Se não tem extensão, adicionar
-                    if not current_ext:
-                        new_filename = f"{original_filename}{file_extension}"
-                    # Se mudou o formato (ex: de JPG para PNG por causa de transparência)
-                    elif has_transparency and current_ext.lower() not in ['.png', '.webp']:
-                        new_filename = f"{base_name}{file_extension}"
-                    # Se não tem transparência e era PNG, pode converter para JPG
-                    elif not has_transparency and current_ext.lower() in ['.png', '.webp']:
-                        new_filename = f"{base_name}{file_extension}"
-                    else:
-                        # Manter o nome original completo
-                        new_filename = original_filename
-                    
-                    logger.info(f"📝 Nome final do arquivo: {new_filename}")
-                    
+                    # Upload com nome temporário - não importa, vamos renomear depois
                     new_image_data = {
                         "image": {
                             "attachment": image_base64,
-                            "filename": new_filename,  # Nome limpo sem UUID
-                            "alt": original_alt,  # Manter mesmo alt-text
-                            "position": original_position  # Manter mesma posição
+                            "filename": f"temp_{desired_filename}",  # Nome temporário
+                            "alt": original_alt,
+                            "position": original_position
                         }
                     }
                     
-                    # Manter variantes associadas se houver
                     if image.get('variant_ids'):
                         new_image_data["image"]["variant_ids"] = image['variant_ids']
                     
@@ -1619,9 +1588,9 @@ async def process_image_optimization_background(
                     
                     created_image = create_response.json().get('image', {})
                     new_image_id = created_image.get('id')
+                    new_image_url = created_image.get('src')
                     
                     logger.info(f"✅ Nova imagem otimizada criada com ID: {new_image_id}")
-                    logger.info(f"   Nome preservado: {new_filename}")
                     
                     # PASSO 5: Deletar imagem original
                     delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{image.get('product_id')}/images/{image.get('id')}.json"
@@ -1631,6 +1600,29 @@ async def process_image_optimization_background(
                         logger.warning(f"⚠️ Aviso ao deletar imagem original: HTTP {delete_response.status_code}")
                     else:
                         logger.info(f"✅ Imagem original removida")
+                    
+                    # PASSO 6: ADICIONAR À LISTA PARA RENOMEAÇÃO POSTERIOR
+                    # Ajustar extensão do nome desejado se necessário
+                    base_name, current_ext = os.path.splitext(desired_filename)
+                    if not current_ext:
+                        final_desired_name = f"{desired_filename}{file_extension}"
+                    elif has_transparency and current_ext.lower() not in ['.png', '.webp']:
+                        final_desired_name = f"{base_name}{file_extension}"
+                    elif not has_transparency and current_ext.lower() in ['.png', '.webp']:
+                        final_desired_name = f"{base_name}{file_extension}"
+                    else:
+                        final_desired_name = desired_filename
+                    
+                    images_to_rename.append({
+                        'id': new_image_id,
+                        'product_id': image.get('product_id'),
+                        'src': new_image_url,
+                        'url': new_image_url,
+                        'desired_name': final_desired_name,
+                        'alt': original_alt,
+                        'position': original_position,
+                        'variant_ids': image.get('variant_ids', [])
+                    })
                     
                     successful += 1
                     
@@ -1643,7 +1635,8 @@ async def process_image_optimization_background(
                         'new_dimensions': f"{new_width}x{new_height}",
                         'savings_percentage': savings_percentage,
                         'transparency_preserved': has_transparency,
-                        'filename_preserved': new_filename
+                        'desired_filename': final_desired_name,
+                        'needs_rename': True
                     })
                     
                     # Limpar memória
@@ -1687,6 +1680,57 @@ async def process_image_optimization_background(
                 # Rate limiting
                 await asyncio.sleep(0.8)
         
+        # ETAPA FINAL: RENOMEAR TODAS AS IMAGENS OTIMIZADAS
+        if images_to_rename:
+            logger.info(f"🔄 INICIANDO RENOMEAÇÃO DE {len(images_to_rename)} IMAGENS OTIMIZADAS")
+            
+            rename_task_id = f"rename_after_optimize_{task_id}"
+            
+            # Criar template baseado no nome desejado
+            for img_to_rename in images_to_rename:
+                try:
+                    logger.info(f"📝 Renomeando imagem {img_to_rename['id']} para: {img_to_rename['desired_name']}")
+                    
+                    # Baixar a imagem otimizada
+                    img_response = await client.get(img_to_rename['url'], timeout=30.0)
+                    if img_response.status_code != 200:
+                        raise Exception(f"Erro ao baixar imagem para renomear")
+                    
+                    # Upload com o nome correto usando mesma lógica do endpoint de renomeação
+                    rename_data = {
+                        "image": {
+                            "attachment": base64.b64encode(img_response.content).decode('utf-8'),
+                            "filename": img_to_rename['desired_name'],
+                            "alt": img_to_rename['alt'],
+                            "position": img_to_rename['position']
+                        }
+                    }
+                    
+                    if img_to_rename.get('variant_ids'):
+                        rename_data["image"]["variant_ids"] = img_to_rename['variant_ids']
+                    
+                    # Criar nova imagem com nome correto
+                    create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{img_to_rename['product_id']}/images.json"
+                    rename_response = await client.post(
+                        create_url,
+                        headers=headers,
+                        json=rename_data
+                    )
+                    
+                    if rename_response.status_code in [200, 201]:
+                        final_image = rename_response.json().get('image', {})
+                        
+                        # Deletar a imagem temporária
+                        delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{img_to_rename['product_id']}/images/{img_to_rename['id']}.json"
+                        await client.delete(delete_url, headers=headers)
+                        
+                        logger.info(f"✅ Imagem renomeada com sucesso: {img_to_rename['desired_name']}")
+                    
+                    await asyncio.sleep(1.0)  # Rate limiting
+                    
+                except Exception as e:
+                    logger.error(f"❌ Erro ao renomear imagem {img_to_rename['id']}: {str(e)}")
+        
         # Finalizar tarefa
         final_status = "completed" if failed == 0 else "completed_with_errors"
         
@@ -1696,8 +1740,8 @@ async def process_image_optimization_background(
             tasks_db[task_id]["results"] = results[-10:]
             tasks_db[task_id]["progress"]["current_image"] = None
             
-            logger.info(f"🏁 OTIMIZAÇÃO FINALIZADA:")
-            logger.info(f"   ✅ Otimizadas: {successful}")
+            logger.info(f"🏁 OTIMIZAÇÃO E RENOMEAÇÃO FINALIZADAS:")
+            logger.info(f"   ✅ Otimizadas e renomeadas: {successful}")
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   📊 Total: {processed}/{total}")
             
