@@ -1,4 +1,3 @@
-# Framework e servidor
 fastapi
 uvicorn[standard]
 httpx
@@ -6,34 +5,8 @@ pydantic
 python-multipart
 websockets
 pytz
-
-# Processamento de imagem básico
 pillow
 numpy
 opencv-python-headless
-
-# Remoção de fundo com IA
-rembg[gpu]  # Inclui suporte GPU se disponível
-onnxruntime  # Para modelos ONNX
-
-# Deep Learning - PyTorch
-torch>=2.0.0
-torchvision>=0.15.0
-torchaudio
-
-# Transformers e Hugging Face
-transformers>=4.35.0
-huggingface_hub
-tokenizers
-safetensors
-
-# Segment Anything Model (SAM)
-segment-anything
-
-# Processamento avançado
-scipy  # Para operações matemáticas avançadas
-scikit-image  # Para processamento de imagem adicional
-
-# Utilitários
-aiofiles  # Para operações assíncronas com arquivos
-python-dotenv  # Para variáveis de ambiente
+rembg
+onnxruntime

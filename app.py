@@ -20,18 +20,11 @@ import hashlib
 import tempfile
 from enum import Enum
 
-# NOVOS IMPORTS PARA REMOÇÃO AVANÇADA DE FUNDO
-import torch
-import cv2
+# IMPORTS PARA REMOÇÃO DE FUNDO - APENAS O ESSENCIAL
 import numpy as np
 from PIL import Image
-import onnxruntime as ort
 import rembg
 from rembg import remove, new_session
-from transformers import pipeline
-from segment_anything import SamPredictor, sam_model_registry, SamAutomaticMaskGenerator
-import huggingface_hub
-from huggingface_hub import hf_hub_download
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -2058,115 +2051,56 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
             }
         }
 
-# ==================== SISTEMA ULTRA AVANÇADO DE REMOÇÃO DE FUNDO ====================
+# ==================== SISTEMA DE REMOÇÃO DE FUNDO COM BiRefNet ====================
 
-class ImageComplexityLevel(Enum):
-    """Níveis de complexidade de imagem para seleção de modelo"""
-    SIMPLE_PRODUCT = "simple_product"
-    COMPLEX_EDGES = "complex_edges"
-    HAIR_DETAIL = "hair_detail"
-    TRANSPARENCY = "transparency"
-    MIXED = "mixed"
+# Cache global para o modelo
+BIREFNET_MODEL = None
 
-# Cache global para modelos carregados
-MODELS_CACHE = {
-    "sam": None,
-    "rmbg2": None,
-    "dis": None,
-    "u2net": None,
-    "isnet": None,
-    "birefnet": None
-}
-
-def initialize_models():
-    """Inicializa todos os modelos na memória para uso rápido"""
-    global MODELS_CACHE
+def initialize_birefnet():
+    """Inicializa APENAS o BiRefNet - o melhor modelo"""
+    global BIREFNET_MODEL
     
     try:
-        logger.info("🚀 Inicializando modelos de remoção de fundo...")
+        logger.info("🚀 Inicializando BiRefNet (RMBG-2.0)...")
         
-        # Inicializar SAM
+        # Tentar carregar a versão mais poderosa
         try:
-            if torch.cuda.is_available():
-                device = "cuda"
-                logger.info("🎮 CUDA disponível - usando GPU")
-            else:
-                device = "cpu"
-                logger.info("💻 Usando CPU")
-            
-            # Baixar e carregar SAM
-            sam_checkpoint = hf_hub_download(repo_id="facebook/sam-vit-huge", filename="sam_vit_h_4b8939.pth")
-            sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
-            sam.to(device=device)
-            MODELS_CACHE["sam"] = SamAutomaticMaskGenerator(sam)
-            logger.info("✅ SAM carregado com sucesso")
-        except Exception as e:
-            logger.warning(f"⚠️ SAM não pôde ser carregado: {e}")
-        
-        # Inicializar RMBG-2.0 (BiRefNet)
-        try:
-            MODELS_CACHE["birefnet"] = new_session('birefnet-massive')
-            logger.info("✅ BiRefNet (RMBG-2.0) carregado")
+            BIREFNET_MODEL = new_session('birefnet-massive')
+            logger.info("✅ BiRefNet MASSIVE carregado - MÁXIMA QUALIDADE!")
         except:
+            # Se não couber na memória, usar versão geral
             try:
-                MODELS_CACHE["birefnet"] = new_session('u2net')
-                logger.info("✅ Fallback para U2Net")
-            except Exception as e:
-                logger.warning(f"⚠️ BiRefNet não disponível: {e}")
+                BIREFNET_MODEL = new_session('birefnet-general')
+                logger.info("✅ BiRefNet GENERAL carregado - ALTA QUALIDADE!")
+            except:
+                # Último fallback - u2net básico
+                BIREFNET_MODEL = new_session('u2net')
+                logger.info("⚠️ Usando U2Net como fallback (BiRefNet não disponível)")
         
-        # Inicializar DIS (IS-Net)
-        try:
-            MODELS_CACHE["isnet"] = new_session('isnet-general-use')
-            logger.info("✅ IS-Net (DIS) carregado")
-        except Exception as e:
-            logger.warning(f"⚠️ IS-Net não disponível: {e}")
-        
-        # Inicializar U²-Net
-        try:
-            MODELS_CACHE["u2net"] = new_session('u2net')
-            logger.info("✅ U²-Net carregado")
-        except Exception as e:
-            logger.warning(f"⚠️ U²-Net não disponível: {e}")
-        
-        # Inicializar U²-Net Human Segmentation
-        try:
-            MODELS_CACHE["u2net_human"] = new_session('u2net_human_seg')
-            logger.info("✅ U²-Net Human Segmentation carregado")
-        except Exception as e:
-            logger.warning(f"⚠️ U²-Net Human não disponível: {e}")
-        
-        # Inicializar U²-Net Cloth Segmentation
-        try:
-            MODELS_CACHE["u2net_cloth"] = new_session('u2net_cloth_seg')
-            logger.info("✅ U²-Net Cloth Segmentation carregado")
-        except Exception as e:
-            logger.warning(f"⚠️ U²-Net Cloth não disponível: {e}")
-        
-        logger.info("🎯 Sistema de modelos inicializado com sucesso!")
+        logger.info("🎯 Sistema de remoção de fundo pronto!")
         
     except Exception as e:
-        logger.error(f"❌ Erro ao inicializar modelos: {e}")
+        logger.error(f"❌ Erro ao inicializar modelo: {e}")
+        BIREFNET_MODEL = None
 
-# Inicializar modelos quando o servidor iniciar
+# Adicionar à inicialização do servidor
 @app.on_event("startup")
-async def startup_models():
-    """Inicializar modelos na inicialização do servidor"""
-    initialize_models()
-    logger.info("🤖 Modelos de IA carregados e prontos!")
+async def startup_birefnet():
+    """Inicializar BiRefNet na inicialização do servidor"""
+    initialize_birefnet()
+    logger.info("🤖 BiRefNet pronto para uso!")
 
 @app.post("/api/images/remove-background")
-async def remove_background_ultra_advanced(data: Dict[str, Any], background_tasks: BackgroundTasks):
+async def remove_background_birefnet(data: Dict[str, Any], background_tasks: BackgroundTasks):
     """
-    Endpoint ULTRA AVANÇADO para remoção de fundo com múltiplos modelos de IA
-    Suporta: SAM, BiRefNet (RMBG-2.0), IS-Net (DIS), U²-Net e variantes especializadas
+    Endpoint para remoção de fundo usando APENAS BiRefNet - o melhor modelo
     """
     
     task_id = data.get("id") or f"bg_removal_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
     
-    logger.info(f"🎨 REMOÇÃO DE FUNDO ULTRA AVANÇADA: {task_id}")
+    logger.info(f"🎨 REMOÇÃO DE FUNDO COM BiRefNet: {task_id}")
     logger.info(f"📸 Total de imagens: {len(data.get('selectedImages', []))}")
     logger.info(f"🎯 Cor de fundo: {data.get('backgroundColor', 'transparent')}")
-    logger.info(f"🤖 Modelos disponíveis: {list(filter(lambda x: MODELS_CACHE[x] is not None, MODELS_CACHE.keys()))}")
     
     selected_images = data.get("selectedImages", [])
     background_color = data.get("backgroundColor", "transparent")
@@ -2181,25 +2115,16 @@ async def remove_background_ultra_advanced(data: Dict[str, Any], background_task
     # Criar tarefa
     tasks_db[task_id] = {
         "id": task_id,
-        "name": f"Remoção Ultra Avançada - {len(selected_images)} imagens",
+        "name": f"Remoção de Fundo BiRefNet - {len(selected_images)} imagens",
         "status": "processing",
-        "task_type": "background_removal_ultra",
+        "task_type": "background_removal_birefnet",
         "progress": {
             "processed": 0,
             "total": len(selected_images),
             "successful": 0,
             "failed": 0,
             "percentage": 0,
-            "current_image": None,
-            "model_usage": {
-                "sam": 0,
-                "birefnet": 0,
-                "isnet": 0,
-                "u2net": 0,
-                "u2net_human": 0,
-                "u2net_cloth": 0,
-                "ensemble": 0
-            }
+            "current_image": None
         },
         "started_at": get_brazil_time_str(),
         "updated_at": get_brazil_time_str(),
@@ -2215,7 +2140,7 @@ async def remove_background_ultra_advanced(data: Dict[str, Any], background_task
     logger.info(f"✅ Tarefa {task_id} criada")
     
     background_tasks.add_task(
-        process_background_removal_ultra_advanced,
+        process_background_removal_birefnet,
         task_id,
         selected_images,
         background_color,
@@ -2225,350 +2150,51 @@ async def remove_background_ultra_advanced(data: Dict[str, Any], background_task
     
     return {
         "success": True,
-        "message": f"Processamento ultra avançado iniciado para {len(selected_images)} imagens",
+        "message": f"Processamento BiRefNet iniciado para {len(selected_images)} imagens",
         "taskId": task_id,
-        "estimatedTime": f"{len(selected_images) * 2.5:.1f} segundos",
-        "mode": "ultra_advanced_background_removal"
+        "estimatedTime": f"{len(selected_images) * 2:.1f} segundos",
+        "mode": "birefnet_background_removal"
     }
-
-async def analyze_image_ultra(image_data: bytes) -> Dict[str, Any]:
-    """
-    Análise ULTRA AVANÇADA da imagem para seleção otimizada de modelos
-    """
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img_array = np.array(img)
-        
-        # Análises avançadas
-        width, height = img.size
-        aspect_ratio = width / height
-        
-        # Detectar se é uma pessoa
-        is_person = False
-        has_hair = False
-        is_clothing = False
-        
-        # Converter para RGB para análise
-        if img.mode != 'RGB':
-            img_rgb = img.convert('RGB')
-        else:
-            img_rgb = img
-        
-        img_cv2 = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2BGR)
-        
-        # Detectar faces (indica pessoa)
-        try:
-            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-            is_person = len(faces) > 0
-            
-            if is_person:
-                logger.info("👤 Pessoa detectada na imagem")
-                
-                # Detectar possível presença de cabelo (área acima do rosto)
-                for (x, y, w, h) in faces:
-                    hair_region = gray[max(0, y-h//2):y+h//4, x:x+w]
-                    hair_std = np.std(hair_region)
-                    has_hair = hair_std > 20
-                    if has_hair:
-                        logger.info("💇 Cabelo detectado")
-        except:
-            pass
-        
-        # Detectar roupas (análise de cores e texturas)
-        hsv = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2HSV)
-        
-        # Análise de saturação (roupas geralmente têm saturação média)
-        saturation_mean = np.mean(hsv[:, :, 1])
-        if 30 < saturation_mean < 150 and aspect_ratio > 0.5:
-            is_clothing = True
-            logger.info("👕 Possível roupa detectada")
-        
-        # Análise de complexidade de bordas
-        edges = cv2.Canny(gray, 50, 150)
-        edge_density = np.sum(edges > 0) / (width * height)
-        
-        # Análise de transparência
-        has_alpha = img.mode in ('RGBA', 'LA')
-        has_real_transparency = False
-        transparency_complexity = 0
-        
-        if has_alpha and img.mode == 'RGBA':
-            alpha = img_array[:, :, 3]
-            unique_alphas = np.unique(alpha)
-            
-            if len(unique_alphas) > 2:  # Mais que apenas 0 e 255
-                has_real_transparency = True
-                # Calcular complexidade da transparência
-                alpha_edges = cv2.Canny(alpha, 50, 150)
-                transparency_complexity = np.sum(alpha_edges > 0) / (width * height)
-                logger.info(f"🔍 Transparência complexa detectada: {transparency_complexity:.2%}")
-        
-        # Detectar padrões repetitivos (texturas)
-        gray_float = gray.astype(np.float32)
-        dst = cv2.cornerHarris(gray_float, 2, 3, 0.04)
-        corner_density = np.sum(dst > 0.01 * dst.max()) / (width * height)
-        has_texture = corner_density > 0.001
-        
-        # Análise de frequências (Fourier)
-        f_transform = np.fft.fft2(gray)
-        f_shift = np.fft.fftshift(f_transform)
-        magnitude_spectrum = np.abs(f_shift)
-        high_freq_energy = np.sum(magnitude_spectrum[magnitude_spectrum > np.percentile(magnitude_spectrum, 90)])
-        
-        # Determinar complexidade e modelos recomendados
-        complexity = {
-            "level": ImageComplexityLevel.SIMPLE_PRODUCT,
-            "is_person": is_person,
-            "has_hair": has_hair,
-            "is_clothing": is_clothing,
-            "has_texture": has_texture,
-            "has_transparency": has_real_transparency,
-            "transparency_complexity": transparency_complexity,
-            "edge_density": edge_density,
-            "high_freq_energy": high_freq_energy,
-            "recommended_models": [],
-            "ensemble_recommended": False
-        }
-        
-        # Seleção inteligente de modelos
-        if is_person and has_hair:
-            complexity["level"] = ImageComplexityLevel.HAIR_DETAIL
-            complexity["recommended_models"] = ["birefnet", "u2net_human", "sam"]
-            complexity["ensemble_recommended"] = True
-            logger.info("🎯 Recomendação: BiRefNet + U2Net Human + SAM (pessoa com cabelo)")
-        elif is_person:
-            complexity["level"] = ImageComplexityLevel.COMPLEX_EDGES
-            complexity["recommended_models"] = ["u2net_human", "birefnet"]
-            logger.info("🎯 Recomendação: U2Net Human + BiRefNet (pessoa)")
-        elif is_clothing:
-            complexity["recommended_models"] = ["u2net_cloth", "isnet"]
-            logger.info("🎯 Recomendação: U2Net Cloth + IS-Net (roupa)")
-        elif has_real_transparency and transparency_complexity > 0.01:
-            complexity["level"] = ImageComplexityLevel.TRANSPARENCY
-            complexity["recommended_models"] = ["isnet", "u2net", "birefnet"]
-            complexity["ensemble_recommended"] = True
-            logger.info("🎯 Recomendação: IS-Net + U2Net + BiRefNet (transparências complexas)")
-        elif edge_density > 0.1 or has_texture:
-            complexity["level"] = ImageComplexityLevel.COMPLEX_EDGES
-            complexity["recommended_models"] = ["isnet", "sam"]
-            logger.info("🎯 Recomendação: IS-Net + SAM (bordas complexas)")
-        elif high_freq_energy > 1000000:
-            complexity["level"] = ImageComplexityLevel.MIXED
-            complexity["recommended_models"] = ["birefnet", "isnet", "sam"]
-            complexity["ensemble_recommended"] = True
-            logger.info("🎯 Recomendação: Ensemble (alta frequência)")
-        else:
-            complexity["recommended_models"] = ["sam", "u2net"]
-            logger.info("🎯 Recomendação: SAM + U2Net (produto simples)")
-        
-        return complexity
-        
-    except Exception as e:
-        logger.error(f"❌ Erro na análise ultra: {str(e)}")
-        return {
-            "level": ImageComplexityLevel.MIXED,
-            "recommended_models": ["birefnet", "u2net"],
-            "ensemble_recommended": False
-        }
-
-async def process_with_sam_advanced(image_data: bytes) -> Optional[bytes]:
-    """
-    Processamento com SAM (Segment Anything Model) - Meta AI
-    """
-    try:
-        if MODELS_CACHE["sam"] is None:
-            logger.warning("⚠️ SAM não está carregado")
-            return None
-        
-        logger.info("🤖 Processando com SAM...")
-        
-        # Converter bytes para imagem
-        img = Image.open(io.BytesIO(image_data))
-        img_array = np.array(img.convert('RGB'))
-        
-        # Gerar máscaras automáticas
-        masks = MODELS_CACHE["sam"].generate(img_array)
-        
-        if not masks:
-            logger.warning("⚠️ SAM não gerou máscaras")
-            return None
-        
-        # Selecionar a maior máscara (geralmente o objeto principal)
-        largest_mask = max(masks, key=lambda x: x['area'])
-        mask = largest_mask['segmentation']
-        
-        # Aplicar máscara
-        if img.mode != 'RGBA':
-            img = img.convert('RGBA')
-        
-        img_array = np.array(img)
-        img_array[:, :, 3] = mask.astype(np.uint8) * 255
-        
-        # Converter de volta para bytes
-        result_img = Image.fromarray(img_array, 'RGBA')
-        output_buffer = io.BytesIO()
-        result_img.save(output_buffer, format='PNG', optimize=True)
-        output_buffer.seek(0)
-        
-        logger.info("✅ SAM processamento concluído")
-        return output_buffer.getvalue()
-        
-    except Exception as e:
-        logger.error(f"❌ Erro no SAM: {str(e)}")
-        return None
 
 async def process_with_birefnet(image_data: bytes) -> Optional[bytes]:
     """
-    Processamento com BiRefNet (RMBG-2.0) - Estado da arte
+    Processa imagem com BiRefNet - o melhor modelo de remoção de fundo
     """
     try:
-        if MODELS_CACHE["birefnet"] is None:
-            logger.warning("⚠️ BiRefNet não está carregado")
-            return None
+        if BIREFNET_MODEL is None:
+            logger.warning("⚠️ BiRefNet não está carregado, usando modo básico")
+            # Fallback para remoção básica
+            output = remove(image_data)
+        else:
+            logger.info("🎯 Processando com BiRefNet...")
+            # Usar o modelo BiRefNet carregado
+            output = remove(image_data, session=BIREFNET_MODEL)
         
-        logger.info("🎯 Processando com BiRefNet (RMBG-2.0)...")
-        
-        # Processar com BiRefNet
-        output = remove(image_data, session=MODELS_CACHE["birefnet"])
-        
-        logger.info("✅ BiRefNet processamento concluído")
+        logger.info("✅ Processamento concluído com sucesso")
         return output
         
     except Exception as e:
-        logger.error(f"❌ Erro no BiRefNet: {str(e)}")
-        return None
-
-async def process_with_isnet(image_data: bytes) -> Optional[bytes]:
-    """
-    Processamento com IS-Net (DIS - Dichotomous Image Segmentation)
-    """
-    try:
-        if MODELS_CACHE["isnet"] is None:
-            logger.warning("⚠️ IS-Net não está carregado")
+        logger.error(f"❌ Erro no processamento: {str(e)}")
+        # Tentar fallback básico
+        try:
+            logger.info("🔄 Tentando fallback básico...")
+            output = remove(image_data)
+            return output
+        except:
             return None
-        
-        logger.info("✂️ Processando com IS-Net (DIS)...")
-        
-        # Processar com IS-Net
-        output = remove(image_data, session=MODELS_CACHE["isnet"])
-        
-        logger.info("✅ IS-Net processamento concluído")
-        return output
-        
-    except Exception as e:
-        logger.error(f"❌ Erro no IS-Net: {str(e)}")
-        return None
 
-async def process_with_u2net_variants(image_data: bytes, variant: str = "general") -> Optional[bytes]:
+async def apply_background_color(image_data: bytes, color: str) -> bytes:
     """
-    Processamento com variantes do U²-Net
-    """
-    try:
-        session_key = {
-            "general": "u2net",
-            "human": "u2net_human",
-            "cloth": "u2net_cloth"
-        }.get(variant, "u2net")
-        
-        if MODELS_CACHE[session_key] is None:
-            logger.warning(f"⚠️ U²-Net {variant} não está carregado")
-            return None
-        
-        logger.info(f"🔮 Processando com U²-Net {variant}...")
-        
-        # Processar com U²-Net
-        output = remove(image_data, session=MODELS_CACHE[session_key])
-        
-        logger.info(f"✅ U²-Net {variant} processamento concluído")
-        return output
-        
-    except Exception as e:
-        logger.error(f"❌ Erro no U²-Net {variant}: {str(e)}")
-        return None
-
-async def ensemble_processing(image_data: bytes, models: List[str]) -> Optional[bytes]:
-    """
-    Processamento ensemble - combina múltiplos modelos para resultado superior
-    """
-    try:
-        logger.info(f"🎭 Processamento ENSEMBLE com {len(models)} modelos: {models}")
-        
-        results = []
-        
-        # Processar com cada modelo
-        for model in models:
-            result = None
-            
-            if model == "sam":
-                result = await process_with_sam_advanced(image_data)
-            elif model == "birefnet":
-                result = await process_with_birefnet(image_data)
-            elif model == "isnet":
-                result = await process_with_isnet(image_data)
-            elif model == "u2net":
-                result = await process_with_u2net_variants(image_data, "general")
-            elif model == "u2net_human":
-                result = await process_with_u2net_variants(image_data, "human")
-            elif model == "u2net_cloth":
-                result = await process_with_u2net_variants(image_data, "cloth")
-            
-            if result:
-                results.append(result)
-        
-        if not results:
-            logger.warning("⚠️ Nenhum modelo produziu resultado no ensemble")
-            return None
-        
-        # Combinar resultados usando votação de pixels
-        logger.info("🔄 Combinando resultados do ensemble...")
-        
-        # Converter todos para arrays numpy
-        masks = []
-        for result in results:
-            img = Image.open(io.BytesIO(result))
-            if img.mode != 'RGBA':
-                img = img.convert('RGBA')
-            mask = np.array(img)[:, :, 3]
-            masks.append(mask)
-        
-        # Votação: pixel é transparente se maioria dos modelos concordam
-        combined_mask = np.mean(masks, axis=0)
-        final_mask = (combined_mask > 127).astype(np.uint8) * 255
-        
-        # Aplicar máscara refinada na imagem original
-        original_img = Image.open(io.BytesIO(image_data))
-        if original_img.mode != 'RGBA':
-            original_img = original_img.convert('RGBA')
-        
-        img_array = np.array(original_img)
-        img_array[:, :, 3] = final_mask
-        
-        # Converter de volta para bytes
-        result_img = Image.fromarray(img_array, 'RGBA')
-        output_buffer = io.BytesIO()
-        result_img.save(output_buffer, format='PNG', optimize=True)
-        output_buffer.seek(0)
-        
-        logger.info("✅ Processamento ensemble concluído")
-        return output_buffer.getvalue()
-        
-    except Exception as e:
-        logger.error(f"❌ Erro no processamento ensemble: {str(e)}")
-        return None
-
-async def apply_background_color_advanced(image_data: bytes, color: str) -> bytes:
-    """
-    Aplica cor de fundo com qualidade profissional
+    Aplica cor de fundo à imagem processada
     """
     img = Image.open(io.BytesIO(image_data))
     
+    # Garantir RGBA
     if img.mode != 'RGBA':
         img = img.convert('RGBA')
     
     if color == "transparent":
-        # Manter transparência com otimização
+        # Manter transparência
         output_buffer = io.BytesIO()
         img.save(output_buffer, format='PNG', optimize=True, compress_level=6)
         output_buffer.seek(0)
@@ -2580,7 +2206,7 @@ async def apply_background_color_advanced(image_data: bytes, color: str) -> byte
     elif color == "black":
         background = Image.new('RGBA', img.size, (0, 0, 0, 255))
     else:
-        # Cor customizada
+        # Cor customizada (hex)
         try:
             if color.startswith('#'):
                 color = color[1:]
@@ -2590,17 +2216,6 @@ async def apply_background_color_advanced(image_data: bytes, color: str) -> byte
             background = Image.new('RGBA', img.size, (r, g, b, 255))
         except:
             background = Image.new('RGBA', img.size, (255, 255, 255, 255))
-    
-    # Aplicar suavização nas bordas (anti-aliasing)
-    img_array = np.array(img)
-    if len(img_array.shape) == 3 and img_array.shape[2] == 4:
-        alpha = img_array[:, :, 3].astype(np.float32) / 255.0
-        
-        # Aplicar gaussian blur no canal alpha para suavizar bordas
-        alpha_blurred = cv2.GaussianBlur(alpha, (3, 3), 0)
-        img_array[:, :, 3] = (alpha_blurred * 255).astype(np.uint8)
-        
-        img = Image.fromarray(img_array, 'RGBA')
     
     # Compor imagem sobre o fundo
     background.paste(img, (0, 0), img)
@@ -2619,7 +2234,7 @@ async def apply_background_color_advanced(image_data: bytes, color: str) -> byte
     output_buffer.seek(0)
     return output_buffer.getvalue()
 
-async def process_background_removal_ultra_advanced(
+async def process_background_removal_birefnet(
     task_id: str,
     selected_images: List[Dict],
     background_color: str,
@@ -2628,17 +2243,17 @@ async def process_background_removal_ultra_advanced(
     is_resume: bool = False
 ):
     """
-    Processamento ULTRA AVANÇADO com todos os modelos de IA
+    Processa remoção de fundo usando APENAS BiRefNet
     """
     try:
         if not is_resume:
-            logger.info(f"🚀 INICIANDO PROCESSAMENTO ULTRA AVANÇADO: {task_id}")
+            logger.info(f"🚀 INICIANDO PROCESSAMENTO COM BiRefNet: {task_id}")
         else:
             logger.info(f"▶️ RETOMANDO PROCESSAMENTO: {task_id}")
         
         logger.info(f"🎨 Cor de fundo: {background_color}")
         logger.info(f"📸 Total de imagens: {len(selected_images)}")
-        logger.info(f"🤖 Modelos ativos: {sum(1 for m in MODELS_CACHE.values() if m is not None)}")
+        logger.info(f"🤖 Modelo: BiRefNet (RMBG-2.0) - O MELHOR!")
         
         clean_store = store_name.replace('.myshopify.com', '').strip()
         api_version = '2024-01'
@@ -2649,20 +2264,12 @@ async def process_background_removal_ultra_advanced(
             processed = task["progress"]["processed"]
             successful = task["progress"]["successful"]
             failed = task["progress"]["failed"]
-            model_usage = task["progress"].get("model_usage", {
-                "sam": 0, "birefnet": 0, "isnet": 0, "u2net": 0,
-                "u2net_human": 0, "u2net_cloth": 0, "ensemble": 0
-            })
             results = task.get("results", [])
             total = task["progress"]["total"]
         else:
             processed = 0
             successful = 0
             failed = 0
-            model_usage = {
-                "sam": 0, "birefnet": 0, "isnet": 0, "u2net": 0,
-                "u2net_human": 0, "u2net_cloth": 0, "ensemble": 0
-            }
             results = []
             total = len(selected_images)
         
@@ -2686,14 +2293,13 @@ async def process_background_removal_ultra_advanced(
                     original_position = image_info.get('position', 1)
                     variant_ids = image_info.get('variant_ids', [])
                     
-                    logger.info(f"\n{'='*60}")
-                    logger.info(f"📸 PROCESSANDO IMAGEM {idx + 1}/{total}")
+                    logger.info(f"\n{'='*50}")
+                    logger.info(f"📸 Processando imagem {idx + 1}/{total}")
                     logger.info(f"   ID: {image_id}")
-                    logger.info(f"   Produto: {product_id}")
                     
                     # Atualizar progresso
                     if task_id in tasks_db:
-                        tasks_db[task_id]["progress"]["current_image"] = f"Imagem {image_id}"
+                        tasks_db[task_id]["progress"]["current_image"] = f"Imagem {idx + 1}/{total}"
                         tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                     
                     # Baixar imagem
@@ -2704,86 +2310,17 @@ async def process_background_removal_ultra_advanced(
                     original_image_data = img_response.content
                     logger.info(f"✅ Download concluído: {len(original_image_data)} bytes")
                     
-                    # Análise ULTRA da imagem
-                    complexity = await analyze_image_ultra(original_image_data)
-                    recommended_models = complexity.get("recommended_models", ["birefnet"])
-                    use_ensemble = complexity.get("ensemble_recommended", False)
+                    # Processar com BiRefNet
+                    logger.info(f"🎯 Aplicando BiRefNet...")
+                    processed_image = await process_with_birefnet(original_image_data)
                     
-                    logger.info(f"📊 Análise concluída:")
-                    logger.info(f"   Complexidade: {complexity.get('level', ImageComplexityLevel.SIMPLE_PRODUCT).value}")
-                    logger.info(f"   Pessoa: {complexity.get('is_person', False)}")
-                    logger.info(f"   Cabelo: {complexity.get('has_hair', False)}")
-                    logger.info(f"   Roupa: {complexity.get('is_clothing', False)}")
-                    logger.info(f"   Transparência: {complexity.get('has_transparency', False)}")
-                    logger.info(f"   Densidade de bordas: {complexity.get('edge_density', 0):.2%}")
-                    
-                    # Processar com modelos
-                    processed_image = None
-                    model_used = None
-                    
-                    if use_ensemble and len(recommended_models) > 1:
-                        logger.info(f"🎭 Usando ENSEMBLE com {len(recommended_models)} modelos")
-                        processed_image = await ensemble_processing(original_image_data, recommended_models)
-                        if processed_image:
-                            model_used = "ensemble"
-                            model_usage["ensemble"] += 1
-                    
-                    # Se ensemble falhou ou não foi usado, tentar modelos individuais
                     if not processed_image:
-                        for model in recommended_models:
-                            logger.info(f"🔄 Tentando modelo: {model.upper()}")
-                            
-                            if model == "sam":
-                                processed_image = await process_with_sam_advanced(original_image_data)
-                                if processed_image:
-                                    model_used = "sam"
-                                    model_usage["sam"] += 1
-                                    break
-                            elif model == "birefnet":
-                                processed_image = await process_with_birefnet(original_image_data)
-                                if processed_image:
-                                    model_used = "birefnet"
-                                    model_usage["birefnet"] += 1
-                                    break
-                            elif model == "isnet":
-                                processed_image = await process_with_isnet(original_image_data)
-                                if processed_image:
-                                    model_used = "isnet"
-                                    model_usage["isnet"] += 1
-                                    break
-                            elif model == "u2net":
-                                processed_image = await process_with_u2net_variants(original_image_data, "general")
-                                if processed_image:
-                                    model_used = "u2net"
-                                    model_usage["u2net"] += 1
-                                    break
-                            elif model == "u2net_human":
-                                processed_image = await process_with_u2net_variants(original_image_data, "human")
-                                if processed_image:
-                                    model_used = "u2net_human"
-                                    model_usage["u2net_human"] += 1
-                                    break
-                            elif model == "u2net_cloth":
-                                processed_image = await process_with_u2net_variants(original_image_data, "cloth")
-                                if processed_image:
-                                    model_used = "u2net_cloth"
-                                    model_usage["u2net_cloth"] += 1
-                                    break
+                        raise Exception("Falha no processamento BiRefNet")
                     
-                    # Fallback final
-                    if not processed_image:
-                        logger.warning("⚠️ Todos os modelos falharam, usando fallback básico")
-                        try:
-                            processed_image = remove(original_image_data)
-                            model_used = "fallback_basic"
-                        except:
-                            processed_image = original_image_data
-                            model_used = "original"
-                    
-                    logger.info(f"✅ Processamento concluído com: {model_used.upper()}")
+                    logger.info(f"✅ Fundo removido com sucesso")
                     
                     # Aplicar cor de fundo
-                    final_image = await apply_background_color_advanced(processed_image, background_color)
+                    final_image = await apply_background_color(processed_image, background_color)
                     
                     # Determinar extensão
                     if background_color == "transparent":
@@ -2853,17 +2390,9 @@ async def process_background_removal_ultra_advanced(
                         'new_image_id': new_image_id,
                         'product_id': product_id,
                         'status': 'success',
-                        'model_used': model_used,
-                        'complexity_level': complexity.get('level', ImageComplexityLevel.SIMPLE_PRODUCT).value,
+                        'model_used': 'BiRefNet',
                         'background_color': background_color,
-                        'new_filename': new_filename,
-                        'analysis': {
-                            'is_person': complexity.get('is_person', False),
-                            'has_hair': complexity.get('has_hair', False),
-                            'is_clothing': complexity.get('is_clothing', False),
-                            'has_transparency': complexity.get('has_transparency', False),
-                            'edge_density': complexity.get('edge_density', 0)
-                        }
+                        'new_filename': new_filename
                     })
                     
                     logger.info(f"✅ SUCESSO: Imagem {idx + 1}/{total} processada")
@@ -2889,8 +2418,7 @@ async def process_background_removal_ultra_advanced(
                         "successful": successful,
                         "failed": failed,
                         "percentage": percentage,
-                        "current_image": f"Processando {processed + 1}/{total}" if processed < total else None,
-                        "model_usage": model_usage
+                        "current_image": f"Processando {processed + 1}/{total}" if processed < total else None
                     }
                     tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                     
@@ -2914,17 +2442,13 @@ async def process_background_removal_ultra_advanced(
             tasks_db[task_id]["completed_at"] = get_brazil_time_str()
             tasks_db[task_id]["results"] = results[-10:]
             
-            logger.info(f"\n{'='*60}")
-            logger.info(f"🏁 PROCESSAMENTO ULTRA AVANÇADO FINALIZADO")
+            logger.info(f"\n{'='*50}")
+            logger.info(f"🏁 PROCESSAMENTO BiRefNet FINALIZADO")
             logger.info(f"   ✅ Sucesso: {successful}")
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   📊 Total: {processed}/{total}")
-            logger.info(f"\n🤖 ESTATÍSTICAS DE MODELOS:")
-            for model, count in model_usage.items():
-                if count > 0:
-                    percentage = (count / successful * 100) if successful > 0 else 0
-                    logger.info(f"   {model.upper()}: {count} imagens ({percentage:.1f}%)")
-            logger.info(f"{'='*60}\n")
+            logger.info(f"   🤖 Modelo: BiRefNet (RMBG-2.0)")
+            logger.info(f"{'='*50}\n")
             
     except Exception as e:
         logger.error(f"❌ ERRO CRÍTICO: {str(e)}")
