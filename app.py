@@ -19,6 +19,8 @@ import os
 import hashlib
 import tempfile
 from enum import Enum
+from contextlib import asynccontextmanager
+import traceback
 
 # IMPORTS PARA REMOÇÃO DE FUNDO - APENAS O ESSENCIAL
 import numpy as np
@@ -40,17 +42,6 @@ def get_brazil_time():
 def get_brazil_time_str():
     """Retorna o horário atual de Brasília como string ISO"""
     return get_brazil_time().isoformat()
-
-app = FastAPI(title="Shopify Task Processor", version="3.0.0")
-
-# CORS - IMPORTANTE!
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
 
 # Gerenciador de WebSocket
 class ConnectionManager:
@@ -75,6 +66,184 @@ manager = ConnectionManager()
 
 # Armazenar tarefas em memória
 tasks_db = {}
+
+# Cache global para o modelo BiRefNet
+BIREFNET_MODEL = None
+
+def initialize_birefnet():
+    """Inicializa APENAS o BiRefNet - o melhor modelo"""
+    global BIREFNET_MODEL
+    
+    try:
+        logger.info("🚀 Inicializando BiRefNet (RMBG-2.0)...")
+        
+        # Tentar carregar a versão mais poderosa
+        try:
+            BIREFNET_MODEL = new_session('birefnet-massive')
+            logger.info("✅ BiRefNet MASSIVE carregado - MÁXIMA QUALIDADE!")
+        except:
+            # Se não couber na memória, usar versão geral
+            try:
+                BIREFNET_MODEL = new_session('birefnet-general')
+                logger.info("✅ BiRefNet GENERAL carregado - ALTA QUALIDADE!")
+            except:
+                # Último fallback - u2net básico
+                BIREFNET_MODEL = new_session('u2net')
+                logger.info("⚠️ Usando U2Net como fallback (BiRefNet não disponível)")
+        
+        logger.info("🎯 Sistema de remoção de fundo pronto!")
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao inicializar modelo: {e}")
+        BIREFNET_MODEL = None
+
+# Declaração antecipada das funções que serão usadas no lifespan
+async def check_and_execute_scheduled_tasks():
+    """Verificar e executar tarefas agendadas automaticamente"""
+    while True:
+        try:
+            now = datetime.now()
+            
+            for task_id, task in list(tasks_db.items()):
+                if task["status"] == "scheduled":
+                    # Usar scheduled_for_local se disponível, senão usar scheduled_for
+                    scheduled_for = task.get("scheduled_for_local") or task["scheduled_for"]
+                    
+                    # Processar o horário
+                    if scheduled_for.endswith('Z'):
+                        scheduled_for_clean = scheduled_for[:-1]
+                        scheduled_time = datetime.fromisoformat(scheduled_for_clean).replace(tzinfo=timezone.utc)
+                        scheduled_time = scheduled_time.astimezone().replace(tzinfo=None)
+                    else:
+                        try:
+                            scheduled_time = datetime.fromisoformat(scheduled_for)
+                            if scheduled_time.tzinfo is not None:
+                                scheduled_time = scheduled_time.replace(tzinfo=None)
+                        except:
+                            scheduled_time = datetime.fromisoformat(scheduled_for.replace('Z', ''))
+                    
+                    # Se já passou do horário, executar
+                    if scheduled_time <= now:
+                        logger.info(f"⏰ Executando tarefa agendada {task_id}")
+                        logger.info(f"   Agendada para: {scheduled_time}")
+                        logger.info(f"   Horário atual: {now}")
+                        
+                        # Mudar status e processar
+                        task["status"] = "processing"
+                        task["started_at"] = get_brazil_time_str()
+                        task["updated_at"] = get_brazil_time_str()
+                        
+                        # Aqui você executaria a tarefa baseado no tipo
+                        # Por enquanto, apenas logamos
+                        logger.info(f"▶️ Tarefa {task_id} seria executada aqui")
+            
+            # Verificar a cada 20 segundos
+            await asyncio.sleep(20)
+            
+        except Exception as e:
+            logger.error(f"Erro no verificador de tarefas: {e}")
+            await asyncio.sleep(20)
+
+async def cleanup_old_tasks():
+    """Limpar tarefas antigas da memória para evitar acúmulo"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Aguardar 5 minutos
+            
+            now = datetime.now()
+            tasks_to_remove = []
+            tasks_to_simplify = []
+            
+            for task_id, task in tasks_db.items():
+                status = task.get("status")
+                
+                # Remover tarefas completadas há mais de 24 horas
+                if status in ["completed", "failed", "cancelled", "completed_with_errors"]:
+                    completed_at = task.get("completed_at") or task.get("updated_at")
+                    if completed_at:
+                        try:
+                            completed_time = datetime.fromisoformat(completed_at.replace('Z', ''))
+                            hours_passed = (now - completed_time).total_seconds() / 3600
+                            
+                            if hours_passed > 24:  # Mais de 24 horas
+                                tasks_to_remove.append(task_id)
+                            elif hours_passed > 2:  # Entre 2 e 24 horas - simplificar
+                                tasks_to_simplify.append(task_id)
+                        except:
+                            pass
+            
+            # Remover tarefas muito antigas
+            for task_id in tasks_to_remove:
+                del tasks_db[task_id]
+                logger.info(f"🗑️ Tarefa antiga removida da memória: {task_id}")
+            
+            # Simplificar tarefas completadas recentes (liberar memória mas manter registro)
+            for task_id in tasks_to_simplify:
+                if task_id in tasks_db:
+                    task = tasks_db[task_id]
+                    # Manter apenas informações essenciais
+                    tasks_db[task_id] = {
+                        "id": task["id"],
+                        "name": task.get("name"),
+                        "status": task["status"],
+                        "task_type": task.get("task_type"),
+                        "progress": task.get("progress"),
+                        "started_at": task.get("started_at"),
+                        "completed_at": task.get("completed_at"),
+                        "updated_at": task.get("updated_at"),
+                        "config": {
+                            "itemCount": task.get("config", {}).get("itemCount", 0)
+                        },
+                        "results": []  # Limpar results
+                    }
+            
+            if tasks_to_remove or tasks_to_simplify:
+                logger.info(f"🧹 Limpeza: {len(tasks_to_remove)} removidas, {len(tasks_to_simplify)} simplificadas")
+                logger.info(f"📊 Total de tarefas na memória: {len(tasks_db)}")
+            
+        except Exception as e:
+            logger.error(f"❌ Erro na limpeza automática: {e}")
+
+# NOVO FORMATO PARA LIFESPAN EVENTS
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Código de inicialização (startup)
+    logger.info("🚀 Iniciando servidor Railway...")
+    
+    # Inicializar BiRefNet
+    initialize_birefnet()
+    logger.info("🤖 BiRefNet carregado e pronto!")
+    
+    # Iniciar verificador de tarefas agendadas
+    asyncio.create_task(check_and_execute_scheduled_tasks())
+    logger.info("⏰ Verificador de tarefas agendadas iniciado")
+    
+    # Iniciar limpeza automática
+    asyncio.create_task(cleanup_old_tasks())
+    logger.info("🧹 Sistema de limpeza automática de memória iniciado")
+    
+    logger.info("✅ Servidor Railway totalmente inicializado!")
+    
+    yield  # Servidor rodando
+    
+    # Código de cleanup (shutdown)
+    logger.info("🛑 Encerrando servidor Railway...")
+
+# Criar app com lifespan
+app = FastAPI(
+    title="Shopify Task Processor", 
+    version="3.0.0",
+    lifespan=lifespan  # IMPORTANTE: Adicionar lifespan aqui
+)
+
+# CORS - IMPORTANTE!
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
 # ==================== MODELOS DE DADOS ====================
 class TaskRequest(BaseModel):
@@ -2051,7 +2220,7 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
             }
         }
 
-# ==================== SISTEMA DE REMOÇÃO DE FUNDO COM BiRefNet ====================
+# ==================== SISTEMA DE REMOÇÃO DE FUNDO COM BiRefNet - PRESERVANDO RESOLUÇÃO ====================
 
 # Cache global para o modelo
 BIREFNET_MODEL = None
@@ -2083,120 +2252,192 @@ def initialize_birefnet():
         logger.error(f"❌ Erro ao inicializar modelo: {e}")
         BIREFNET_MODEL = None
 
-# Adicionar à inicialização do servidor
-@app.on_event("startup")
-async def startup_birefnet():
-    """Inicializar BiRefNet na inicialização do servidor"""
-    initialize_birefnet()
-    logger.info("🤖 BiRefNet pronto para uso!")
-
 @app.post("/api/images/remove-background")
 async def remove_background_birefnet(data: Dict[str, Any], background_tasks: BackgroundTasks):
     """
-    Endpoint para remoção de fundo usando APENAS BiRefNet - o melhor modelo
+    Endpoint para remoção de fundo usando APENAS BiRefNet - PRESERVANDO RESOLUÇÃO ORIGINAL
     """
     
-    task_id = data.get("id") or f"bg_removal_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+    # LOG PARA DEBUG
+    logger.info(f"🎯 ENDPOINT /api/images/remove-background CHAMADO!")
+    logger.info(f"📦 Dados recebidos: selectedImages={len(data.get('selectedImages', []))}, backgroundColor={data.get('backgroundColor')}")
     
-    logger.info(f"🎨 REMOÇÃO DE FUNDO COM BiRefNet: {task_id}")
-    logger.info(f"📸 Total de imagens: {len(data.get('selectedImages', []))}")
-    logger.info(f"🎯 Cor de fundo: {data.get('backgroundColor', 'transparent')}")
-    
-    selected_images = data.get("selectedImages", [])
-    background_color = data.get("backgroundColor", "transparent")
-    store_name = data.get("storeName", "")
-    access_token = data.get("accessToken", "")
-    
-    if not selected_images:
-        raise HTTPException(status_code=400, detail="Nenhuma imagem selecionada")
-    if not store_name or not access_token:
-        raise HTTPException(status_code=400, detail="Credenciais não fornecidas")
-    
-    # Criar tarefa
-    tasks_db[task_id] = {
-        "id": task_id,
-        "name": f"Remoção de Fundo BiRefNet - {len(selected_images)} imagens",
-        "status": "processing",
-        "task_type": "background_removal_birefnet",
-        "progress": {
-            "processed": 0,
-            "total": len(selected_images),
-            "successful": 0,
-            "failed": 0,
-            "percentage": 0,
-            "current_image": None
-        },
-        "started_at": get_brazil_time_str(),
-        "updated_at": get_brazil_time_str(),
-        "config": {
-            "backgroundColor": background_color,
-            "storeName": store_name,
-            "accessToken": access_token,
-            "itemCount": len(selected_images)
-        },
-        "results": []
-    }
-    
-    logger.info(f"✅ Tarefa {task_id} criada")
-    
-    background_tasks.add_task(
-        process_background_removal_birefnet,
-        task_id,
-        selected_images,
-        background_color,
-        store_name,
-        access_token
-    )
-    
-    return {
-        "success": True,
-        "message": f"Processamento BiRefNet iniciado para {len(selected_images)} imagens",
-        "taskId": task_id,
-        "estimatedTime": f"{len(selected_images) * 2:.1f} segundos",
-        "mode": "birefnet_background_removal"
-    }
+    try:
+        task_id = data.get("id") or f"bg_removal_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+        
+        logger.info(f"🎨 REMOÇÃO DE FUNDO COM BiRefNet: {task_id}")
+        logger.info(f"📸 Total de imagens: {len(data.get('selectedImages', []))}")
+        logger.info(f"🎯 Cor de fundo: {data.get('backgroundColor', 'transparent')}")
+        logger.info(f"📐 PRESERVANDO RESOLUÇÃO ORIGINAL DAS IMAGENS")
+        
+        selected_images = data.get("selectedImages", [])
+        background_color = data.get("backgroundColor", "transparent")
+        store_name = data.get("storeName", "")
+        access_token = data.get("accessToken", "")
+        
+        # Validação detalhada
+        if not selected_images:
+            logger.error("❌ Nenhuma imagem selecionada")
+            raise HTTPException(status_code=400, detail="Nenhuma imagem selecionada")
+        if not store_name:
+            logger.error("❌ Nome da loja não fornecido")
+            raise HTTPException(status_code=400, detail="Nome da loja não fornecido")
+        if not access_token:
+            logger.error("❌ Token de acesso não fornecido")
+            raise HTTPException(status_code=400, detail="Token de acesso não fornecido")
+        
+        logger.info(f"✅ Validação OK - {len(selected_images)} imagens para processar")
+        logger.info(f"📍 Loja: {store_name}")
+        
+        # Criar tarefa
+        tasks_db[task_id] = {
+            "id": task_id,
+            "name": f"Remoção de Fundo BiRefNet - {len(selected_images)} imagens",
+            "status": "processing",
+            "task_type": "background_removal_birefnet",
+            "progress": {
+                "processed": 0,
+                "total": len(selected_images),
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0,
+                "current_image": None
+            },
+            "started_at": get_brazil_time_str(),
+            "updated_at": get_brazil_time_str(),
+            "config": {
+                "backgroundColor": background_color,
+                "storeName": store_name,
+                "accessToken": access_token,
+                "itemCount": len(selected_images)
+            },
+            "results": []
+        }
+        
+        logger.info(f"✅ Tarefa {task_id} criada e salva em tasks_db")
+        
+        # Processar em background
+        background_tasks.add_task(
+            process_background_removal_birefnet,
+            task_id,
+            selected_images,
+            background_color,
+            store_name,
+            access_token
+        )
+        
+        logger.info(f"✅ Background task iniciada para {task_id}")
+        
+        return {
+            "success": True,
+            "message": f"Processamento BiRefNet iniciado para {len(selected_images)} imagens",
+            "taskId": task_id,
+            "estimatedTime": f"{len(selected_images) * 2:.1f} segundos",
+            "mode": "birefnet_background_removal"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ ERRO NO ENDPOINT: {str(e)}")
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-async def process_with_birefnet(image_data: bytes) -> Optional[bytes]:
+async def process_with_birefnet_preserving_resolution(image_data: bytes) -> Optional[bytes]:
     """
-    Processa imagem com BiRefNet - o melhor modelo de remoção de fundo
+    Processa imagem com BiRefNet PRESERVANDO A RESOLUÇÃO ORIGINAL
     """
     try:
+        # Abrir imagem original para pegar dimensões
+        original_img = Image.open(io.BytesIO(image_data))
+        original_width = original_img.width
+        original_height = original_img.height
+        original_mode = original_img.mode
+        
+        logger.info(f"📐 Resolução original: {original_width}x{original_height} ({original_mode})")
+        
+        # Processar com BiRefNet
         if BIREFNET_MODEL is None:
             logger.warning("⚠️ BiRefNet não está carregado, usando modo básico")
-            # Fallback para remoção básica
             output = remove(image_data)
         else:
             logger.info("🎯 Processando com BiRefNet...")
-            # Usar o modelo BiRefNet carregado
             output = remove(image_data, session=BIREFNET_MODEL)
         
-        logger.info("✅ Processamento concluído com sucesso")
+        # Verificar se a resolução foi mantida
+        processed_img = Image.open(io.BytesIO(output))
+        processed_width = processed_img.width
+        processed_height = processed_img.height
+        
+        logger.info(f"📐 Resolução após processamento: {processed_width}x{processed_height}")
+        
+        # Se a resolução mudou, redimensionar de volta ao tamanho original
+        if processed_width != original_width or processed_height != original_height:
+            logger.info(f"🔄 Restaurando resolução original: {original_width}x{original_height}")
+            
+            # Usar LANCZOS para máxima qualidade no redimensionamento
+            processed_img = processed_img.resize(
+                (original_width, original_height), 
+                Image.Resampling.LANCZOS
+            )
+            
+            # Salvar com qualidade máxima
+            output_buffer = io.BytesIO()
+            if processed_img.mode == 'RGBA':
+                processed_img.save(output_buffer, format='PNG', optimize=True, compress_level=1)
+            else:
+                processed_img.save(output_buffer, format='PNG')
+            output_buffer.seek(0)
+            output = output_buffer.getvalue()
+            
+            logger.info(f"✅ Resolução restaurada: {original_width}x{original_height}")
+        
+        logger.info("✅ Processamento concluído preservando resolução")
         return output
         
     except Exception as e:
         logger.error(f"❌ Erro no processamento: {str(e)}")
-        # Tentar fallback básico
         try:
             logger.info("🔄 Tentando fallback básico...")
             output = remove(image_data)
+            
+            # Verificar e ajustar resolução no fallback também
+            original_img = Image.open(io.BytesIO(image_data))
+            processed_img = Image.open(io.BytesIO(output))
+            
+            if processed_img.size != original_img.size:
+                processed_img = processed_img.resize(original_img.size, Image.Resampling.LANCZOS)
+                output_buffer = io.BytesIO()
+                processed_img.save(output_buffer, format='PNG', optimize=True)
+                output_buffer.seek(0)
+                output = output_buffer.getvalue()
+            
             return output
-        except:
+        except Exception as fallback_error:
+            logger.error(f"❌ Fallback também falhou: {str(fallback_error)}")
             return None
 
-async def apply_background_color(image_data: bytes, color: str) -> bytes:
+async def apply_background_color_preserving_quality(image_data: bytes, color: str, original_dimensions: tuple = None) -> bytes:
     """
-    Aplica cor de fundo à imagem processada
+    Aplica cor de fundo PRESERVANDO QUALIDADE E RESOLUÇÃO
     """
     img = Image.open(io.BytesIO(image_data))
     
-    # Garantir RGBA
+    # Se temos as dimensões originais, garantir que sejam mantidas
+    if original_dimensions:
+        if img.size != original_dimensions:
+            logger.info(f"🔄 Ajustando para dimensões originais: {original_dimensions}")
+            img = img.resize(original_dimensions, Image.Resampling.LANCZOS)
+    
+    # Garantir RGBA para trabalhar com transparência
     if img.mode != 'RGBA':
         img = img.convert('RGBA')
     
     if color == "transparent":
-        # Manter transparência
+        # Manter transparência com máxima qualidade
         output_buffer = io.BytesIO()
-        img.save(output_buffer, format='PNG', optimize=True, compress_level=6)
+        # compress_level=1 para mínima compressão (máxima qualidade)
+        img.save(output_buffer, format='PNG', optimize=False, compress_level=1)
         output_buffer.seek(0)
         return output_buffer.getvalue()
     
@@ -2224,12 +2465,14 @@ async def apply_background_color(image_data: bytes, color: str) -> bytes:
     if color != "transparent":
         background = background.convert('RGB')
     
-    # Salvar com qualidade otimizada
+    # Salvar com MÁXIMA qualidade
     output_buffer = io.BytesIO()
     if color == "transparent":
-        background.save(output_buffer, format='PNG', optimize=True, compress_level=6)
+        # PNG com mínima compressão
+        background.save(output_buffer, format='PNG', optimize=False, compress_level=1)
     else:
-        background.save(output_buffer, format='JPEG', quality=95, optimize=True)
+        # JPEG com qualidade máxima
+        background.save(output_buffer, format='JPEG', quality=100, optimize=False, subsampling=0)
     
     output_buffer.seek(0)
     return output_buffer.getvalue()
@@ -2243,7 +2486,7 @@ async def process_background_removal_birefnet(
     is_resume: bool = False
 ):
     """
-    Processa remoção de fundo usando APENAS BiRefNet
+    Processa remoção de fundo usando BiRefNet PRESERVANDO RESOLUÇÃO ORIGINAL
     """
     try:
         if not is_resume:
@@ -2253,6 +2496,7 @@ async def process_background_removal_birefnet(
         
         logger.info(f"🎨 Cor de fundo: {background_color}")
         logger.info(f"📸 Total de imagens: {len(selected_images)}")
+        logger.info(f"📐 PRESERVANDO RESOLUÇÃO ORIGINAL DE TODAS AS IMAGENS")
         logger.info(f"🤖 Modelo: BiRefNet (RMBG-2.0) - O MELHOR!")
         
         clean_store = store_name.replace('.myshopify.com', '').strip()
@@ -2296,6 +2540,7 @@ async def process_background_removal_birefnet(
                     logger.info(f"\n{'='*50}")
                     logger.info(f"📸 Processando imagem {idx + 1}/{total}")
                     logger.info(f"   ID: {image_id}")
+                    logger.info(f"   URL: {image_url[:100]}...")
                     
                     # Atualizar progresso
                     if task_id in tasks_db:
@@ -2303,6 +2548,7 @@ async def process_background_removal_birefnet(
                         tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                     
                     # Baixar imagem
+                    logger.info(f"📥 Baixando imagem...")
                     img_response = await client.get(image_url, timeout=30.0)
                     if img_response.status_code != 200:
                         raise Exception(f"Erro ao baixar: HTTP {img_response.status_code}")
@@ -2310,19 +2556,36 @@ async def process_background_removal_birefnet(
                     original_image_data = img_response.content
                     logger.info(f"✅ Download concluído: {len(original_image_data)} bytes")
                     
-                    # Processar com BiRefNet
-                    logger.info(f"🎯 Aplicando BiRefNet...")
-                    processed_image = await process_with_birefnet(original_image_data)
+                    # Obter dimensões originais
+                    original_img = Image.open(io.BytesIO(original_image_data))
+                    original_dimensions = (original_img.width, original_img.height)
+                    original_format = original_img.format
+                    logger.info(f"📐 Dimensões originais: {original_dimensions[0]}x{original_dimensions[1]} ({original_format})")
+                    
+                    # Processar com BiRefNet PRESERVANDO RESOLUÇÃO
+                    logger.info(f"🎯 Aplicando BiRefNet com preservação de resolução...")
+                    processed_image = await process_with_birefnet_preserving_resolution(original_image_data)
                     
                     if not processed_image:
                         raise Exception("Falha no processamento BiRefNet")
                     
-                    logger.info(f"✅ Fundo removido com sucesso")
+                    logger.info(f"✅ Fundo removido preservando resolução")
                     
-                    # Aplicar cor de fundo
-                    final_image = await apply_background_color(processed_image, background_color)
+                    # Aplicar cor de fundo PRESERVANDO QUALIDADE
+                    final_image = await apply_background_color_preserving_quality(
+                        processed_image, 
+                        background_color,
+                        original_dimensions
+                    )
                     
-                    # Determinar extensão
+                    # Verificar tamanho final
+                    final_img = Image.open(io.BytesIO(final_image))
+                    logger.info(f"📐 Resolução final: {final_img.width}x{final_img.height}")
+                    
+                    if final_img.size != original_dimensions:
+                        logger.warning(f"⚠️ Resolução diferente! Original: {original_dimensions}, Final: {final_img.size}")
+                    
+                    # Determinar extensão baseada na cor de fundo
                     if background_color == "transparent":
                         file_extension = ".png"
                     else:
@@ -2336,8 +2599,11 @@ async def process_background_removal_birefnet(
                         base_name = original_filename
                     new_filename = f"{base_name}-nobg{file_extension}"
                     
+                    logger.info(f"📝 Novo nome do arquivo: {new_filename}")
+                    
                     # Base64 para upload
                     image_base64 = base64.b64encode(final_image).decode('utf-8')
+                    logger.info(f"📦 Imagem codificada em base64: {len(image_base64)} caracteres")
                     
                     # Criar nova imagem no Shopify
                     create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images.json"
@@ -2359,6 +2625,7 @@ async def process_background_removal_birefnet(
                     if variant_ids and len(variant_ids) > 0:
                         create_data["image"]["variant_ids"] = variant_ids
                     
+                    logger.info(f"📤 Enviando nova imagem para Shopify...")
                     create_response = await client.post(
                         create_url,
                         headers=headers,
@@ -2376,6 +2643,7 @@ async def process_background_removal_birefnet(
                     
                     # Deletar original
                     delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
+                    logger.info(f"🗑️ Deletando imagem original...")
                     delete_response = await client.delete(delete_url, headers=headers)
                     
                     if delete_response.status_code in [200, 204]:
@@ -2392,10 +2660,14 @@ async def process_background_removal_birefnet(
                         'status': 'success',
                         'model_used': 'BiRefNet',
                         'background_color': background_color,
-                        'new_filename': new_filename
+                        'new_filename': new_filename,
+                        'original_resolution': f"{original_dimensions[0]}x{original_dimensions[1]}",
+                        'final_resolution': f"{final_img.width}x{final_img.height}",
+                        'resolution_preserved': final_img.size == original_dimensions
                     })
                     
                     logger.info(f"✅ SUCESSO: Imagem {idx + 1}/{total} processada")
+                    logger.info(f"   Resolução preservada: {'SIM ✅' if final_img.size == original_dimensions else 'NÃO ⚠️'}")
                     
                 except Exception as e:
                     logger.error(f"❌ ERRO na imagem {image_id}: {str(e)}")
@@ -2448,10 +2720,12 @@ async def process_background_removal_birefnet(
             logger.info(f"   ❌ Falhas: {failed}")
             logger.info(f"   📊 Total: {processed}/{total}")
             logger.info(f"   🤖 Modelo: BiRefNet (RMBG-2.0)")
+            logger.info(f"   📐 RESOLUÇÃO ORIGINAL PRESERVADA")
             logger.info(f"{'='*50}\n")
             
     except Exception as e:
         logger.error(f"❌ ERRO CRÍTICO: {str(e)}")
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
         if task_id in tasks_db:
             tasks_db[task_id]["status"] = "failed"
             tasks_db[task_id]["error"] = str(e)
