@@ -3035,6 +3035,63 @@ async def refresh_products_from_shopify(data: Dict[str, Any]):
         logger.error(f"❌ Erro ao buscar produtos do Shopify: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
+# ==================== ATUALIZAÇÃO DE IMAGENS ====================
+@app.post("/api/products/refresh-images")
+async def refresh_product_images(data: Dict[str, Any]):
+    """Buscar apenas as imagens atualizadas de produtos específicos"""
+    
+    product_ids = data.get("productIds", [])
+    store_name = data.get("storeName", "")
+    access_token = data.get("accessToken", "")
+    
+    if not product_ids or not store_name or not access_token:
+        raise HTTPException(status_code=400, detail="Dados incompletos")
+    
+    logger.info(f"🔄 Buscando imagens atualizadas para {len(product_ids)} produtos")
+    
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    api_version = '2024-04'
+    
+    try:
+        updated_products = []
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for product_id in product_ids[:50]:  # Limitar a 50 produtos por vez
+                try:
+                    url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}.json"
+                    headers = {
+                        "X-Shopify-Access-Token": access_token,
+                        "Content-Type": "application/json"
+                    }
+                    
+                    response = await client.get(url, headers=headers)
+                    
+                    if response.status_code == 200:
+                        product_data = response.json().get("product", {})
+                        
+                        # Extrair apenas dados essenciais de imagens
+                        simplified_product = {
+                            "id": product_data.get("id"),
+                            "images": product_data.get("images", []),
+                            "featured_image": product_data.get("image")
+                        }
+                        
+                        updated_products.append(simplified_product)
+                    
+                    await asyncio.sleep(0.1)  # Rate limiting
+                    
+                except Exception as e:
+                    logger.error(f"Erro ao buscar produto {product_id}: {e}")
+                    continue
+        
+        logger.info(f"✅ {len(updated_products)} produtos com imagens atualizadas")
+        
+        return updated_products
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao buscar imagens: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==================== AGENDAMENTO DE TAREFAS (CORRIGIDOS) ====================
 
 @app.post("/api/tasks/schedule")
