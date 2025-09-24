@@ -99,7 +99,7 @@ def initialize_birefnet():
 
 # Declaração antecipada das funções que serão usadas no lifespan
 async def check_and_execute_scheduled_tasks():
-    """Verificar e executar tarefas agendadas automaticamente"""
+    """Verificar e executar tarefas agendadas automaticamente - VERSÃO COMPLETA"""
     while True:
         try:
             now = datetime.now()
@@ -125,6 +125,8 @@ async def check_and_execute_scheduled_tasks():
                     # Se já passou do horário, executar
                     if scheduled_time <= now:
                         logger.info(f"⏰ Executando tarefa agendada {task_id}")
+                        logger.info(f"   Nome: {task.get('name', 'Sem nome')}")
+                        logger.info(f"   Tipo: {task.get('task_type', 'bulk_edit')}")
                         logger.info(f"   Agendada para: {scheduled_time}")
                         logger.info(f"   Horário atual: {now}")
                         
@@ -133,16 +135,163 @@ async def check_and_execute_scheduled_tasks():
                         task["started_at"] = get_brazil_time_str()
                         task["updated_at"] = get_brazil_time_str()
                         
-                        # Aqui você executaria a tarefa baseado no tipo
-                        # Por enquanto, apenas logamos
-                        logger.info(f"▶️ Tarefa {task_id} seria executada aqui")
+                        # Extrair configurações
+                        config = task.get("config", {})
+                        task_type = task.get("task_type", "bulk_edit")
+                        
+                        # EXECUTAR BASEADO NO TIPO DE TAREFA
+                        try:
+                            if task_type == "background_removal_birefnet":
+                                # ========== REMOÇÃO DE FUNDO ==========
+                                logger.info(f"🎨 Executando remoção de fundo para {task_id}")
+                                asyncio.create_task(
+                                    process_background_removal_birefnet(
+                                        task_id,
+                                        config.get("selectedImages", []),
+                                        config.get("backgroundColor", "transparent"),
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                                
+                            elif task_type == "alt_text":
+                                # ========== ALT-TEXT SEO ==========
+                                logger.info(f"📝 Executando alt-text para {task_id}")
+                                asyncio.create_task(
+                                    process_alt_text_background(
+                                        task_id,
+                                        config.get("csvData", []),
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                                
+                            elif task_type == "rename_images":
+                                # ========== RENOMEAÇÃO DE IMAGENS ==========
+                                logger.info(f"🏷️ Executando renomeação para {task_id}")
+                                asyncio.create_task(
+                                    process_rename_images_background(
+                                        task_id,
+                                        config.get("template", ""),
+                                        config.get("images", []),
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                                
+                            elif task_type == "image_optimization":
+                                # ========== OTIMIZAÇÃO DE IMAGENS ==========
+                                logger.info(f"🖼️ Executando otimização para {task_id}")
+                                target_height = config.get("targetHeight")
+                                
+                                if not target_height:
+                                    # Tentar pegar de settings se não estiver em config
+                                    target_height = task.get("settings", {}).get("targetHeight")
+                                
+                                if not target_height:
+                                    logger.error(f"❌ targetHeight não encontrado para tarefa {task_id}")
+                                    task["status"] = "failed"
+                                    task["error"] = "targetHeight não configurado"
+                                    continue
+                                
+                                asyncio.create_task(
+                                    process_image_optimization_background(
+                                        task_id,
+                                        config.get("images", []),
+                                        target_height,
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                                
+                            elif task_type == "variant_management":
+                                # ========== GERENCIAMENTO DE VARIANTES ==========
+                                logger.info(f"📦 Executando variantes para {task_id}")
+                                
+                                if config.get("csvContent"):
+                                    # Processar com CSV
+                                    asyncio.create_task(
+                                        process_variants_background(
+                                            task_id,
+                                            config.get("csvContent", ""),
+                                            config.get("productIds", []),
+                                            config.get("submitData", {}),
+                                            config.get("storeName", ""),
+                                            config.get("accessToken", "")
+                                        )
+                                    )
+                                elif config.get("submitData") and config.get("productId"):
+                                    # Processar produto único
+                                    asyncio.create_task(
+                                        process_single_product_variants(
+                                            task_id,
+                                            config.get("productId"),
+                                            config.get("submitData", {}),
+                                            config.get("storeName", ""),
+                                            config.get("accessToken", "")
+                                        )
+                                    )
+                                else:
+                                    logger.error(f"❌ Configuração inválida para variantes {task_id}")
+                                    task["status"] = "failed"
+                                    task["error"] = "Configuração de variantes inválida"
+                                    continue
+                                    
+                            elif task_type == "bulk_edit":
+                                # ========== EDIÇÃO EM MASSA PADRÃO ==========
+                                logger.info(f"✏️ Executando bulk edit para {task_id}")
+                                asyncio.create_task(
+                                    process_products_background(
+                                        task_id,
+                                        config.get("productIds", []),
+                                        config.get("operations", []),
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                                
+                            else:
+                                # ========== TIPO DESCONHECIDO - TENTAR BULK EDIT ==========
+                                logger.warning(f"⚠️ Tipo de tarefa desconhecido: {task_type}, tentando bulk edit")
+                                asyncio.create_task(
+                                    process_products_background(
+                                        task_id,
+                                        config.get("productIds", []),
+                                        config.get("operations", []),
+                                        config.get("storeName", ""),
+                                        config.get("accessToken", "")
+                                    )
+                                )
+                            
+                            logger.info(f"✅ Tarefa {task_id} ({task_type}) iniciada com sucesso")
+                            
+                            # VERIFICAR E ENVIAR NOTIFICAÇÕES
+                            if config.get("notifications"):
+                                notifications = config["notifications"]
+                                
+                                # Notificação de início de execução
+                                if notifications.get("on_start"):
+                                    logger.info(f"📱 Enviando notificação de início para {task_id}")
+                                    # Aqui você poderia integrar com serviço de notificação
+                                    
+                                # Marcar que a tarefa foi iniciada
+                                if "notifications" not in task:
+                                    task["notifications"] = {}
+                                task["notifications"]["started_at"] = get_brazil_time_str()
+                            
+                        except Exception as exec_error:
+                            logger.error(f"❌ Erro ao executar tarefa {task_id}: {str(exec_error)}")
+                            task["status"] = "failed"
+                            task["error"] = str(exec_error)
+                            task["completed_at"] = get_brazil_time_str()
             
             # Verificar a cada 20 segundos
             await asyncio.sleep(20)
             
         except Exception as e:
-            logger.error(f"Erro no verificador de tarefas: {e}")
-            await asyncio.sleep(20)
+            logger.error(f"❌ Erro no verificador de tarefas agendadas: {e}")
+            logger.error(f"   Traceback: {traceback.format_exc()}")
+            await asyncio.sleep(20)  # Continuar tentando mesmo com erro
 
 async def cleanup_old_tasks():
     """Limpar tarefas antigas da memória para evitar acúmulo"""
@@ -4681,15 +4830,6 @@ async def cleanup_old_tasks():
         except Exception as e:
             logger.error(f"❌ Erro na limpeza automática: {e}")
 
-# Atualizar o startup event
-@app.on_event("startup")
-async def startup_event():
-    """Iniciar verificador de tarefas agendadas e limpeza automática"""
-    asyncio.create_task(check_and_execute_scheduled_tasks())
-    asyncio.create_task(cleanup_old_tasks())  # NOVO: Limpeza automática
-    logger.info("⏰ Verificador de tarefas agendadas iniciado")
-    logger.info("🧹 Sistema de limpeza automática de memória iniciado")
-
 # ==================== STATUS E ATUALIZAÇÃO ====================
 
 @app.get("/task-status/{task_id}")
@@ -5236,13 +5376,6 @@ async def check_and_execute_scheduled_tasks():
         except Exception as e:
             logger.error(f"Erro no verificador de tarefas: {e}")
             await asyncio.sleep(20)
-
-# Iniciar verificador de tarefas agendadas quando o servidor iniciar
-@app.on_event("startup")
-async def startup_event():
-    """Iniciar verificador de tarefas agendadas"""
-    asyncio.create_task(check_and_execute_scheduled_tasks())
-    logger.info("⏰ Verificador de tarefas agendadas iniciado")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
