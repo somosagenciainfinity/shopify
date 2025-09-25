@@ -1407,8 +1407,8 @@ async def process_image_optimization_background(
     is_resume: bool = False
 ):
     """
-    Processar otimização de imagens - MÉTODO DIRETO
-    Download -> Otimizar -> Reupload com mesmo nome -> Deletar antiga
+    Processar otimização de imagens - FLUXO MELHORADO
+    Download -> Otimizar -> Deletar antiga (com retry) -> Upload com mesmo nome
     """
     
     try:
@@ -1650,7 +1650,7 @@ async def process_image_optimization_background(
                         
                         continue
                     
-                    # Baixar imagem
+                    # ============ PASSO 1: DOWNLOAD ============
                     img_response = await client.get(image_url, timeout=30.0)
                     if img_response.status_code != 200:
                         raise Exception(f"Erro ao baixar imagem: HTTP {img_response.status_code}")
@@ -1658,7 +1658,7 @@ async def process_image_optimization_background(
                     image_content = img_response.content
                     logger.info(f"✅ Imagem baixada: {len(image_content)} bytes")
                     
-                    # Processar com Pillow
+                    # ============ PASSO 2: OTIMIZAÇÃO ============
                     img_buffer = io.BytesIO(image_content)
                     pil_image = Image.open(img_buffer)
                     
@@ -1734,19 +1734,48 @@ async def process_image_optimization_background(
                     base_name = os.path.splitext(original_filename)[0]
                     new_filename = f"{base_name}{file_extension}"
                     
-                    # MÉTODO DIRETO: Criar nova imagem e deletar antiga
-                    logger.info(f"📤 Enviando imagem otimizada para Shopify...")
+                    # ============ PASSO 3: DELETAR ORIGINAL PRIMEIRO (FLUXO MELHORADO) ============
+                    headers = {
+                        'X-Shopify-Access-Token': access_token,
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    delete_success = False
+                    delete_attempts = 0
+                    max_delete_attempts = 3
+                    
+                    logger.info(f"🗑️ Tentando deletar imagem original {image_id} ANTES do upload...")
+                    
+                    while not delete_success and delete_attempts < max_delete_attempts:
+                        try:
+                            delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
+                            delete_response = await client.delete(delete_url, headers=headers)
+                            
+                            if delete_response.status_code in [200, 204]:
+                                logger.info(f"✅ Imagem original deletada com sucesso (tentativa {delete_attempts + 1})")
+                                delete_success = True
+                            elif delete_response.status_code == 404:
+                                logger.info(f"⚠️ Imagem original já não existe (404)")
+                                delete_success = True  # Considerar sucesso se já não existe
+                            else:
+                                logger.warning(f"⚠️ Falha ao deletar (tentativa {delete_attempts + 1}): HTTP {delete_response.status_code}")
+                                delete_attempts += 1
+                                if delete_attempts < max_delete_attempts:
+                                    await asyncio.sleep(1)  # Aguardar 1 segundo antes de tentar novamente
+                        except Exception as del_error:
+                            logger.warning(f"⚠️ Erro ao deletar (tentativa {delete_attempts + 1}): {str(del_error)}")
+                            delete_attempts += 1
+                            if delete_attempts < max_delete_attempts:
+                                await asyncio.sleep(1)
+                    
+                    # ============ PASSO 4: UPLOAD DA NOVA IMAGEM ============
+                    logger.info(f"📤 Enviando imagem otimizada para Shopify com nome: {new_filename}")
                     
                     # Converter para base64
                     image_base64 = base64.b64encode(optimized_bytes).decode('utf-8')
                     
                     # Criar nova imagem
                     create_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images.json"
-                    
-                    headers = {
-                        'X-Shopify-Access-Token': access_token,
-                        'Content-Type': 'application/json'
-                    }
                     
                     create_data = {
                         "image": {
@@ -1776,16 +1805,18 @@ async def process_image_optimization_background(
                     
                     logger.info(f"✅ Nova imagem criada com ID: {new_image_id}")
                     
-                    # Deletar imagem antiga
-                    logger.info(f"🗑️ Deletando imagem antiga {image_id}")
-                    
-                    delete_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products/{product_id}/images/{image_id}.json"
-                    delete_response = await client.delete(delete_url, headers=headers)
-                    
-                    if delete_response.status_code in [200, 204]:
-                        logger.info(f"✅ Imagem antiga deletada")
-                    else:
-                        logger.warning(f"⚠️ Aviso ao deletar imagem antiga: HTTP {delete_response.status_code}")
+                    # ============ PASSO 5: SE DELETAR FALHOU ANTES, TENTAR NOVAMENTE ============
+                    if not delete_success:
+                        logger.info(f"🗑️ Tentando deletar imagem original novamente (pós-upload)...")
+                        try:
+                            delete_response = await client.delete(delete_url, headers=headers)
+                            if delete_response.status_code in [200, 204]:
+                                logger.info(f"✅ Imagem original finalmente deletada")
+                            else:
+                                logger.warning(f"⚠️ Não foi possível deletar imagem original: HTTP {delete_response.status_code}")
+                                logger.warning(f"⚠️ Pode haver duplicata temporária até limpeza manual")
+                        except Exception as final_del_error:
+                            logger.warning(f"⚠️ Erro final ao tentar deletar: {str(final_del_error)}")
                     
                     successful += 1
                     
@@ -1798,7 +1829,8 @@ async def process_image_optimization_background(
                         'new_size': optimized_size,
                         'savings': savings_percentage,
                         'dimensions': f"{new_width}x{new_height}",
-                        'transparency_preserved': should_be_png
+                        'transparency_preserved': should_be_png,
+                        'original_deleted': delete_success
                     })
                     
                     # Limpar memória
