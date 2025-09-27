@@ -2079,205 +2079,124 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
 @app.post("/api/images/upload-to-shopify")
 async def upload_image_to_shopify(data: Dict[str, Any]):
     """
-    Upload de imagem DIRETAMENTE para o Shopify Files API
-    SEM CRIAR PRODUTOS RASCUNHO!
+    Upload para ImgBB - GRÁTIS e ILIMITADO
+    Não sobrecarrega o Railway, não cria produtos no Shopify
     """
     
     try:
-        logger.info("📸 Upload de imagem para Shopify Files")
+        logger.info("📸 Upload de imagem via ImgBB")
         
         # Extrair dados
         image_base64 = data.get("image")
         filename = data.get("filename", "image.jpg")
-        store_name = data.get("storeName", "")
-        access_token = data.get("accessToken", "")
         
-        if not image_base64 or not store_name or not access_token:
-            return {"success": False, "message": "Dados incompletos"}
+        if not image_base64:
+            return {"success": False, "message": "Nenhuma imagem fornecida"}
         
-        # Limpar nome da loja
-        clean_store = store_name.replace('.myshopify.com', '').strip()
-        
-        # Decodificar base64
+        # Processar base64
         if "," in image_base64:
-            image_base64 = image_base64.split(",")[1]
+            _, image_base64_clean = image_base64.split(",", 1)
+        else:
+            image_base64_clean = image_base64
         
-        image_bytes = base64.b64decode(image_base64)
-        logger.info(f"📦 Imagem: {len(image_bytes)} bytes")
+        logger.info(f"📦 Processando imagem: {filename}")
         
-        # OPÇÃO 1: Usar Shopify CDN diretamente via API REST
-        # Este é um truque: fazer upload como asset de tema temporário
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # IMGBB - Serviço GRÁTIS de hospedagem
+            # API Key pública (você pode criar a sua própria grátis em imgbb.com)
+            imgbb_url = "https://api.imgbb.com/1/upload"
             
-            # Headers padrão
-            headers = {
-                'X-Shopify-Access-Token': access_token,
-                'Content-Type': 'application/json'
+            # Preparar dados
+            form_data = {
+                'key': '6d207e02198a847aa98d0a2a901485a5',  # API key pública
+                'image': image_base64_clean,
+                'name': filename.split('.')[0]
             }
             
-            # Tentar primeiro: Upload via Theme Assets (mais confiável)
-            try:
-                # Buscar o tema ativo
-                themes_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes.json"
-                themes_response = await client.get(themes_url, headers=headers)
-                
-                if themes_response.status_code == 200:
-                    themes = themes_response.json().get("themes", [])
-                    main_theme = next((t for t in themes if t.get("role") == "main"), None)
-                    
-                    if main_theme:
-                        theme_id = main_theme["id"]
-                        
-                        # Gerar nome único para o arquivo
-                        timestamp = int(datetime.now().timestamp())
-                        clean_filename = re.sub(r'[^a-zA-Z0-9\-_\.]', '', filename)
-                        asset_key = f"assets/upload_{timestamp}_{clean_filename}"
-                        
-                        # Upload como asset do tema
-                        asset_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes/{theme_id}/assets.json"
-                        
-                        asset_data = {
-                            "asset": {
-                                "key": asset_key,
-                                "attachment": base64.b64encode(image_bytes).decode('utf-8')
-                            }
-                        }
-                        
-                        asset_response = await client.put(asset_url, json=asset_data, headers=headers)
-                        
-                        if asset_response.status_code in [200, 201]:
-                            asset_result = asset_response.json().get("asset", {})
-                            
-                            # Construir URL pública do CDN
-                            public_url = asset_result.get("public_url")
-                            if not public_url:
-                                # Construir manualmente se não vier
-                                public_url = f"https://cdn.shopify.com/s/files/1/{clean_store}/assets/{asset_key}"
-                            
-                            logger.info(f"✅ Upload via Theme Assets bem-sucedido: {public_url}")
-                            
-                            return {
-                                "success": True,
-                                "url": public_url,
-                                "filename": clean_filename,
-                                "size": len(image_bytes),
-                                "method": "theme_assets",
-                                "message": "Upload permanente concluído"
-                            }
-            except Exception as e:
-                logger.warning(f"⚠️ Theme Assets falhou: {e}")
+            # Fazer upload
+            response = await client.post(imgbb_url, data=form_data)
             
-            # OPÇÃO 2: Se Theme Assets falhar, usar Files API via GraphQL
-            try:
-                graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/graphql.json"
+            if response.status_code == 200:
+                result = response.json()
                 
-                # Criar staged upload
-                mutation = """
-                mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-                    stagedUploadsCreate(input: $input) {
-                        stagedTargets {
-                            url
-                            resourceUrl
-                            parameters {
-                                name
-                                value
-                            }
-                        }
-                    }
-                }
-                """
-                
-                # Detectar MIME type
-                mime_type = "image/jpeg"
-                if filename.lower().endswith('.png'):
-                    mime_type = "image/png"
-                elif filename.lower().endswith('.gif'):
-                    mime_type = "image/gif"
-                elif filename.lower().endswith('.webp'):
-                    mime_type = "image/webp"
-                
-                variables = {
-                    "input": [{
-                        "resource": "IMAGE",
+                if result.get('success') and result.get('data'):
+                    image_data = result['data']
+                    
+                    # URL permanente do ImgBB
+                    permanent_url = image_data.get('url')
+                    
+                    logger.info(f"✅ Upload concluído: {permanent_url}")
+                    
+                    return {
+                        "success": True,
+                        "url": permanent_url,
+                        "display_url": image_data.get('display_url'),
+                        "delete_url": image_data.get('delete_url'),
                         "filename": filename,
-                        "mimeType": mime_type,
-                        "httpMethod": "POST"
-                    }]
+                        "size": image_data.get('size', 0),
+                        "width": image_data.get('width'),
+                        "height": image_data.get('height'),
+                        "permanent": True,
+                        "service": "ImgBB",
+                        "message": "Upload concluído com sucesso"
+                    }
+                else:
+                    logger.error(f"❌ ImgBB retornou erro: {result}")
+                    raise Exception("ImgBB rejeitou o upload")
+            else:
+                logger.error(f"❌ HTTP {response.status_code}: {response.text}")
+                raise Exception(f"Erro HTTP {response.status_code}")
+                
+    except Exception as e:
+        logger.error(f"❌ Erro no upload: {str(e)}")
+        
+        # FALLBACK: Tentar Imgur como alternativa
+        try:
+            logger.info("🔄 Tentando Imgur como fallback...")
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                imgur_url = "https://api.imgur.com/3/image"
+                
+                headers = {
+                    'Authorization': 'Client-ID 0b711b9fc2d5a0d'  # Client ID público
                 }
                 
-                staged_response = await client.post(
-                    graphql_url,
-                    json={"query": mutation, "variables": variables},
-                    headers=headers
-                )
+                form_data = {
+                    'image': image_base64_clean,
+                    'type': 'base64',
+                    'name': filename
+                }
                 
-                if staged_response.status_code == 200:
-                    result = staged_response.json()
-                    staged_target = result["data"]["stagedUploadsCreate"]["stagedTargets"][0]
+                response = await client.post(imgur_url, headers=headers, data=form_data)
+                
+                if response.status_code == 200:
+                    result = response.json()
                     
-                    # Fazer upload para URL temporário
-                    upload_url = staged_target["url"]
-                    params = {p["name"]: p["value"] for p in staged_target["parameters"]}
-                    
-                    # Upload via multipart
-                    files = {'file': (filename, image_bytes, mime_type)}
-                    upload_response = await client.post(upload_url, data=params, files=files)
-                    
-                    if upload_response.status_code in [200, 201, 204]:
-                        # Retornar resource URL
-                        resource_url = staged_target["resourceUrl"]
+                    if result.get('success') and result.get('data'):
+                        imgur_data = result['data']
+                        imgur_url = imgur_data.get('link')
                         
-                        # Converter para URL público
-                        public_url = resource_url.replace('/admin/', '/s/')
-                        
-                        logger.info(f"✅ Upload via GraphQL bem-sucedido: {public_url}")
+                        logger.info(f"✅ Upload via Imgur concluído: {imgur_url}")
                         
                         return {
                             "success": True,
-                            "url": public_url,
+                            "url": imgur_url,
+                            "delete_hash": imgur_data.get('deletehash'),
                             "filename": filename,
-                            "size": len(image_bytes),
-                            "method": "graphql_files",
-                            "message": "Upload permanente concluído"
+                            "size": imgur_data.get('size', 0),
+                            "width": imgur_data.get('width'),
+                            "height": imgur_data.get('height'),
+                            "permanent": True,
+                            "service": "Imgur",
+                            "message": "Upload concluído via Imgur"
                         }
-            except Exception as e:
-                logger.warning(f"⚠️ GraphQL Files falhou: {e}")
-            
-            # OPÇÃO 3: Fallback final - Hospedar temporariamente no Railway
-            logger.info("🔄 Usando hospedagem temporária no Railway como fallback")
-            
-            image_id = f"temp_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
-            
-            if not hasattr(app.state, 'temp_images'):
-                app.state.temp_images = {}
-            
-            # Armazenar por 24 horas
-            app.state.temp_images[image_id] = {
-                'data': image_bytes,
-                'mime_type': 'image/jpeg' if '.jpg' in filename.lower() else 'image/png',
-                'filename': filename,
-                'expires_at': (datetime.now() + timedelta(hours=24)).isoformat(),
-                'size': len(image_bytes)
-            }
-            
-            temp_url = f"https://shopify-production-8bcd.up.railway.app/api/images/temp/{image_id}"
-            
-            return {
-                "success": True,
-                "url": temp_url,
-                "temporary": True,
-                "expires_in": "24 horas",
-                "filename": filename,
-                "size": len(image_bytes),
-                "message": "Upload temporário (Shopify indisponível) - válido por 24h",
-                "warning": "Esta é uma URL temporária. A imagem será removida em 24 horas."
-            }
+                        
+        except Exception as imgur_error:
+            logger.error(f"❌ Imgur também falhou: {imgur_error}")
         
-    except Exception as e:
-        logger.error(f"❌ Erro no upload: {str(e)}")
         return {
             "success": False,
-            "message": f"Erro no upload: {str(e)}"
+            "message": f"Todos os serviços falharam: {str(e)}"
         }
 
 # ==================== ENDPOINTS DE NOTIFICAÇÕES (NOVOS) ====================
