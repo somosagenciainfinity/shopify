@@ -4702,10 +4702,8 @@ async def startup_event():
     """Iniciar tarefas de background"""
     asyncio.create_task(check_and_execute_scheduled_tasks())
     asyncio.create_task(cleanup_old_tasks())
-    asyncio.create_task(cleanup_temp_images())  # ADICIONAR ESTA LINHA
     logger.info("⏰ Verificador de tarefas agendadas iniciado")
     logger.info("🧹 Sistema de limpeza automática de memória iniciado")
-    logger.info("🖼️ Sistema de limpeza de imagens temporárias iniciado")  # ADICIONAR ESTA LINHA
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
