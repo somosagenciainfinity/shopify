@@ -2076,166 +2076,140 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
 
 # ==================== UPLOAD DE IMAGEM NA DESCRIÇÃO DE PRODUTOS ====================
 
-@app.post("/api/images/upload-to-shopify")
-async def upload_image_to_shopify(data: Dict[str, Any]):
+@app.post("/api/images/upload-to-theme")
+async def upload_image_to_theme(data: Dict[str, Any]):
     """
-    Upload INTELIGENTE - Detecta duplicatas via HASH
-    Se a mesma imagem for enviada 3000 vezes, armazena APENAS 1 VEZ!
+    Upload de imagem para os Assets do tema do Shopify
+    As imagens ficam permanentes no CDN do Shopify!
     """
     
     try:
-        logger.info("📸 Recebendo upload de imagem")
+        logger.info("📸 Upload para Theme Assets do Shopify")
         
         # Extrair dados
         image_base64 = data.get("image")
         filename = data.get("filename", "image.jpg")
+        store_name = data.get("storeName", "")
+        access_token = data.get("accessToken", "")
         
-        if not image_base64:
-            return {"success": False, "message": "Nenhuma imagem fornecida"}
+        if not all([image_base64, store_name, access_token]):
+            return {"success": False, "message": "Dados incompletos"}
+        
+        # Limpar store name
+        clean_store = store_name.replace('.myshopify.com', '').strip()
         
         # Processar base64
         if "," in image_base64:
-            header, image_base64 = image_base64.split(",", 1)
-            mime_type = "image/jpeg"
-            if "image/png" in header:
-                mime_type = "image/png"
-            elif "image/gif" in header:
-                mime_type = "image/gif"
+            _, image_base64_clean = image_base64.split(",", 1)
         else:
-            mime_type = "image/jpeg"
+            image_base64_clean = image_base64
         
-        # Decodificar
-        image_bytes = base64.b64decode(image_base64)
+        logger.info(f"📦 Processando imagem: {filename}")
         
-        # 🔑 GERAR HASH ÚNICO DA IMAGEM
-        import hashlib
-        image_hash = hashlib.sha256(image_bytes).hexdigest()
-        
-        logger.info(f"🔑 Hash da imagem: {image_hash}")
-        logger.info(f"📦 Tamanho: {len(image_bytes)} bytes")
-        
-        # VERIFICAR SE JÁ EXISTE
-        if not hasattr(app.state, 'image_storage'):
-            app.state.image_storage = {}
-        
-        if not hasattr(app.state, 'image_hashes'):
-            app.state.image_hashes = {}  # Mapeia hash -> image_id
-        
-        # 🎯 VERIFICAR SE IMAGEM JÁ FOI UPADA
-        if image_hash in app.state.image_hashes:
-            # IMAGEM JÁ EXISTE! RETORNAR URL EXISTENTE
-            existing_image_id = app.state.image_hashes[image_hash]
-            existing_url = f"https://shopify-production-8bcd.up.railway.app/api/images/permanent/{existing_image_id}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            headers = {
+                'X-Shopify-Access-Token': access_token,
+                'Content-Type': 'application/json'
+            }
             
-            logger.info(f"♻️ IMAGEM JÁ EXISTE! Reutilizando: {existing_image_id}")
-            logger.info(f"💰 Economia de espaço: {len(image_bytes)} bytes não duplicados")
+            # PASSO 1: Buscar o tema ativo
+            themes_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes.json"
+            themes_response = await client.get(themes_url, headers=headers)
             
-            # Atualizar contador de uso
-            if existing_image_id in app.state.image_storage:
-                app.state.image_storage[existing_image_id]['usage_count'] = \
-                    app.state.image_storage[existing_image_id].get('usage_count', 1) + 1
+            if themes_response.status_code != 200:
+                return {"success": False, "message": "Erro ao buscar temas"}
+            
+            themes = themes_response.json().get("themes", [])
+            
+            # Encontrar o tema principal (ativo)
+            main_theme = next((t for t in themes if t.get("role") == "main"), None)
+            
+            if not main_theme:
+                # Se não encontrar tema principal, usar o primeiro tema
+                main_theme = themes[0] if themes else None
+            
+            if not main_theme:
+                return {"success": False, "message": "Nenhum tema encontrado"}
+            
+            theme_id = main_theme["id"]
+            logger.info(f"📱 Usando tema: {main_theme.get('name')} (ID: {theme_id})")
+            
+            # PASSO 2: Gerar nome único para o arquivo
+            import hashlib
+            timestamp = int(datetime.now().timestamp())
+            
+            # Limpar nome do arquivo
+            clean_filename = re.sub(r'[^a-zA-Z0-9\-_]', '', filename.split('.')[0])
+            extension = '.jpg'
+            if 'png' in filename.lower():
+                extension = '.png'
+            elif 'gif' in filename.lower():
+                extension = '.gif'
+            elif 'webp' in filename.lower():
+                extension = '.webp'
+            
+            # Nome único no formato: upload_timestamp_nome.ext
+            unique_filename = f"upload_{timestamp}_{clean_filename}{extension}"
+            asset_key = f"assets/{unique_filename}"
+            
+            logger.info(f"📝 Nome do asset: {asset_key}")
+            
+            # PASSO 3: Upload para Theme Assets
+            asset_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes/{theme_id}/assets.json"
+            
+            asset_data = {
+                "asset": {
+                    "key": asset_key,
+                    "attachment": image_base64_clean
+                }
+            }
+            
+            # Fazer upload
+            upload_response = await client.put(asset_url, json=asset_data, headers=headers)
+            
+            if upload_response.status_code not in [200, 201]:
+                error_text = upload_response.text
+                logger.error(f"❌ Erro no upload: {error_text}")
+                return {"success": False, "message": f"Erro no upload: {upload_response.status_code}"}
+            
+            # PASSO 4: Obter a URL pública
+            asset_result = upload_response.json().get("asset", {})
+            
+            # Construir URL do CDN
+            # Formato: https://cdn.shopify.com/s/files/1/[shop_id]/[theme_id]/assets/[filename]
+            public_url = asset_result.get("public_url")
+            
+            if not public_url:
+                # Construir manualmente se não vier
+                # Buscar informações da loja para pegar o ID
+                shop_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/shop.json"
+                shop_response = await client.get(shop_url, headers=headers)
                 
-                logger.info(f"📊 Esta imagem já é usada {app.state.image_storage[existing_image_id]['usage_count']} vezes")
+                if shop_response.status_code == 200:
+                    shop_data = shop_response.json().get("shop", {})
+                    shop_id = shop_data.get("id", "")
+                    
+                    # URL padrão do CDN
+                    public_url = f"https://cdn.shopify.com/s/files/1/{shop_id}/files/{unique_filename}"
+                else:
+                    # URL alternativa
+                    public_url = f"https://{clean_store}/cdn/shop/files/{unique_filename}"
+            
+            logger.info(f"✅ Upload concluído! URL: {public_url}")
             
             return {
                 "success": True,
-                "url": existing_url,
-                "image_id": existing_image_id,
-                "filename": filename,
-                "size": len(image_bytes),
-                "mime_type": mime_type,
-                "reused": True,  # INDICA QUE FOI REUTILIZADA
-                "message": "Imagem já existente reutilizada (economia de espaço!)",
-                "usage_count": app.state.image_storage[existing_image_id].get('usage_count', 1)
+                "url": public_url,
+                "cdn_url": public_url,
+                "asset_key": asset_key,
+                "theme_id": theme_id,
+                "filename": unique_filename,
+                "message": "Imagem enviada para Theme Assets com sucesso!"
             }
-        
-        # NOVA IMAGEM - ARMAZENAR
-        timestamp = int(datetime.now().timestamp())
-        image_id = f"{timestamp}_{image_hash[:12]}"  # ID baseado em tempo + hash
-        
-        # Limpar nome do arquivo
-        clean_filename = re.sub(r'[^a-zA-Z0-9\-_\.]', '', filename)
-        
-        # Armazenar imagem
-        app.state.image_storage[image_id] = {
-            'data': image_bytes,
-            'mime_type': mime_type,
-            'filename': clean_filename,
-            'uploaded_at': datetime.now().isoformat(),
-            'size': len(image_bytes),
-            'hash': image_hash,
-            'usage_count': 1,
-            'permanent': True
-        }
-        
-        # Mapear hash -> id para futuras buscas
-        app.state.image_hashes[image_hash] = image_id
-        
-        # URL pública
-        public_url = f"https://shopify-production-8bcd.up.railway.app/api/images/permanent/{image_id}"
-        
-        logger.info(f"✅ NOVA imagem armazenada: {image_id}")
-        logger.info(f"🔗 URL: {public_url}")
-        
-        # Estatísticas do sistema
-        total_images = len(app.state.image_storage)
-        total_unique = len(app.state.image_hashes)
-        total_size = sum(img['size'] for img in app.state.image_storage.values())
-        
-        logger.info(f"📊 Sistema: {total_unique} imagens únicas, {total_size/1024/1024:.2f}MB total")
-        
-        return {
-            "success": True,
-            "url": public_url,
-            "image_id": image_id,
-            "filename": clean_filename,
-            "size": len(image_bytes),
-            "mime_type": mime_type,
-            "reused": False,  # NOVA IMAGEM
-            "message": "Nova imagem armazenada com sucesso",
-            "system_stats": {
-                "total_unique_images": total_unique,
-                "total_storage_mb": round(total_size/1024/1024, 2)
-            }
-        }
-        
+            
     except Exception as e:
         logger.error(f"❌ Erro: {str(e)}")
-        return {"success": False, "message": f"Erro: {str(e)}"}
-
-@app.get("/api/images/stats")
-async def get_image_stats():
-    """Estatísticas do sistema de imagens"""
-    
-    if not hasattr(app.state, 'image_storage'):
-        return {"total_images": 0, "total_size": 0}
-    
-    total_images = len(app.state.image_storage)
-    total_unique = len(app.state.image_hashes) if hasattr(app.state, 'image_hashes') else 0
-    total_size = sum(img['size'] for img in app.state.image_storage.values())
-    
-    # Top 10 imagens mais usadas
-    most_used = sorted(
-        app.state.image_storage.items(),
-        key=lambda x: x[1].get('usage_count', 1),
-        reverse=True
-    )[:10]
-    
-    return {
-        "total_unique_images": total_unique,
-        "total_storage_mb": round(total_size/1024/1024, 2),
-        "average_reuse": round(sum(img.get('usage_count', 1) for img in app.state.image_storage.values()) / max(total_images, 1), 2),
-        "most_used_images": [
-            {
-                "id": img_id,
-                "filename": data.get('filename'),
-                "usage_count": data.get('usage_count', 1),
-                "size_kb": round(data.get('size', 0)/1024, 2)
-            }
-            for img_id, data in most_used
-        ],
-        "space_saved_mb": "Calculado com base em duplicatas evitadas"
-    }
+        return {"success": False, "message": str(e)}
 
 # ==================== ENDPOINTS DE NOTIFICAÇÕES (NOVOS) ====================
 
