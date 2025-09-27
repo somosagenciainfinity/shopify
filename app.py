@@ -2079,12 +2079,12 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
 @app.post("/api/images/upload-to-theme")
 async def upload_image_to_theme(data: Dict[str, Any]):
     """
-    Upload de imagem para os Assets do tema do Shopify
-    As imagens ficam permanentes no CDN do Shopify!
+    Upload INTELIGENTE para Theme Assets com DEDUPLICAÇÃO
+    Se a mesma imagem for enviada múltiplas vezes, REUTILIZA a URL!
     """
     
     try:
-        logger.info("📸 Upload para Theme Assets do Shopify")
+        logger.info("📸 Upload para Theme Assets (com deduplicação)")
         
         # Extrair dados
         image_base64 = data.get("image")
@@ -2095,7 +2095,6 @@ async def upload_image_to_theme(data: Dict[str, Any]):
         if not all([image_base64, store_name, access_token]):
             return {"success": False, "message": "Dados incompletos"}
         
-        # Limpar store name
         clean_store = store_name.replace('.myshopify.com', '').strip()
         
         # Processar base64
@@ -2104,7 +2103,45 @@ async def upload_image_to_theme(data: Dict[str, Any]):
         else:
             image_base64_clean = image_base64
         
-        logger.info(f"📦 Processando imagem: {filename}")
+        # 🔑 GERAR HASH ÚNICO DA IMAGEM
+        import hashlib
+        image_bytes = base64.b64decode(image_base64_clean)
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        
+        logger.info(f"🔑 Hash da imagem: {image_hash[:16]}...")
+        
+        # VERIFICAR CACHE DE URLS
+        if not hasattr(app.state, 'theme_assets_cache'):
+            app.state.theme_assets_cache = {}
+        
+        # Chave do cache: store + hash
+        cache_key = f"{clean_store}:{image_hash}"
+        
+        # 🎯 VERIFICAR SE JÁ EXISTE NO CACHE
+        if cache_key in app.state.theme_assets_cache:
+            cached_data = app.state.theme_assets_cache[cache_key]
+            
+            logger.info(f"♻️ IMAGEM JÁ EXISTE! Reutilizando URL existente")
+            logger.info(f"💰 Economia: Upload evitado, usando cache")
+            logger.info(f"📊 Esta imagem já foi usada {cached_data.get('usage_count', 1)} vezes")
+            
+            # Incrementar contador de uso
+            cached_data['usage_count'] = cached_data.get('usage_count', 1) + 1
+            cached_data['last_used'] = datetime.now().isoformat()
+            
+            return {
+                "success": True,
+                "url": cached_data['url'],
+                "cdn_url": cached_data['url'],
+                "asset_key": cached_data['asset_key'],
+                "filename": cached_data['filename'],
+                "reused": True,
+                "usage_count": cached_data['usage_count'],
+                "message": f"Imagem reutilizada! (já usada {cached_data['usage_count']}x)"
+            }
+        
+        # NOVA IMAGEM - Fazer upload normal
+        logger.info("🆕 Nova imagem, fazendo upload...")
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             headers = {
@@ -2112,7 +2149,7 @@ async def upload_image_to_theme(data: Dict[str, Any]):
                 'Content-Type': 'application/json'
             }
             
-            # PASSO 1: Buscar o tema ativo
+            # Buscar tema ativo
             themes_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes.json"
             themes_response = await client.get(themes_url, headers=headers)
             
@@ -2120,41 +2157,57 @@ async def upload_image_to_theme(data: Dict[str, Any]):
                 return {"success": False, "message": "Erro ao buscar temas"}
             
             themes = themes_response.json().get("themes", [])
-            
-            # Encontrar o tema principal (ativo)
-            main_theme = next((t for t in themes if t.get("role") == "main"), None)
-            
-            if not main_theme:
-                # Se não encontrar tema principal, usar o primeiro tema
-                main_theme = themes[0] if themes else None
+            main_theme = next((t for t in themes if t.get("role") == "main"), themes[0] if themes else None)
             
             if not main_theme:
                 return {"success": False, "message": "Nenhum tema encontrado"}
             
             theme_id = main_theme["id"]
-            logger.info(f"📱 Usando tema: {main_theme.get('name')} (ID: {theme_id})")
             
-            # PASSO 2: Gerar nome único para o arquivo
-            import hashlib
-            timestamp = int(datetime.now().timestamp())
-            
-            # Limpar nome do arquivo
-            clean_filename = re.sub(r'[^a-zA-Z0-9\-_]', '', filename.split('.')[0])
+            # Gerar nome baseado no HASH (para garantir unicidade)
             extension = '.jpg'
             if 'png' in filename.lower():
                 extension = '.png'
             elif 'gif' in filename.lower():
                 extension = '.gif'
-            elif 'webp' in filename.lower():
-                extension = '.webp'
             
-            # Nome único no formato: upload_timestamp_nome.ext
-            unique_filename = f"upload_{timestamp}_{clean_filename}{extension}"
+            # Nome único baseado no hash (primeiros 12 caracteres)
+            unique_filename = f"img_{image_hash[:12]}{extension}"
             asset_key = f"assets/{unique_filename}"
             
-            logger.info(f"📝 Nome do asset: {asset_key}")
+            logger.info(f"📝 Nome único do asset: {asset_key}")
             
-            # PASSO 3: Upload para Theme Assets
+            # Verificar se já existe no tema (double-check)
+            check_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes/{theme_id}/assets.json?asset[key]={asset_key}"
+            check_response = await client.get(check_url, headers=headers)
+            
+            if check_response.status_code == 200:
+                # Asset já existe no tema!
+                existing_asset = check_response.json().get("asset", {})
+                public_url = existing_asset.get("public_url", f"https://{clean_store}/cdn/shop/files/{unique_filename}")
+                
+                logger.info(f"♻️ Asset já existe no tema! Reutilizando")
+                
+                # Salvar no cache
+                app.state.theme_assets_cache[cache_key] = {
+                    'url': public_url,
+                    'asset_key': asset_key,
+                    'filename': unique_filename,
+                    'usage_count': 1,
+                    'created_at': datetime.now().isoformat()
+                }
+                
+                return {
+                    "success": True,
+                    "url": public_url,
+                    "cdn_url": public_url,
+                    "asset_key": asset_key,
+                    "filename": unique_filename,
+                    "reused": True,
+                    "message": "Asset já existia no tema, reutilizado!"
+                }
+            
+            # Upload novo asset
             asset_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes/{theme_id}/assets.json"
             
             asset_data = {
@@ -2164,38 +2217,30 @@ async def upload_image_to_theme(data: Dict[str, Any]):
                 }
             }
             
-            # Fazer upload
             upload_response = await client.put(asset_url, json=asset_data, headers=headers)
             
             if upload_response.status_code not in [200, 201]:
-                error_text = upload_response.text
-                logger.error(f"❌ Erro no upload: {error_text}")
                 return {"success": False, "message": f"Erro no upload: {upload_response.status_code}"}
             
-            # PASSO 4: Obter a URL pública
             asset_result = upload_response.json().get("asset", {})
+            public_url = asset_result.get("public_url", f"https://{clean_store}/cdn/shop/files/{unique_filename}")
             
-            # Construir URL do CDN
-            # Formato: https://cdn.shopify.com/s/files/1/[shop_id]/[theme_id]/assets/[filename]
-            public_url = asset_result.get("public_url")
+            # SALVAR NO CACHE
+            app.state.theme_assets_cache[cache_key] = {
+                'url': public_url,
+                'asset_key': asset_key,
+                'filename': unique_filename,
+                'usage_count': 1,
+                'created_at': datetime.now().isoformat()
+            }
             
-            if not public_url:
-                # Construir manualmente se não vier
-                # Buscar informações da loja para pegar o ID
-                shop_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/shop.json"
-                shop_response = await client.get(shop_url, headers=headers)
-                
-                if shop_response.status_code == 200:
-                    shop_data = shop_response.json().get("shop", {})
-                    shop_id = shop_data.get("id", "")
-                    
-                    # URL padrão do CDN
-                    public_url = f"https://cdn.shopify.com/s/files/1/{shop_id}/files/{unique_filename}"
-                else:
-                    # URL alternativa
-                    public_url = f"https://{clean_store}/cdn/shop/files/{unique_filename}"
+            logger.info(f"✅ Novo asset criado e cacheado: {public_url}")
             
-            logger.info(f"✅ Upload concluído! URL: {public_url}")
+            # Estatísticas do cache
+            total_cached = len(app.state.theme_assets_cache)
+            total_uses = sum(item.get('usage_count', 1) for item in app.state.theme_assets_cache.values())
+            
+            logger.info(f"📊 Cache: {total_cached} imagens únicas, {total_uses} usos totais")
             
             return {
                 "success": True,
@@ -2204,7 +2249,12 @@ async def upload_image_to_theme(data: Dict[str, Any]):
                 "asset_key": asset_key,
                 "theme_id": theme_id,
                 "filename": unique_filename,
-                "message": "Imagem enviada para Theme Assets com sucesso!"
+                "reused": False,
+                "message": "Nova imagem enviada para Theme Assets!",
+                "cache_stats": {
+                    "total_unique": total_cached,
+                    "total_uses": total_uses
+                }
             }
             
     except Exception as e:
