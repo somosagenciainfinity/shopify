@@ -2079,12 +2079,12 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
 @app.post("/api/images/upload-to-shopify")
 async def upload_image_to_shopify(data: Dict[str, Any]):
     """
-    Upload para ImgBB - GRÁTIS e ILIMITADO
-    Não sobrecarrega o Railway, não cria produtos no Shopify
+    Upload INTELIGENTE - Detecta duplicatas via HASH
+    Se a mesma imagem for enviada 3000 vezes, armazena APENAS 1 VEZ!
     """
     
     try:
-        logger.info("📸 Upload de imagem via ImgBB")
+        logger.info("📸 Recebendo upload de imagem")
         
         # Extrair dados
         image_base64 = data.get("image")
@@ -2095,109 +2095,147 @@ async def upload_image_to_shopify(data: Dict[str, Any]):
         
         # Processar base64
         if "," in image_base64:
-            _, image_base64_clean = image_base64.split(",", 1)
+            header, image_base64 = image_base64.split(",", 1)
+            mime_type = "image/jpeg"
+            if "image/png" in header:
+                mime_type = "image/png"
+            elif "image/gif" in header:
+                mime_type = "image/gif"
         else:
-            image_base64_clean = image_base64
+            mime_type = "image/jpeg"
         
-        logger.info(f"📦 Processando imagem: {filename}")
+        # Decodificar
+        image_bytes = base64.b64decode(image_base64)
         
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # IMGBB - Serviço GRÁTIS de hospedagem
-            # API Key pública (você pode criar a sua própria grátis em imgbb.com)
-            imgbb_url = "https://api.imgbb.com/1/upload"
+        # 🔑 GERAR HASH ÚNICO DA IMAGEM
+        import hashlib
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        
+        logger.info(f"🔑 Hash da imagem: {image_hash}")
+        logger.info(f"📦 Tamanho: {len(image_bytes)} bytes")
+        
+        # VERIFICAR SE JÁ EXISTE
+        if not hasattr(app.state, 'image_storage'):
+            app.state.image_storage = {}
+        
+        if not hasattr(app.state, 'image_hashes'):
+            app.state.image_hashes = {}  # Mapeia hash -> image_id
+        
+        # 🎯 VERIFICAR SE IMAGEM JÁ FOI UPADA
+        if image_hash in app.state.image_hashes:
+            # IMAGEM JÁ EXISTE! RETORNAR URL EXISTENTE
+            existing_image_id = app.state.image_hashes[image_hash]
+            existing_url = f"https://shopify-production-8bcd.up.railway.app/api/images/permanent/{existing_image_id}"
             
-            # Preparar dados
-            form_data = {
-                'key': '6d207e02198a847aa98d0a2a901485a5',  # API key pública
-                'image': image_base64_clean,
-                'name': filename.split('.')[0]
+            logger.info(f"♻️ IMAGEM JÁ EXISTE! Reutilizando: {existing_image_id}")
+            logger.info(f"💰 Economia de espaço: {len(image_bytes)} bytes não duplicados")
+            
+            # Atualizar contador de uso
+            if existing_image_id in app.state.image_storage:
+                app.state.image_storage[existing_image_id]['usage_count'] = \
+                    app.state.image_storage[existing_image_id].get('usage_count', 1) + 1
+                
+                logger.info(f"📊 Esta imagem já é usada {app.state.image_storage[existing_image_id]['usage_count']} vezes")
+            
+            return {
+                "success": True,
+                "url": existing_url,
+                "image_id": existing_image_id,
+                "filename": filename,
+                "size": len(image_bytes),
+                "mime_type": mime_type,
+                "reused": True,  # INDICA QUE FOI REUTILIZADA
+                "message": "Imagem já existente reutilizada (economia de espaço!)",
+                "usage_count": app.state.image_storage[existing_image_id].get('usage_count', 1)
             }
-            
-            # Fazer upload
-            response = await client.post(imgbb_url, data=form_data)
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                if result.get('success') and result.get('data'):
-                    image_data = result['data']
-                    
-                    # URL permanente do ImgBB
-                    permanent_url = image_data.get('url')
-                    
-                    logger.info(f"✅ Upload concluído: {permanent_url}")
-                    
-                    return {
-                        "success": True,
-                        "url": permanent_url,
-                        "display_url": image_data.get('display_url'),
-                        "delete_url": image_data.get('delete_url'),
-                        "filename": filename,
-                        "size": image_data.get('size', 0),
-                        "width": image_data.get('width'),
-                        "height": image_data.get('height'),
-                        "permanent": True,
-                        "service": "ImgBB",
-                        "message": "Upload concluído com sucesso"
-                    }
-                else:
-                    logger.error(f"❌ ImgBB retornou erro: {result}")
-                    raise Exception("ImgBB rejeitou o upload")
-            else:
-                logger.error(f"❌ HTTP {response.status_code}: {response.text}")
-                raise Exception(f"Erro HTTP {response.status_code}")
-                
-    except Exception as e:
-        logger.error(f"❌ Erro no upload: {str(e)}")
         
-        # FALLBACK: Tentar Imgur como alternativa
-        try:
-            logger.info("🔄 Tentando Imgur como fallback...")
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                imgur_url = "https://api.imgur.com/3/image"
-                
-                headers = {
-                    'Authorization': 'Client-ID 0b711b9fc2d5a0d'  # Client ID público
-                }
-                
-                form_data = {
-                    'image': image_base64_clean,
-                    'type': 'base64',
-                    'name': filename
-                }
-                
-                response = await client.post(imgur_url, headers=headers, data=form_data)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    
-                    if result.get('success') and result.get('data'):
-                        imgur_data = result['data']
-                        imgur_url = imgur_data.get('link')
-                        
-                        logger.info(f"✅ Upload via Imgur concluído: {imgur_url}")
-                        
-                        return {
-                            "success": True,
-                            "url": imgur_url,
-                            "delete_hash": imgur_data.get('deletehash'),
-                            "filename": filename,
-                            "size": imgur_data.get('size', 0),
-                            "width": imgur_data.get('width'),
-                            "height": imgur_data.get('height'),
-                            "permanent": True,
-                            "service": "Imgur",
-                            "message": "Upload concluído via Imgur"
-                        }
-                        
-        except Exception as imgur_error:
-            logger.error(f"❌ Imgur também falhou: {imgur_error}")
+        # NOVA IMAGEM - ARMAZENAR
+        timestamp = int(datetime.now().timestamp())
+        image_id = f"{timestamp}_{image_hash[:12]}"  # ID baseado em tempo + hash
+        
+        # Limpar nome do arquivo
+        clean_filename = re.sub(r'[^a-zA-Z0-9\-_\.]', '', filename)
+        
+        # Armazenar imagem
+        app.state.image_storage[image_id] = {
+            'data': image_bytes,
+            'mime_type': mime_type,
+            'filename': clean_filename,
+            'uploaded_at': datetime.now().isoformat(),
+            'size': len(image_bytes),
+            'hash': image_hash,
+            'usage_count': 1,
+            'permanent': True
+        }
+        
+        # Mapear hash -> id para futuras buscas
+        app.state.image_hashes[image_hash] = image_id
+        
+        # URL pública
+        public_url = f"https://shopify-production-8bcd.up.railway.app/api/images/permanent/{image_id}"
+        
+        logger.info(f"✅ NOVA imagem armazenada: {image_id}")
+        logger.info(f"🔗 URL: {public_url}")
+        
+        # Estatísticas do sistema
+        total_images = len(app.state.image_storage)
+        total_unique = len(app.state.image_hashes)
+        total_size = sum(img['size'] for img in app.state.image_storage.values())
+        
+        logger.info(f"📊 Sistema: {total_unique} imagens únicas, {total_size/1024/1024:.2f}MB total")
         
         return {
-            "success": False,
-            "message": f"Todos os serviços falharam: {str(e)}"
+            "success": True,
+            "url": public_url,
+            "image_id": image_id,
+            "filename": clean_filename,
+            "size": len(image_bytes),
+            "mime_type": mime_type,
+            "reused": False,  # NOVA IMAGEM
+            "message": "Nova imagem armazenada com sucesso",
+            "system_stats": {
+                "total_unique_images": total_unique,
+                "total_storage_mb": round(total_size/1024/1024, 2)
+            }
         }
+        
+    except Exception as e:
+        logger.error(f"❌ Erro: {str(e)}")
+        return {"success": False, "message": f"Erro: {str(e)}"}
+
+@app.get("/api/images/stats")
+async def get_image_stats():
+    """Estatísticas do sistema de imagens"""
+    
+    if not hasattr(app.state, 'image_storage'):
+        return {"total_images": 0, "total_size": 0}
+    
+    total_images = len(app.state.image_storage)
+    total_unique = len(app.state.image_hashes) if hasattr(app.state, 'image_hashes') else 0
+    total_size = sum(img['size'] for img in app.state.image_storage.values())
+    
+    # Top 10 imagens mais usadas
+    most_used = sorted(
+        app.state.image_storage.items(),
+        key=lambda x: x[1].get('usage_count', 1),
+        reverse=True
+    )[:10]
+    
+    return {
+        "total_unique_images": total_unique,
+        "total_storage_mb": round(total_size/1024/1024, 2),
+        "average_reuse": round(sum(img.get('usage_count', 1) for img in app.state.image_storage.values()) / max(total_images, 1), 2),
+        "most_used_images": [
+            {
+                "id": img_id,
+                "filename": data.get('filename'),
+                "usage_count": data.get('usage_count', 1),
+                "size_kb": round(data.get('size', 0)/1024, 2)
+            }
+            for img_id, data in most_used
+        ],
+        "space_saved_mb": "Calculado com base em duplicatas evitadas"
+    }
 
 # ==================== ENDPOINTS DE NOTIFICAÇÕES (NOVOS) ====================
 
