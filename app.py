@@ -2074,13 +2074,13 @@ async def schedule_image_optimization(data: Dict[str, Any], background_tasks: Ba
             }
         }
 
-# ==================== UPLOAD DIRETO PARA SHOPIFY FILES ====================
+# ==================== UPLOAD DE IMAGEM NA DESCRIÇÃO DE PRODUTOS ====================
 
 @app.post("/api/images/upload-to-shopify")
 async def upload_image_to_shopify(data: Dict[str, Any]):
     """
     Upload de imagem DIRETAMENTE para o Shopify Files API
-    A imagem fica armazenada permanentemente no Shopify, não no Railway
+    SEM CRIAR PRODUTOS RASCUNHO!
     """
     
     try:
@@ -2093,7 +2093,7 @@ async def upload_image_to_shopify(data: Dict[str, Any]):
         access_token = data.get("accessToken", "")
         
         if not image_base64 or not store_name or not access_token:
-            raise HTTPException(status_code=400, detail="Dados incompletos")
+            return {"success": False, "message": "Dados incompletos"}
         
         # Limpar nome da loja
         clean_store = store_name.replace('.myshopify.com', '').strip()
@@ -2105,301 +2105,180 @@ async def upload_image_to_shopify(data: Dict[str, Any]):
         image_bytes = base64.b64decode(image_base64)
         logger.info(f"📦 Imagem: {len(image_bytes)} bytes")
         
-        # Detectar formato
-        from PIL import Image
-        import io
-        
-        img_buffer = io.BytesIO(image_bytes)
-        pil_image = Image.open(img_buffer)
-        
-        # Determinar formato e mime type
-        format_map = {
-            'JPEG': ('image/jpeg', '.jpg'),
-            'PNG': ('image/png', '.png'),
-            'WEBP': ('image/webp', '.webp'),
-            'GIF': ('image/gif', '.gif')
-        }
-        
-        original_format = pil_image.format or 'PNG'
-        mime_type, extension = format_map.get(original_format, ('image/png', '.png'))
-        
-        logger.info(f"🎨 Formato: {original_format} ({pil_image.width}x{pil_image.height})")
-        
-        # Limpar nome do arquivo
-        clean_filename = re.sub(r'[^a-zA-Z0-9\-_]', '', filename.split('.')[0])
-        final_filename = f"{clean_filename}{extension}"
-        
-        pil_image.close()
-        img_buffer.close()
-        
-        # PASSO 1: Criar staged upload no Shopify
+        # OPÇÃO 1: Usar Shopify CDN diretamente via API REST
+        # Este é um truque: fazer upload como asset de tema temporário
         async with httpx.AsyncClient(timeout=60.0) as client:
             
-            # GraphQL para criar staged upload
-            graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/graphql.json"
-            
-            mutation = """
-            mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-                stagedUploadsCreate(input: $input) {
-                    stagedTargets {
-                        url
-                        resourceUrl
-                        parameters {
-                            name
-                            value
-                        }
-                    }
-                    userErrors {
-                        field
-                        message
-                    }
-                }
-            }
-            """
-            
-            variables = {
-                "input": [{
-                    "resource": "FILE",
-                    "filename": final_filename,
-                    "mimeType": mime_type,
-                    "fileSize": str(len(image_bytes))
-                }]
-            }
-            
+            # Headers padrão
             headers = {
                 'X-Shopify-Access-Token': access_token,
                 'Content-Type': 'application/json'
             }
             
-            # Criar staged upload
-            response = await client.post(
-                graphql_url,
-                json={"query": mutation, "variables": variables},
-                headers=headers
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"Erro ao criar staged upload: {response.text}")
-            
-            result = response.json()
-            
-            if result.get("errors"):
-                raise Exception(f"Erro GraphQL: {result['errors']}")
-            
-            staged_target = result["data"]["stagedUploadsCreate"]["stagedTargets"][0]
-            upload_url = staged_target["url"]
-            resource_url = staged_target["resourceUrl"]
-            parameters = {p["name"]: p["value"] for p in staged_target["parameters"]}
-            
-            logger.info(f"📤 Staged upload criado: {resource_url}")
-            
-            # PASSO 2: Upload do arquivo para o URL temporário
-            form_data = {}
-            for key, value in parameters.items():
-                form_data[key] = value
-            
-            # IMPORTANTE: O arquivo deve ser o último campo
-            files = {
-                'file': (final_filename, image_bytes, mime_type)
-            }
-            
-            upload_response = await client.post(
-                upload_url,
-                data=form_data,
-                files=files
-            )
-            
-            if upload_response.status_code not in [200, 201, 204]:
-                raise Exception(f"Erro no upload: {upload_response.status_code}")
-            
-            logger.info(f"✅ Arquivo enviado para Shopify")
-            
-            # PASSO 3: Criar o File no Shopify
-            create_mutation = """
-            mutation fileCreate($files: [FileCreateInput!]!) {
-                fileCreate(files: $files) {
-                    files {
-                        id
-                        alt
-                        createdAt
-                        fileStatus
-                        preview {
-                            image {
-                                url
-                                width
-                                height
+            # Tentar primeiro: Upload via Theme Assets (mais confiável)
+            try:
+                # Buscar o tema ativo
+                themes_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes.json"
+                themes_response = await client.get(themes_url, headers=headers)
+                
+                if themes_response.status_code == 200:
+                    themes = themes_response.json().get("themes", [])
+                    main_theme = next((t for t in themes if t.get("role") == "main"), None)
+                    
+                    if main_theme:
+                        theme_id = main_theme["id"]
+                        
+                        # Gerar nome único para o arquivo
+                        timestamp = int(datetime.now().timestamp())
+                        clean_filename = re.sub(r'[^a-zA-Z0-9\-_\.]', '', filename)
+                        asset_key = f"assets/upload_{timestamp}_{clean_filename}"
+                        
+                        # Upload como asset do tema
+                        asset_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/themes/{theme_id}/assets.json"
+                        
+                        asset_data = {
+                            "asset": {
+                                "key": asset_key,
+                                "attachment": base64.b64encode(image_bytes).decode('utf-8')
                             }
                         }
-                        ... on MediaImage {
-                            id
-                            image {
-                                url
-                                width
-                                height
+                        
+                        asset_response = await client.put(asset_url, json=asset_data, headers=headers)
+                        
+                        if asset_response.status_code in [200, 201]:
+                            asset_result = asset_response.json().get("asset", {})
+                            
+                            # Construir URL pública do CDN
+                            public_url = asset_result.get("public_url")
+                            if not public_url:
+                                # Construir manualmente se não vier
+                                public_url = f"https://cdn.shopify.com/s/files/1/{clean_store}/assets/{asset_key}"
+                            
+                            logger.info(f"✅ Upload via Theme Assets bem-sucedido: {public_url}")
+                            
+                            return {
+                                "success": True,
+                                "url": public_url,
+                                "filename": clean_filename,
+                                "size": len(image_bytes),
+                                "method": "theme_assets",
+                                "message": "Upload permanente concluído"
+                            }
+            except Exception as e:
+                logger.warning(f"⚠️ Theme Assets falhou: {e}")
+            
+            # OPÇÃO 2: Se Theme Assets falhar, usar Files API via GraphQL
+            try:
+                graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/graphql.json"
+                
+                # Criar staged upload
+                mutation = """
+                mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+                    stagedUploadsCreate(input: $input) {
+                        stagedTargets {
+                            url
+                            resourceUrl
+                            parameters {
+                                name
+                                value
                             }
                         }
                     }
-                    userErrors {
-                        field
-                        message
-                    }
                 }
+                """
+                
+                # Detectar MIME type
+                mime_type = "image/jpeg"
+                if filename.lower().endswith('.png'):
+                    mime_type = "image/png"
+                elif filename.lower().endswith('.gif'):
+                    mime_type = "image/gif"
+                elif filename.lower().endswith('.webp'):
+                    mime_type = "image/webp"
+                
+                variables = {
+                    "input": [{
+                        "resource": "IMAGE",
+                        "filename": filename,
+                        "mimeType": mime_type,
+                        "httpMethod": "POST"
+                    }]
+                }
+                
+                staged_response = await client.post(
+                    graphql_url,
+                    json={"query": mutation, "variables": variables},
+                    headers=headers
+                )
+                
+                if staged_response.status_code == 200:
+                    result = staged_response.json()
+                    staged_target = result["data"]["stagedUploadsCreate"]["stagedTargets"][0]
+                    
+                    # Fazer upload para URL temporário
+                    upload_url = staged_target["url"]
+                    params = {p["name"]: p["value"] for p in staged_target["parameters"]}
+                    
+                    # Upload via multipart
+                    files = {'file': (filename, image_bytes, mime_type)}
+                    upload_response = await client.post(upload_url, data=params, files=files)
+                    
+                    if upload_response.status_code in [200, 201, 204]:
+                        # Retornar resource URL
+                        resource_url = staged_target["resourceUrl"]
+                        
+                        # Converter para URL público
+                        public_url = resource_url.replace('/admin/', '/s/')
+                        
+                        logger.info(f"✅ Upload via GraphQL bem-sucedido: {public_url}")
+                        
+                        return {
+                            "success": True,
+                            "url": public_url,
+                            "filename": filename,
+                            "size": len(image_bytes),
+                            "method": "graphql_files",
+                            "message": "Upload permanente concluído"
+                        }
+            except Exception as e:
+                logger.warning(f"⚠️ GraphQL Files falhou: {e}")
+            
+            # OPÇÃO 3: Fallback final - Hospedar temporariamente no Railway
+            logger.info("🔄 Usando hospedagem temporária no Railway como fallback")
+            
+            image_id = f"temp_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
+            
+            if not hasattr(app.state, 'temp_images'):
+                app.state.temp_images = {}
+            
+            # Armazenar por 24 horas
+            app.state.temp_images[image_id] = {
+                'data': image_bytes,
+                'mime_type': 'image/jpeg' if '.jpg' in filename.lower() else 'image/png',
+                'filename': filename,
+                'expires_at': (datetime.now() + timedelta(hours=24)).isoformat(),
+                'size': len(image_bytes)
             }
-            """
             
-            create_variables = {
-                "files": [{
-                    "originalSource": resource_url,
-                    "contentType": "IMAGE",
-                    "alt": f"Imagem para descrição - {clean_filename}"
-                }]
+            temp_url = f"https://shopify-production-8bcd.up.railway.app/api/images/temp/{image_id}"
+            
+            return {
+                "success": True,
+                "url": temp_url,
+                "temporary": True,
+                "expires_in": "24 horas",
+                "filename": filename,
+                "size": len(image_bytes),
+                "message": "Upload temporário (Shopify indisponível) - válido por 24h",
+                "warning": "Esta é uma URL temporária. A imagem será removida em 24 horas."
             }
-            
-            # Aguardar um pouco para o Shopify processar
-            await asyncio.sleep(2)
-            
-            create_response = await client.post(
-                graphql_url,
-                json={"query": create_mutation, "variables": create_variables},
-                headers=headers
-            )
-            
-            if create_response.status_code != 200:
-                # Se falhar, ainda temos o resource_url que funciona
-                logger.warning(f"⚠️ fileCreate falhou, usando resource_url")
-                
-                # Tentar pegar a URL direta
-                cdn_url = resource_url.replace('/admin/api/', '/cdn/shop/')
-                
-                return {
-                    "success": True,
-                    "url": cdn_url,
-                    "shopify_url": resource_url,
-                    "filename": final_filename,
-                    "size": len(image_bytes),
-                    "message": "Upload concluído (URL temporária)"
-                }
-            
-            create_result = create_response.json()
-            
-            if create_result.get("data", {}).get("fileCreate", {}).get("files"):
-                file_data = create_result["data"]["fileCreate"]["files"][0]
-                
-                # Tentar pegar a URL da imagem
-                if "image" in file_data:
-                    final_url = file_data["image"]["url"]
-                elif file_data.get("preview", {}).get("image"):
-                    final_url = file_data["preview"]["image"]["url"]
-                else:
-                    final_url = resource_url
-                
-                logger.info(f"✅ Imagem criada no Shopify: {final_url}")
-                
-                return {
-                    "success": True,
-                    "url": final_url,
-                    "shopify_file_id": file_data.get("id"),
-                    "filename": final_filename,
-                    "size": len(image_bytes),
-                    "width": file_data.get("image", {}).get("width"),
-                    "height": file_data.get("image", {}).get("height"),
-                    "message": "Upload permanente no Shopify concluído"
-                }
-            else:
-                # Fallback para resource_url
-                return {
-                    "success": True,
-                    "url": resource_url,
-                    "filename": final_filename,
-                    "size": len(image_bytes),
-                    "message": "Upload concluído"
-                }
         
     except Exception as e:
-        logger.error(f"❌ Erro no upload para Shopify: {str(e)}")
-        
-        # FALLBACK: Se Shopify falhar, usar método temporário do Railway
-        logger.info("🔄 Tentando fallback para armazenamento temporário...")
-        
-        # Armazenar temporariamente (será deletado em 1 hora)
-        image_id = f"temp_{int(datetime.now().timestamp())}_{secrets.token_hex(4)}"
-        
-        if not hasattr(app.state, 'temp_images'):
-            app.state.temp_images = {}
-        
-        app.state.temp_images[image_id] = {
-            'data': image_bytes,
-            'mime_type': mime_type,
-            'filename': final_filename,
-            'expires_at': (datetime.now() + timedelta(hours=1)).isoformat(),
-            'size': len(image_bytes)
-        }
-        
-        temp_url = f"https://shopify-production-8bcd.up.railway.app/api/images/temp/{image_id}"
-        
+        logger.error(f"❌ Erro no upload: {str(e)}")
         return {
-            "success": True,
-            "url": temp_url,
-            "temporary": True,
-            "expires_in": "1 hora",
-            "filename": final_filename,
-            "size": len(image_bytes),
-            "message": "Upload temporário (Shopify indisponível)"
+            "success": False,
+            "message": f"Erro no upload: {str(e)}"
         }
-
-@app.get("/api/images/temp/{image_id}")
-async def serve_temp_image(image_id: str):
-    """
-    Servir imagem temporária (auto-deleta após 1 hora)
-    """
-    
-    if not hasattr(app.state, 'temp_images'):
-        raise HTTPException(status_code=404, detail="Imagem não encontrada")
-    
-    if image_id not in app.state.temp_images:
-        raise HTTPException(status_code=404, detail="Imagem não encontrada ou expirada")
-    
-    image_data = app.state.temp_images[image_id]
-    
-    # Verificar se expirou
-    expires_at = datetime.fromisoformat(image_data['expires_at'])
-    if datetime.now() > expires_at:
-        del app.state.temp_images[image_id]
-        raise HTTPException(status_code=410, detail="Imagem expirada")
-    
-    return Response(
-        content=image_data['data'],
-        media_type=image_data['mime_type'],
-        headers={
-            'Cache-Control': 'public, max-age=3600',  # Cache por 1 hora apenas
-            'X-Temporary': 'true',
-            'X-Expires-At': image_data['expires_at']
-        }
-    )
-
-# Auto-limpeza de imagens temporárias
-async def cleanup_temp_images():
-    """Limpar imagens temporárias expiradas a cada 30 minutos"""
-    while True:
-        try:
-            await asyncio.sleep(1800)  # 30 minutos
-            
-            if hasattr(app.state, 'temp_images'):
-                now = datetime.now()
-                to_delete = []
-                
-                for image_id, data in app.state.temp_images.items():
-                    expires_at = datetime.fromisoformat(data['expires_at'])
-                    if now > expires_at:
-                        to_delete.append(image_id)
-                
-                for image_id in to_delete:
-                    del app.state.temp_images[image_id]
-                
-                if to_delete:
-                    logger.info(f"🧹 {len(to_delete)} imagens temporárias expiradas removidas")
-        except Exception as e:
-            logger.error(f"Erro na limpeza de imagens temporárias: {e}")
 
 # ==================== ENDPOINTS DE NOTIFICAÇÕES (NOVOS) ====================
 
