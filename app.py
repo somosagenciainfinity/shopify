@@ -67,74 +67,6 @@ manager = ConnectionManager()
 # Armazenar tarefas em memória
 tasks_db = {}
 
-# ==================== FUNÇÃO INTERNA PARA BUSCAR PRODUTOS (NOVA) ====================
-
-async def refresh_products_from_shopify_internal(store_name: str, access_token: str):
-    """Função interna para buscar produtos atualizados do Shopify"""
-    
-    clean_store = store_name.replace('.myshopify.com', '').strip()
-    api_version = '2024-04'
-    
-    try:
-        all_products = []
-        url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products.json?limit=250"
-        headers = {
-            "X-Shopify-Access-Token": access_token,
-            "Content-Type": "application/json"
-        }
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers)
-            
-            if response.status_code != 200:
-                logger.error(f"❌ Erro ao buscar produtos internamente: HTTP {response.status_code}")
-                return None
-            
-            data = response.json()
-            products = data.get("products", [])
-            all_products.extend(products)
-            
-            # Continuar paginação (limitado para não travar)
-            link_header = response.headers.get("link", "")
-            page_count = 1
-            
-            while link_header and 'rel="next"' in link_header and page_count < 10:  # Máximo 10 páginas
-                parts = link_header.split(",")
-                next_url = None
-                
-                for part in parts:
-                    if 'rel="next"' in part:
-                        start = part.find("<") + 1
-                        end = part.find(">")
-                        if start > 0 and end > start:
-                            next_url = part[start:end]
-                            break
-                
-                if not next_url:
-                    break
-                
-                response = await client.get(next_url, headers=headers)
-                
-                if response.status_code != 200:
-                    logger.warning(f"⚠️ Erro na página {page_count + 1}, parando paginação")
-                    break
-                
-                data = response.json()
-                products = data.get("products", [])
-                all_products.extend(products)
-                
-                page_count += 1
-                link_header = response.headers.get("link", "")
-                
-                await asyncio.sleep(0.3)  # Rate limiting
-        
-        logger.info(f"✅ {len(all_products)} produtos buscados internamente")
-        return all_products
-        
-    except Exception as e:
-        logger.error(f"❌ Erro interno ao buscar produtos: {e}")
-        return None
-
 # ==================== MODELOS DE DADOS ====================
 class TaskRequest(BaseModel):
     id: str
@@ -693,24 +625,6 @@ async def process_alt_text_background(
         tasks_db[task_id]["results"] = results
         tasks_db[task_id]["progress"]["current_image"] = None
         
-        # ✅ NOVO: ATUALIZAÇÃO EM TEMPO REAL - BUSCAR PRODUTOS ATUALIZADOS
-        logger.info(f"🔄 Buscando produtos atualizados para sincronização em tempo real...")
-        
-        try:
-            updated_products = await refresh_products_from_shopify_internal(store_name, access_token)
-            
-            if updated_products:
-                tasks_db[task_id]["updated_products"] = updated_products
-                tasks_db[task_id]["products_refreshed"] = True
-                logger.info(f"✅ {len(updated_products)} produtos atualizados disponíveis para sincronização em tempo real")
-            else:
-                tasks_db[task_id]["needs_manual_refresh"] = True
-                logger.warning(f"⚠️ Não foi possível buscar produtos atualizados, marcando para refresh manual")
-                
-        except Exception as e:
-            logger.error(f"❌ Erro ao buscar produtos atualizados: {e}")
-            tasks_db[task_id]["needs_manual_refresh"] = True
-        
         logger.info(f"🏁 ALT-TEXT FINALIZADO: ✅ {successful} | ❌ {failed} | ⚪ {unchanged}")
 
 # ==================== ENDPOINT DE RENOMEAÇÃO DE IMAGENS - VERSÃO DIRETA SEM ATTACHMENT ====================
@@ -1158,7 +1072,7 @@ async def process_rename_images_background(
             tasks_db[task_id]["status"] = final_status
             tasks_db[task_id]["completed_at"] = get_brazil_time_str()
             
-            # OTIMIZAÇÃO 3: LIMITAR DADOS APÓS CONCLUSÃO
+            # OTIMIZAÇÃO 3: LIMPAR DADOS APÓS CONCLUSÃO
             # Manter apenas últimos 10 results para tarefas completadas
             tasks_db[task_id]["results"] = results[-10:]
             
@@ -1172,24 +1086,6 @@ async def process_rename_images_background(
                 }
             
             tasks_db[task_id]["progress"]["current_image"] = None
-            
-            # ✅ NOVO: ATUALIZAÇÃO EM TEMPO REAL - BUSCAR PRODUTOS ATUALIZADOS
-            logger.info(f"🔄 Buscando produtos atualizados para sincronização em tempo real...")
-            
-            try:
-                updated_products = await refresh_products_from_shopify_internal(store_name, access_token)
-                
-                if updated_products:
-                    tasks_db[task_id]["updated_products"] = updated_products
-                    tasks_db[task_id]["products_refreshed"] = True
-                    logger.info(f"✅ {len(updated_products)} produtos atualizados disponíveis para sincronização em tempo real")
-                else:
-                    tasks_db[task_id]["needs_manual_refresh"] = True
-                    logger.warning(f"⚠️ Não foi possível buscar produtos atualizados, marcando para refresh manual")
-                    
-            except Exception as e:
-                logger.error(f"❌ Erro ao buscar produtos atualizados: {e}")
-                tasks_db[task_id]["needs_manual_refresh"] = True
             
             logger.info(f"🏁 PROCESSO DE RENOMEAÇÃO FINALIZADO:")
             logger.info(f"   ✅ Renomeados: {successful}")
@@ -1994,24 +1890,6 @@ async def process_image_optimization_background(
             tasks_db[task_id]["status"] = "completed" if failed == 0 else "completed_with_errors"
             tasks_db[task_id]["completed_at"] = get_brazil_time_str()
             tasks_db[task_id]["results"] = results[-10:]
-            
-            # ✅ NOVO: ATUALIZAÇÃO EM TEMPO REAL - BUSCAR PRODUTOS ATUALIZADOS
-            logger.info(f"🔄 Buscando produtos atualizados para sincronização em tempo real...")
-            
-            try:
-                updated_products = await refresh_products_from_shopify_internal(store_name, access_token)
-                
-                if updated_products:
-                    tasks_db[task_id]["updated_products"] = updated_products
-                    tasks_db[task_id]["products_refreshed"] = True
-                    logger.info(f"✅ {len(updated_products)} produtos atualizados disponíveis para sincronização em tempo real")
-                else:
-                    tasks_db[task_id]["needs_manual_refresh"] = True
-                    logger.warning(f"⚠️ Não foi possível buscar produtos atualizados, marcando para refresh manual")
-                    
-            except Exception as e:
-                logger.error(f"❌ Erro ao buscar produtos atualizados: {e}")
-                tasks_db[task_id]["needs_manual_refresh"] = True
             
             logger.info(f"🏁 OTIMIZAÇÃO FINALIZADA:")
             logger.info(f"   ✅ Processadas: {successful}")
@@ -3009,24 +2887,6 @@ async def process_variants_background(
         tasks_db[task_id]["results"] = results
         tasks_db[task_id]["progress"]["current_product"] = None  # LIMPAR APENAS NO FINAL
         
-        # ✅ NOVO: ATUALIZAÇÃO EM TEMPO REAL - BUSCAR PRODUTOS ATUALIZADOS
-        logger.info(f"🔄 Buscando produtos atualizados para sincronização em tempo real...")
-        
-        try:
-            updated_products = await refresh_products_from_shopify_internal(store_name, access_token)
-            
-            if updated_products:
-                tasks_db[task_id]["updated_products"] = updated_products
-                tasks_db[task_id]["products_refreshed"] = True
-                logger.info(f"✅ {len(updated_products)} produtos atualizados disponíveis para sincronização em tempo real")
-            else:
-                tasks_db[task_id]["needs_manual_refresh"] = True
-                logger.warning(f"⚠️ Não foi possível buscar produtos atualizados, marcando para refresh manual")
-                
-        except Exception as e:
-            logger.error(f"❌ Erro ao buscar produtos atualizados: {e}")
-            tasks_db[task_id]["needs_manual_refresh"] = True
-        
         logger.info(f"🏁 PROCESSAMENTO DE VARIANTES FINALIZADO: ✅ {successful} | ❌ {failed}")
 
 # Função auxiliar para processar variantes de um único produto
@@ -3268,25 +3128,6 @@ async def process_single_product_variants(
                     tasks_db[task_id]["progress"]["processed"] = 1
                     tasks_db[task_id]["progress"]["successful"] = 1
                     tasks_db[task_id]["progress"]["percentage"] = 100
-                    
-                    # ✅ NOVO: ATUALIZAÇÃO EM TEMPO REAL - BUSCAR PRODUTOS ATUALIZADOS
-                    logger.info(f"🔄 Buscando produtos atualizados para sincronização em tempo real...")
-                    
-                    try:
-                        updated_products = await refresh_products_from_shopify_internal(store_name, access_token)
-                        
-                        if updated_products:
-                            tasks_db[task_id]["updated_products"] = updated_products
-                            tasks_db[task_id]["products_refreshed"] = True
-                            logger.info(f"✅ {len(updated_products)} produtos atualizados disponíveis para sincronização em tempo real")
-                        else:
-                            tasks_db[task_id]["needs_manual_refresh"] = True
-                            logger.warning(f"⚠️ Não foi possível buscar produtos atualizados, marcando para refresh manual")
-                            
-                    except Exception as e:
-                        logger.error(f"❌ Erro ao buscar produtos atualizados: {e}")
-                        tasks_db[task_id]["needs_manual_refresh"] = True
-                
                 logger.info(f"✅ Produto '{product_title}' atualizado com sucesso")
             else:
                 error_text = await update_response.text()
@@ -3307,27 +3148,149 @@ async def process_single_product_variants(
             tasks_db[task_id]["progress"]["processed"] = 1
             tasks_db[task_id]["progress"]["failed"] = 1
 
-# ==================== ATUALIZAR PRODUTOS DO SHOPIFY ====================
+# ==================== ATUALIZAR PRODUTOS DO SHOPIFY (INTELIGENTE) ====================
 
 @app.post("/api/products/refresh")
 async def refresh_products_from_shopify(data: Dict[str, Any]):
-    """Buscar produtos atualizados diretamente do Shopify"""
+    """
+    Buscar produtos atualizados do Shopify de forma inteligente:
+    - Se fornecer 'lastUpdateTime', busca apenas produtos modificados após essa data
+    - Se não fornecer, busca todos os produtos (primeira carga)
+    """
     
     store_name = data.get("storeName", "")
     access_token = data.get("accessToken", "")
+    last_update_time = data.get("lastUpdateTime")  # ISO 8601 timestamp (opcional)
     
     if not store_name or not access_token:
         raise HTTPException(status_code=400, detail="storeName e accessToken são obrigatórios")
     
-    logger.info(f"🔄 Buscando produtos atualizados do Shopify para {store_name}")
+    # Limpar nome da loja
+    clean_store = store_name.replace('.myshopify.com', '').strip()
+    api_version = '2024-10'
     
-    # Usar a função interna
-    updated_products = await refresh_products_from_shopify_internal(store_name, access_token)
+    # Determinar modo de busca
+    if last_update_time:
+        logger.info(f"🔄 Buscando produtos atualizados após {last_update_time} para {store_name}")
+        mode = "incremental"
+    else:
+        logger.info(f"🔄 Buscando TODOS os produtos do Shopify para {store_name}")
+        mode = "full"
     
-    if updated_products is None:
-        raise HTTPException(status_code=500, detail="Erro ao buscar produtos do Shopify")
-    
-    return updated_products
+    try:
+        all_products = []
+        
+        # Construir URL base
+        base_url = f"https://{clean_store}.myshopify.com/admin/api/{api_version}/products.json"
+        
+        # Adicionar parâmetros
+        params = {"limit": 250}
+        if last_update_time:
+            # Buscar apenas produtos atualizados após esta data
+            params["updated_at_min"] = last_update_time
+        
+        headers = {
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Primeira requisição
+            response = await client.get(base_url, params=params, headers=headers)
+            
+            if response.status_code != 200:
+                error_text = response.text
+                logger.error(f"❌ Erro ao buscar produtos: {error_text}")
+                raise HTTPException(status_code=response.status_code, detail=f"Erro do Shopify: {error_text}")
+            
+            data = response.json()
+            products = data.get("products", [])
+            all_products.extend(products)
+            
+            logger.info(f"📦 Primeira página: {len(products)} produtos")
+            
+            # Verificar se há mais páginas através do header Link
+            link_header = response.headers.get("link", "")
+            
+            # Continuar buscando páginas enquanto houver
+            page_count = 1
+            max_pages = 100  # Limite de segurança
+            
+            while link_header and 'rel="next"' in link_header and page_count < max_pages:
+                # Extrair URL da próxima página
+                parts = link_header.split(",")
+                next_url = None
+                
+                for part in parts:
+                    if 'rel="next"' in part:
+                        # Extrair URL entre < e >
+                        start = part.find("<") + 1
+                        end = part.find(">")
+                        if start > 0 and end > start:
+                            next_url = part[start:end]
+                            break
+                
+                if not next_url:
+                    break
+                
+                # Buscar próxima página
+                response = await client.get(next_url, headers=headers)
+                
+                if response.status_code != 200:
+                    logger.warning(f"⚠️ Erro ao buscar página {page_count + 1}, parando paginação")
+                    break
+                
+                data = response.json()
+                products = data.get("products", [])
+                all_products.extend(products)
+                
+                page_count += 1
+                logger.info(f"📦 Página {page_count}: {len(products)} produtos (Total: {len(all_products)})")
+                
+                # Atualizar link header
+                link_header = response.headers.get("link", "")
+                
+                # Rate limiting - respeitar limites do Shopify
+                await asyncio.sleep(0.5)
+        
+        # Enriquecer produtos com dados necessários
+        for product in all_products:
+            # Garantir que variants estão presentes
+            if "variants" not in product or not product["variants"]:
+                product["variants"] = []
+            
+            # Garantir que options estão presentes
+            if "options" not in product or not product["options"]:
+                product["options"] = []
+            
+            # Garantir que images estão presentes
+            if "images" not in product or not product["images"]:
+                product["images"] = []
+            
+            # Adicionar timestamp de atualização se não existir
+            if "updated_at" not in product:
+                product["updated_at"] = datetime.utcnow().isoformat()
+        
+        # Log final
+        if mode == "incremental":
+            logger.info(f"✅ {len(all_products)} produtos atualizados carregados (modo incremental)")
+        else:
+            logger.info(f"✅ {len(all_products)} produtos carregados (carga completa)")
+        
+        # Retornar resposta com metadados
+        return {
+            "products": all_products,
+            "total": len(all_products),
+            "mode": mode,
+            "timestamp": datetime.utcnow().isoformat(),
+            "updated_at_min": last_update_time if last_update_time else None
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro ao buscar produtos do Shopify: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 # ==================== ATUALIZAÇÃO DE IMAGENS ====================
 @app.post("/api/products/refresh-images")
@@ -4704,24 +4667,6 @@ async def process_products_background(
         tasks_db[task_id]["completed_at"] = get_brazil_time_str()
         tasks_db[task_id]["results"] = results
         tasks_db[task_id]["progress"]["current_product"] = None
-        
-        # ✅ NOVO: ATUALIZAÇÃO EM TEMPO REAL - BUSCAR PRODUTOS ATUALIZADOS
-        logger.info(f"🔄 Buscando produtos atualizados para sincronização em tempo real...")
-        
-        try:
-            updated_products = await refresh_products_from_shopify_internal(store_name, access_token)
-            
-            if updated_products:
-                tasks_db[task_id]["updated_products"] = updated_products
-                tasks_db[task_id]["products_refreshed"] = True
-                logger.info(f"✅ {len(updated_products)} produtos atualizados disponíveis para sincronização em tempo real")
-            else:
-                tasks_db[task_id]["needs_manual_refresh"] = True
-                logger.warning(f"⚠️ Não foi possível buscar produtos atualizados, marcando para refresh manual")
-                
-        except Exception as e:
-            logger.error(f"❌ Erro ao buscar produtos atualizados: {e}")
-            tasks_db[task_id]["needs_manual_refresh"] = True
         
         logger.info(f"🏁 TAREFA FINALIZADA: ✅ {successful} | ❌ {failed}")
 
