@@ -3993,33 +3993,26 @@ async def cancel_task_alt(task_id: str):
 
 @app.get("/tasks")
 async def list_tasks_simple():
-    """Endpoint simples /tasks para compatibilidade - CORRIGIDO"""
-    # RETORNAR TODAS AS TAREFAS ATIVAS, não apenas as recentes!
+    """Endpoint /tasks - RETORNA TODAS AS TAREFAS ATIVAS SEM SIMPLIFICAR"""
     active_tasks = []
-    completed_tasks = []
     
     for task_id, task in tasks_db.items():
         status = task.get("status")
         
         # SEMPRE incluir tarefas ativas (processing, running, paused, scheduled)
         if status in ["processing", "running", "paused", "scheduled"]:
+            # ✅ RETORNAR TAREFA COMPLETA, NÃO SIMPLIFICADA!
             active_tasks.append(task)
-        # Incluir tarefas completadas/canceladas/falhas também
-        elif status in ["completed", "completed_with_errors", "failed", "cancelled"]:
-            completed_tasks.append(task)
-    
-    # Combinar todas as tarefas
-    all_tasks = active_tasks + completed_tasks
     
     # Ordenar por updated_at (mais recentes primeiro)
-    all_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    active_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     
-    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas e {len(completed_tasks)} completadas")
+    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas COMPLETAS")
     
     return {
         "success": True,
-        "tasks": all_tasks,  # RETORNAR TODAS AS TAREFAS
-        "total": len(all_tasks)
+        "tasks": active_tasks,  # ✅ TAREFAS COMPLETAS COM TODOS OS DADOS
+        "total": len(active_tasks)
     }
 
 @app.get("/api/tasks/all")
@@ -4229,19 +4222,9 @@ async def get_task_status(task_id: str):
     """Verificar status detalhado da tarefa"""
     
     if task_id not in tasks_db:
-        logger.warning(f"⚠️ Tarefa {task_id} não encontrada")
-        return {
-            "id": task_id,
-            "status": "not_found",
-            "message": "Tarefa não encontrada",
-            "progress": {
-                "processed": 0,
-                "total": 0,
-                "successful": 0,
-                "failed": 0,
-                "percentage": 0
-            }
-        }
+        logger.info(f"📊 Tarefa {task_id} não encontrada (já foi limpa ou não existe)")
+        # ✅ RETORNAR 404 AO INVÉS DE 200 COM "not_found"
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
     
     task = tasks_db[task_id]
     logger.info(f"📊 Status: {task['status']} - {task['progress']['percentage']}%")
