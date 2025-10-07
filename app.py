@@ -3993,60 +3993,33 @@ async def cancel_task_alt(task_id: str):
 
 @app.get("/tasks")
 async def list_tasks_simple():
-    """Endpoint simples /tasks para compatibilidade - OTIMIZADO PARA TASKSRUNNING"""
-    # RETORNAR APENAS TAREFAS ATIVAS E RECENTES!
+    """Endpoint simples /tasks para compatibilidade - CORRIGIDO"""
+    # RETORNAR TODAS AS TAREFAS ATIVAS, não apenas as recentes!
     active_tasks = []
-    recent_completed = []
-    
-    now = datetime.now()
+    completed_tasks = []
     
     for task_id, task in tasks_db.items():
         status = task.get("status")
         
-        # Sempre incluir tarefas ativas
+        # SEMPRE incluir tarefas ativas (processing, running, paused, scheduled)
         if status in ["processing", "running", "paused", "scheduled"]:
             active_tasks.append(task)
-        # Incluir tarefas completadas das últimas 2 horas apenas
+        # Incluir tarefas completadas/canceladas/falhas também
         elif status in ["completed", "completed_with_errors", "failed", "cancelled"]:
-            completed_at = task.get("completed_at") or task.get("updated_at")
-            if completed_at:
-                try:
-                    completed_time = datetime.fromisoformat(completed_at.replace('Z', ''))
-                    # Só incluir se foi completada nas últimas 2 horas
-                    if (now - completed_time).total_seconds() < 7200:  # 2 horas
-                        # Criar versão simplificada da tarefa completada
-                        simplified_task = {
-                            "id": task["id"],
-                            "name": task.get("name"),
-                            "status": task["status"],
-                            "task_type": task.get("task_type", "bulk_edit"),
-                            "progress": task.get("progress", {}),
-                            "started_at": task.get("started_at"),
-                            "completed_at": task.get("completed_at"),
-                            "updated_at": task.get("updated_at"),
-                            # NÃO incluir config completo ou results grandes
-                            "config": {
-                                "itemCount": task.get("config", {}).get("itemCount", 0)
-                            },
-                            # Limitar results a 5 últimos
-                            "results": task.get("results", [])[-5:] if "results" in task else []
-                        }
-                        recent_completed.append(simplified_task)
-                except:
-                    pass
+            completed_tasks.append(task)
     
-    # Combinar tarefas ativas e recentes
-    tasks_list = active_tasks + recent_completed
+    # Combinar todas as tarefas
+    all_tasks = active_tasks + completed_tasks
     
-    # Ordenar por updated_at
-    tasks_list.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    # Ordenar por updated_at (mais recentes primeiro)
+    all_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     
-    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas e {len(recent_completed)} recentes")
+    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas e {len(completed_tasks)} completadas")
     
     return {
         "success": True,
-        "tasks": tasks_list,
-        "total": len(tasks_list)
+        "tasks": all_tasks,  # RETORNAR TODAS AS TAREFAS
+        "total": len(all_tasks)
     }
 
 @app.get("/api/tasks/all")
