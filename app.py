@@ -483,7 +483,6 @@ async def process_alt_text_background(
     
     clean_store = store_name.replace('.myshopify.com', '')
     
-    # Se for retomada, pegar progresso existente
     if is_resume and task_id in tasks_db:
         task = tasks_db[task_id]
         processed = task["progress"]["processed"]
@@ -502,7 +501,6 @@ async def process_alt_text_background(
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i, image_data in enumerate(csv_data[processed:], start=processed):
-            # Verificar se a tarefa foi pausada ou cancelada
             if task_id not in tasks_db:
                 logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
                 return
@@ -514,10 +512,8 @@ async def process_alt_text_background(
                 return
             
             try:
-                # Renderizar template
                 final_alt_text = image_data.get('template_used', '')
                 
-                # Substituir variáveis
                 replacements = {
                     r'\{\{\s*product\.title\s*\}\}': image_data.get('product_title', ''),
                     r'\{\{\s*product\.handle\s*\}\}': image_data.get('product_handle', ''),
@@ -537,14 +533,12 @@ async def process_alt_text_background(
                 
                 final_alt_text = ' '.join(final_alt_text.split()).strip()
                 
-                # Verificar se precisa de atualização
                 if image_data.get('current_alt_text') == final_alt_text:
                     logger.info(f"ℹ️ Alt-text já correto para imagem {image_data.get('image_id')}")
                     unchanged += 1
                     processed += 1
                     continue
                 
-                # Atualizar via API Shopify
                 shopify_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/products/{image_data.get('product_id')}/images/{image_data.get('image_id')}.json"
                 
                 headers = {
@@ -590,7 +584,7 @@ async def process_alt_text_background(
                     'error': str(e)
                 })
             
-            # Atualizar progresso
+            # ✅ ATUALIZAR PROGRESSO IMEDIATAMENTE
             processed += 1
             percentage = round((processed / total) * 100)
             
@@ -607,16 +601,14 @@ async def process_alt_text_background(
                 tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 tasks_db[task_id]["results"] = results[-50:]
             
-            # Verificar novamente se foi pausado/cancelado
             if task_id in tasks_db:
                 if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
                     logger.info(f"🛑 Parando após processar imagem {image_data.get('image_id')}")
                     return
             
-            # Rate limiting
-            await asyncio.sleep(0.2)
+            # ✅ RATE LIMITING REDUZIDO: 50ms
+            await asyncio.sleep(0.05)
     
-    # Finalizar
     final_status = "completed" if failed == 0 else "completed_with_errors"
     
     if task_id in tasks_db:
@@ -1063,7 +1055,7 @@ async def process_rename_images_background(
                         return
                 
                 # Rate limiting
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.1)
         
         # Finalizar tarefa
         final_status = "completed" if failed == 0 else "completed_with_errors"
@@ -1883,7 +1875,7 @@ async def process_image_optimization_background(
                         return
                 
                 # Rate limiting
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
         
         # Finalizar
         if task_id in tasks_db:
@@ -2873,7 +2865,7 @@ async def process_variants_background(
                     return
             
             # Rate limiting
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.05)
     
     except Exception as e:
         logger.error(f"❌ Erro geral no processamento de variantes: {str(e)}")
@@ -4423,7 +4415,7 @@ async def process_products_background(
     access_token: str,
     is_resume: bool = False
 ):
-    """PROCESSAR PRODUTOS EM BACKGROUND - VERSÃO MELHORADA"""
+    """PROCESSAR PRODUTOS EM BACKGROUND - VERSÃO COM ATUALIZAÇÃO EM TEMPO REAL"""
     if not is_resume:
         logger.info(f"🚀 INICIANDO PROCESSAMENTO: {task_id}")
     else:
@@ -4489,7 +4481,7 @@ async def process_products_background(
                 # PEGAR O TÍTULO DO PRODUTO
                 product_title = current_product.get("title", "Sem título")
                 
-                # ATUALIZAR PROGRESSO COM TÍTULO ANTES DE PROCESSAR
+                # ✅ ATUALIZAR PROGRESSO COM TÍTULO ANTES DE PROCESSAR
                 if task_id in tasks_db:
                     tasks_db[task_id]["progress"]["current_product"] = product_title
                     tasks_db[task_id]["updated_at"] = get_brazil_time_str()
@@ -4588,7 +4580,7 @@ async def process_products_background(
                 }
                 logger.error(f"❌ Exceção: {str(e)}")
             
-            # Atualizar progresso
+            # ✅ ATUALIZAR PROGRESSO **IMEDIATAMENTE** APÓS CADA PRODUTO
             results.append(result)
             processed += 1
             percentage = round((processed / total) * 100)
@@ -4612,8 +4604,8 @@ async def process_products_background(
                     logger.info(f"🛑 Parando após processar {product_id}")
                     return
             
-            # Rate limiting
-            await asyncio.sleep(0.3)
+            # ✅ RATE LIMITING MÍNIMO - APENAS 50ms (0.05s)
+            await asyncio.sleep(0.05)
     
     # Finalizar
     final_status = "completed" if failed == 0 else "completed_with_errors"
