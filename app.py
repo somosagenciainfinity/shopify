@@ -3976,34 +3976,28 @@ async def cancel_task(task_id: str):
         "task": task
     }
 
-@app.post("/task-cancel/{task_id}")
-async def cancel_task_alt(task_id: str):
-    """Endpoint alternativo para cancelar tarefa (compatibilidade)"""
-    return await cancel_task(task_id)
-
 # ==================== LISTAR TAREFAS ====================
 
 @app.get("/tasks")
 async def list_tasks_simple():
-    """Endpoint /tasks - RETORNA TODAS AS TAREFAS ATIVAS SEM SIMPLIFICAR"""
+    """Endpoint /tasks - RETORNA APENAS TAREFAS ATIVAS (NÃO CANCELADAS)"""
     active_tasks = []
     
     for task_id, task in tasks_db.items():
         status = task.get("status")
         
-        # SEMPRE incluir tarefas ativas (processing, running, paused, scheduled)
+        # ✅ FILTRAR: Apenas tarefas ativas (NÃO incluir canceladas)
         if status in ["processing", "running", "paused", "scheduled"]:
-            # ✅ RETORNAR TAREFA COMPLETA, NÃO SIMPLIFICADA!
             active_tasks.append(task)
     
     # Ordenar por updated_at (mais recentes primeiro)
     active_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     
-    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas COMPLETAS")
+    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas (canceladas filtradas)")
     
     return {
         "success": True,
-        "tasks": active_tasks,  # ✅ TAREFAS COMPLETAS COM TODOS OS DADOS
+        "tasks": active_tasks,
         "total": len(active_tasks)
     }
 
