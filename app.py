@@ -374,13 +374,16 @@ async def load_all_products_optimized(client: httpx.AsyncClient, store: str, hea
     all_products = []
     cursor = None
     batch_count = 0
+    max_retries = 3
     
     while True:
         batch_count += 1
+        retry_count = 0
         
+        # AUMENTAR O BATCH SIZE E ADICIONAR RETRY
         query = """
         query($cursor: String) {
-          products(first: 50, after: $cursor) {
+          products(first: 250, after: $cursor) {
             edges {
               node {
                 id
@@ -473,52 +476,88 @@ async def load_all_products_optimized(client: httpx.AsyncClient, store: str, hea
         
         graphql_url = f"https://{store}.myshopify.com/admin/api/2024-10/graphql.json"
         
-        response = await client.post(
-            graphql_url,
-            headers=headers,
-            json={"query": query, "variables": {"cursor": cursor}}
-        )
+        while retry_count < max_retries:
+            try:
+                response = await client.post(
+                    graphql_url,
+                    headers=headers,
+                    json={"query": query, "variables": {"cursor": cursor}}
+                )
+                
+                if response.status_code == 200:
+                    break
+                elif response.status_code == 429:  # Rate limit
+                    retry_count += 1
+                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                    continue
+                else:
+                    logger.error(f"Erro GraphQL: {response.status_code}")
+                    break
+            except Exception as e:
+                logger.error(f"Erro na requisição: {e}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    break
+                await asyncio.sleep(2 ** retry_count)
         
         if response.status_code != 200:
-            logger.error(f"Erro GraphQL: {response.status_code}")
+            logger.error(f"Falha após {max_retries} tentativas")
             break
         
         result = response.json()
         
         if 'errors' in result:
             logger.error(f"Erros GraphQL: {result['errors']}")
-            break
+            # NÃO PARAR AQUI - tentar continuar se possível
+            if 'data' not in result:
+                break
         
         products_data = result.get('data', {}).get('products')
         if not products_data:
+            logger.warning(f"Sem dados de produtos no batch {batch_count}")
             break
         
         # Processar produtos em batch
         batch_products = []
-        for edge in products_data['edges']:
-            product = process_product_node(edge['node'])
-            batch_products.append(product)
+        for edge in products_data.get('edges', []):
+            if edge and 'node' in edge:
+                try:
+                    product = process_product_node(edge['node'])
+                    batch_products.append(product)
+                except Exception as e:
+                    logger.error(f"Erro ao processar produto: {e}")
+                    continue
         
-        all_products.extend(batch_products)
+        if batch_products:
+            all_products.extend(batch_products)
+            
+            # ATUALIZAR PROGRESSO REAL DE PRODUTOS
+            if session_id and session_id in loading_progress:
+                loading_progress[session_id].update({
+                    "products_loaded": len(all_products),
+                    "message": f"🛍️ {len(all_products)} produtos carregados..."
+                })
+            
+            logger.info(f"📦 Batch {batch_count}: {len(batch_products)} produtos (Total: {len(all_products)})")
         
-        # ATUALIZAR PROGRESSO REAL DE PRODUTOS
-        if session_id and session_id in loading_progress:
-            loading_progress[session_id].update({
-                "products_loaded": len(all_products),
-                "message": f"🛍️ {len(all_products)} produtos carregados..."
-            })
+        # IMPORTANTE: Verificar pageInfo corretamente
+        page_info = products_data.get('pageInfo', {})
+        has_next = page_info.get('hasNextPage', False)
+        next_cursor = page_info.get('endCursor')
         
-        logger.info(f"📦 Batch {batch_count}: {len(batch_products)} produtos (Total: {len(all_products)})")
+        logger.info(f"   PageInfo: hasNextPage={has_next}, cursor={next_cursor[:20] if next_cursor else 'None'}...")
         
-        if not products_data['pageInfo']['hasNextPage']:
+        if not has_next or not next_cursor:
+            logger.info(f"🏁 Fim da paginação. Total de produtos: {len(all_products)}")
             break
         
-        cursor = products_data['pageInfo']['endCursor']
+        cursor = next_cursor
         
-        # Rate limiting dinâmico - REDUZIDO PARA 50 produtos por batch
-        delay = min(0.1 + (batch_count * 0.05), 0.5)
+        # Rate limiting dinâmico - mais conservador
+        delay = 0.5  # Delay fixo de 500ms entre batches
         await asyncio.sleep(delay)
     
+    logger.info(f"✅ Total final de produtos carregados: {len(all_products)}")
     return all_products
 
 # ADICIONAR ESTAS DUAS NOVAS FUNÇÕES APÓS load_all_products_optimized:
