@@ -245,7 +245,9 @@ async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, 
                 title
                 handle
                 description
-                productsCount
+                productsCount {
+                  count
+                }
                 image {
                   url
                   altText
@@ -279,7 +281,9 @@ async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, 
             logger.error(f"Erros GraphQL: {result['errors']}")
             break
         
-        collections_data = result['data']['collections']
+        collections_data = result.get('data', {}).get('collections')
+        if not collections_data:
+            break
         
         for edge in collections_data['edges']:
             node = edge['node']
@@ -288,7 +292,7 @@ async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, 
                 'title': node['title'],
                 'handle': node['handle'],
                 'description': node['description'] or '',
-                'products_count': node.get('productsCount', 0),
+                'products_count': node.get('productsCount', {}).get('count', 0),
                 'image': {
                     'url': node['image']['url'],
                     'alt': node['image']['altText']
@@ -384,10 +388,7 @@ async def load_all_products_optimized(client: httpx.AsyncClient, store: str, hea
                       }
                       sku
                       barcode
-                      weight
-                      weightUnit
                       taxable
-                      requiresShipping
                       selectedOptions {
                         name
                         value
@@ -431,7 +432,9 @@ async def load_all_products_optimized(client: httpx.AsyncClient, store: str, hea
             logger.error(f"Erros GraphQL: {result['errors']}")
             break
         
-        products_data = result['data']['products']
+        products_data = result.get('data', {}).get('products')
+        if not products_data:
+            break
         
         # Processar produtos em batch
         batch_products = []
@@ -522,16 +525,20 @@ def process_product_node(node):
             'compare_at_price': var.get('compareAtPrice'),
             'inventory_quantity': var.get('inventoryQuantity', 0),
             'inventory_management': 'shopify' if var.get('inventoryItem', {}).get('tracked') else None,
+            'inventory_policy': 'deny',
             'sku': var.get('sku', ''),
             'barcode': var.get('barcode', ''),
-            'weight': var.get('weight', 0),
-            'weight_unit': var.get('weightUnit', 'kg'),
-            'requires_shipping': var.get('requiresShipping', True),
+            'weight': 0,
+            'weight_unit': 'kg',
+            'requires_shipping': True,
             'taxable': var.get('taxable', True),
             'option1': option1,
             'option2': option2,
             'option3': option3,
-            'image_id': int(var['image']['id'].split('/')[-1]) if var.get('image') and var['image'].get('id') else None
+            'grams': 0,
+            'image_id': int(var['image']['id'].split('/')[-1]) if var.get('image') and var['image'].get('id') else None,
+            'cost': None,
+            'fulfillment_service': 'manual'
         })
     
     # Traduzir status
