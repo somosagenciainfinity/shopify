@@ -179,14 +179,12 @@ async def load_all_shopify_data(data: Dict[str, Any]):
         "current_phase": "initialization"
     }
     
-    logger.info(f"🚀 Iniciando carregamento completo para {clean_store}")
+    logger.info(f"🚀 Iniciando carregamento completo para {clean_store} - Session: {session_id}")
     
     start_time = time.time()
     
     try:
-        # Carregar coleções e produtos
         async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
-            # Headers padrão
             headers = {
                 'X-Shopify-Access-Token': access_token,
                 'Content-Type': 'application/json',
@@ -205,7 +203,7 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             
             loading_progress[session_id]["total_collections"] = len(all_collections)
             
-            # ============ FASE 2: Carregar Produtos com GraphQL ============
+            # ============ FASE 2: Carregar Produtos ============
             loading_progress[session_id].update({
                 "current_phase": "products",
                 "message": "🛍️ Carregando produtos..."
@@ -225,7 +223,6 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             
             logger.info("🔗 Fase 3: Processando relacionamentos...")
             
-            # Contar produtos por coleção
             collection_product_counts = {}
             product_collection_map = {}
             
@@ -235,7 +232,6 @@ async def load_all_shopify_data(data: Dict[str, Any]):
                     for collection_id in product['collection_ids']:
                         collection_product_counts[collection_id] = collection_product_counts.get(collection_id, 0) + 1
             
-            # Atualizar contadores nas coleções
             for collection in all_collections:
                 collection['products_count'] = collection_product_counts.get(collection['id'], 0)
             
@@ -248,11 +244,12 @@ async def load_all_shopify_data(data: Dict[str, Any]):
                 "message": f"✅ Carregamento completo em {elapsed_time:.2f}s"
             })
             
-            # Limpar progresso após 5 segundos
-            asyncio.create_task(clear_progress_after_delay(session_id, 5))
+            # Limpar progresso após 30 segundos (NÃO antes de retornar!)
+            asyncio.create_task(clear_progress_after_delay(session_id, 30))
             
             logger.info(f"🏁 Carregamento completo em {elapsed_time:.2f} segundos")
             
+            # IMPORTANTE: RETORNAR OS DADOS COMPLETOS!
             return {
                 "success": True,
                 "session_id": session_id,
