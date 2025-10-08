@@ -154,7 +154,7 @@ async def proxy_endpoint(
 @app.post("/api/shopify/load-all-data")
 async def load_all_shopify_data(data: Dict[str, Any]):
     """
-    Carrega TODOS os produtos e coleções SEM ARMAZENAR NA MEMÓRIA DO SERVIDOR
+    Carrega TODOS os produtos e coleções com progresso REAL
     """
     
     store_name = data.get("store_name", "")
@@ -165,10 +165,10 @@ async def load_all_shopify_data(data: Dict[str, Any]):
     
     clean_store = store_name.replace('.myshopify.com', '').strip()
     
-    # Criar ID único para esta sessão de carregamento
+    # Criar ID único para esta sessão
     session_id = f"{clean_store}_{int(time.time())}"
     
-    # APENAS CONTADORES, NÃO DADOS!
+    # Inicializar progresso
     loading_progress[session_id] = {
         "status": "starting",
         "message": "Iniciando carregamento...",
@@ -177,7 +177,7 @@ async def load_all_shopify_data(data: Dict[str, Any]):
         "current_phase": "initialization"
     }
     
-    logger.info(f"🚀 Iniciando carregamento completo para {clean_store}")
+    logger.info(f"🚀 Iniciando carregamento para {clean_store} - Session: {session_id}")
     
     start_time = time.time()
     
@@ -196,19 +196,15 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             })
             
             all_collections = await load_all_collections_optimized(client, clean_store, headers, session_id)
-            
-            # NÃO ARMAZENAR, apenas contar
             loading_progress[session_id]["collections_loaded"] = len(all_collections)
             
             # ============ FASE 2: Carregar Produtos ============
             loading_progress[session_id].update({
-                "current_phase": "products",
+                "current_phase": "products", 
                 "message": "🛍️ Carregando produtos..."
             })
             
             all_products = await load_all_products_optimized(client, clean_store, headers, session_id)
-            
-            # NÃO ARMAZENAR, apenas contar
             loading_progress[session_id]["products_loaded"] = len(all_products)
             
             # ============ FASE 3: Processar relacionamentos ============
@@ -235,15 +231,15 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             loading_progress[session_id].update({
                 "status": "completed",
                 "current_phase": "completed",
-                "message": f"✅ Carregamento completo em {elapsed_time:.2f}s"
+                "message": f"✅ Carregamento completo!"
             })
             
-            # Limpar progresso após 5 segundos
-            asyncio.create_task(clear_progress_after_delay(session_id, 5))
+            # Limpar progresso após 30 segundos
+            asyncio.create_task(clear_progress_after_delay(session_id, 30))
             
             logger.info(f"🏁 Carregamento completo em {elapsed_time:.2f} segundos")
             
-            # RETORNAR DADOS DIRETAMENTE (sem armazenar no servidor)
+            # RETORNAR DADOS COMPLETOS
             return {
                 "success": True,
                 "session_id": session_id,
@@ -253,9 +249,7 @@ async def load_all_shopify_data(data: Dict[str, Any]):
                 "stats": {
                     "total_products": len(all_products),
                     "total_collections": len(all_collections),
-                    "load_time": f"{elapsed_time:.2f}s",
-                    "products_with_collections": len(product_collection_map),
-                    "average_images_per_product": sum(len(p.get('images', [])) for p in all_products) / max(len(all_products), 1)
+                    "load_time": f"{elapsed_time:.2f}s"
                 }
             }
             
@@ -265,8 +259,6 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             "status": "error",
             "message": f"❌ Erro: {str(e)}"
         })
-        # Limpar imediatamente em caso de erro
-        asyncio.create_task(clear_progress_after_delay(session_id, 1))
         raise HTTPException(status_code=500, detail=str(e))
 
 async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, headers: dict, session_id: str = None):
