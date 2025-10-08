@@ -483,6 +483,7 @@ async def process_alt_text_background(
     
     clean_store = store_name.replace('.myshopify.com', '')
     
+    # Se for retomada, pegar progresso existente
     if is_resume and task_id in tasks_db:
         task = tasks_db[task_id]
         processed = task["progress"]["processed"]
@@ -501,6 +502,7 @@ async def process_alt_text_background(
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i, image_data in enumerate(csv_data[processed:], start=processed):
+            # Verificar se a tarefa foi pausada ou cancelada
             if task_id not in tasks_db:
                 logger.warning(f"⚠️ Tarefa {task_id} não existe mais")
                 return
@@ -512,8 +514,10 @@ async def process_alt_text_background(
                 return
             
             try:
+                # Renderizar template
                 final_alt_text = image_data.get('template_used', '')
                 
+                # Substituir variáveis
                 replacements = {
                     r'\{\{\s*product\.title\s*\}\}': image_data.get('product_title', ''),
                     r'\{\{\s*product\.handle\s*\}\}': image_data.get('product_handle', ''),
@@ -533,12 +537,14 @@ async def process_alt_text_background(
                 
                 final_alt_text = ' '.join(final_alt_text.split()).strip()
                 
+                # Verificar se precisa de atualização
                 if image_data.get('current_alt_text') == final_alt_text:
                     logger.info(f"ℹ️ Alt-text já correto para imagem {image_data.get('image_id')}")
                     unchanged += 1
                     processed += 1
                     continue
                 
+                # Atualizar via API Shopify
                 shopify_url = f"https://{clean_store}.myshopify.com/admin/api/2024-01/products/{image_data.get('product_id')}/images/{image_data.get('image_id')}.json"
                 
                 headers = {
@@ -584,7 +590,7 @@ async def process_alt_text_background(
                     'error': str(e)
                 })
             
-            # ✅ ATUALIZAR PROGRESSO IMEDIATAMENTE
+            # Atualizar progresso
             processed += 1
             percentage = round((processed / total) * 100)
             
@@ -601,14 +607,16 @@ async def process_alt_text_background(
                 tasks_db[task_id]["updated_at"] = get_brazil_time_str()
                 tasks_db[task_id]["results"] = results[-50:]
             
+            # Verificar novamente se foi pausado/cancelado
             if task_id in tasks_db:
                 if tasks_db[task_id].get("status") in ["paused", "cancelled"]:
                     logger.info(f"🛑 Parando após processar imagem {image_data.get('image_id')}")
                     return
             
-            # ✅ RATE LIMITING REDUZIDO: 50ms
-            await asyncio.sleep(0.05)
+            # Rate limiting
+            await asyncio.sleep(0.2)
     
+    # Finalizar
     final_status = "completed" if failed == 0 else "completed_with_errors"
     
     if task_id in tasks_db:
@@ -1055,7 +1063,7 @@ async def process_rename_images_background(
                         return
                 
                 # Rate limiting
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1.0)
         
         # Finalizar tarefa
         final_status = "completed" if failed == 0 else "completed_with_errors"
@@ -1875,7 +1883,7 @@ async def process_image_optimization_background(
                         return
                 
                 # Rate limiting
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.5)
         
         # Finalizar
         if task_id in tasks_db:
@@ -2865,7 +2873,7 @@ async def process_variants_background(
                     return
             
             # Rate limiting
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.5)
     
     except Exception as e:
         logger.error(f"❌ Erro geral no processamento de variantes: {str(e)}")
@@ -3713,10 +3721,7 @@ async def pause_task(task_id: str):
 async def resume_task(task_id: str, background_tasks: BackgroundTasks):
     """Retomar uma tarefa pausada - VERSÃO MELHORADA COM SUPORTE A VARIANTES E RENOMEAÇÃO"""
     
-    logger.info(f"▶️ Requisição para retomar tarefa: {task_id}")
-    
     if task_id not in tasks_db:
-        logger.error(f"❌ Tarefa {task_id} não encontrada")
         raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada")
     
     task = tasks_db[task_id]
@@ -3728,232 +3733,226 @@ async def resume_task(task_id: str, background_tasks: BackgroundTasks):
             "message": f"Tarefa não está pausada (status atual: {task['status']})"
         }
     
-    # ✅ Mudar status para processing
+    # Mudar status para processing
     task["status"] = "processing"
     task["resumed_at"] = get_brazil_time_str()
     task["updated_at"] = get_brazil_time_str()
     
-    # ✅ Verificar o tipo de tarefa
+    # Verificar o tipo de tarefa
     task_type = task.get("task_type", "bulk_edit")
     config = task.get("config", {})
     
     logger.info(f"▶️ Retomando tarefa {task_id} (tipo: {task_type})")
     
-    try:
-        if task_type == "variant_management":
-            # RETOMAR VARIANTES
-            all_product_ids = config.get("productIds", [])
-            processed_count = task.get("progress", {}).get("processed", 0)
-            remaining_products = all_product_ids[processed_count:]
+    if task_type == "variant_management":
+        # RETOMAR VARIANTES
+        all_product_ids = config.get("productIds", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_products = all_product_ids[processed_count:]
+        
+        logger.info(f"   Total de produtos: {len(all_product_ids)}")
+        logger.info(f"   Já processados: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_products)}")
+        
+        if len(remaining_products) > 0:
+            # Processar variantes restantes
+            background_tasks.add_task(
+                process_variants_background,
+                task_id,
+                config.get("csvContent", ""),
+                remaining_products,  # Apenas produtos restantes
+                config.get("submitData", {}),
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True  # Adicionar flag de retomada
+            )
             
-            logger.info(f"   Total de produtos: {len(all_product_ids)}")
-            logger.info(f"   Já processados: {processed_count}")
-            logger.info(f"   Restantes: {len(remaining_products)}")
+            logger.info(f"✅ Tarefa de variantes {task_id} retomada com {len(remaining_products)} produtos")
             
-            if len(remaining_products) > 0:
-                # Processar variantes restantes
-                background_tasks.add_task(
-                    process_variants_background,
-                    task_id,
-                    config.get("csvContent", ""),
-                    remaining_products,
-                    config.get("submitData", {}),
-                    config.get("storeName", ""),
-                    config.get("accessToken", ""),
-                    is_resume=True
-                )
-                
-                logger.info(f"✅ Tarefa de variantes {task_id} retomada")
-                
-                return {
-                    "success": True,
-                    "message": f"Tarefa de variantes retomada com sucesso",
-                    "task": task,
-                    "remaining": len(remaining_products)
-                }
-            else:
-                task["status"] = "completed"
-                task["completed_at"] = get_brazil_time_str()
-                
-                return {
-                    "success": True,
-                    "message": "Tarefa já estava completa",
-                    "task": task
-                }
-                
-        elif task_type == "alt_text":
-            # RETOMAR ALT-TEXT
-            all_images = config.get("csvData", [])
-            processed_count = task.get("progress", {}).get("processed", 0)
-            remaining_images = all_images[processed_count:]
-            
-            logger.info(f"   Total de imagens: {len(all_images)}")
-            logger.info(f"   Já processadas: {processed_count}")
-            logger.info(f"   Restantes: {len(remaining_images)}")
-            
-            if len(remaining_images) > 0:
-                background_tasks.add_task(
-                    process_alt_text_background,
-                    task_id,
-                    remaining_images,
-                    config.get("storeName", ""),
-                    config.get("accessToken", ""),
-                    is_resume=True
-                )
-                
-                logger.info(f"✅ Tarefa de alt-text {task_id} retomada")
-                
-                return {
-                    "success": True,
-                    "message": f"Tarefa de alt-text retomada com sucesso",
-                    "task": task,
-                    "remaining": len(remaining_images)
-                }
-            else:
-                task["status"] = "completed"
-                task["completed_at"] = get_brazil_time_str()
-                
-                return {
-                    "success": True,
-                    "message": "Tarefa já estava completa",
-                    "task": task
-                }
-                
-        elif task_type == "rename_images":
-            # RETOMAR RENOMEAÇÃO DE IMAGENS
-            all_images = config.get("images", [])
-            processed_count = task.get("progress", {}).get("processed", 0)
-            remaining_images = all_images[processed_count:]
-            
-            logger.info(f"📸 Retomando renomeação de imagens:")
-            logger.info(f"   Total de imagens: {len(all_images)}")
-            logger.info(f"   Já processadas: {processed_count}")
-            logger.info(f"   Restantes: {len(remaining_images)}")
-            
-            if len(remaining_images) > 0:
-                background_tasks.add_task(
-                    process_rename_images_background,
-                    task_id,
-                    config.get("template", ""),
-                    all_images,  # ✅ PASSAR TODAS as imagens
-                    config.get("storeName", ""),
-                    config.get("accessToken", ""),
-                    is_resume=True
-                )
-                
-                logger.info(f"✅ Tarefa de renomeação {task_id} retomada")
-                
-                return {
-                    "success": True,
-                    "message": f"Tarefa de renomeação retomada com sucesso",
-                    "task": task,
-                    "remaining": len(remaining_images),
-                    "progress": task.get("progress")
-                }
-            else:
-                task["status"] = "completed"
-                task["completed_at"] = get_brazil_time_str()
-                
-                return {
-                    "success": True,
-                    "message": "Tarefa já estava completa",
-                    "task": task
-                }
-                
-        elif task_type == "image_optimization":
-            # RETOMAR OTIMIZAÇÃO DE IMAGENS
-            all_images = config.get("images", [])
-            processed_count = task.get("progress", {}).get("processed", 0)
-            remaining_count = len(all_images) - processed_count
-            
-            target_height = config.get("targetHeight")
-            if not target_height:
-                logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
-                return {
-                    "success": False,
-                    "message": "targetHeight não configurado na tarefa"
-                }
-            
-            logger.info(f"🖼️ Retomando otimização de imagens:")
-            logger.info(f"   Total de imagens: {len(all_images)}")
-            logger.info(f"   Já processadas: {processed_count}")
-            logger.info(f"   Restantes: {remaining_count}")
-            
-            if remaining_count > 0:
-                background_tasks.add_task(
-                    process_image_optimization_background,
-                    task_id,
-                    all_images,  # ✅ PASSAR TODAS as imagens
-                    target_height,
-                    config.get("storeName", ""),
-                    config.get("accessToken", ""),
-                    is_resume=True
-                )
-                
-                logger.info(f"✅ Tarefa de otimização {task_id} retomada")
-                
-                return {
-                    "success": True,
-                    "message": f"Tarefa de otimização retomada com sucesso",
-                    "task": task,
-                    "remaining": remaining_count,
-                    "progress": task.get("progress")
-                }
-            else:
-                task["status"] = "completed"
-                task["completed_at"] = get_brazil_time_str()
-                
-                return {
-                    "success": True,
-                    "message": "Tarefa já estava completa",
-                    "task": task
-                }
+            return {
+                "success": True,
+                "message": f"Tarefa de variantes retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_products)
+            }
         else:
-            # RETOMAR BULK EDIT NORMAL
-            all_product_ids = config.get("productIds", [])
-            processed_count = task.get("progress", {}).get("processed", 0)
-            remaining_products = all_product_ids[processed_count:]
+            # Se não há produtos restantes, marcar como completa
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
             
-            logger.info(f"   Total de produtos: {len(all_product_ids)}")
-            logger.info(f"   Já processados: {processed_count}")
-            logger.info(f"   Restantes: {len(remaining_products)}")
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
+    elif task_type == "alt_text":
+        # RETOMAR ALT-TEXT
+        all_images = config.get("csvData", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_images = all_images[processed_count:]
+        
+        logger.info(f"   Total de imagens: {len(all_images)}")
+        logger.info(f"   Já processadas: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_images)}")
+        
+        if len(remaining_images) > 0:
+            background_tasks.add_task(
+                process_alt_text_background,
+                task_id,
+                remaining_images,
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True
+            )
             
-            if len(remaining_products) > 0:
-                background_tasks.add_task(
-                    process_products_background,
-                    task_id,
-                    remaining_products,
-                    config.get("operations", []),
-                    config.get("storeName", ""),
-                    config.get("accessToken", ""),
-                    is_resume=True
-                )
-                
-                logger.info(f"✅ Tarefa {task_id} retomada")
-                
-                return {
-                    "success": True,
-                    "message": f"Tarefa retomada com sucesso",
-                    "task": task,
-                    "remaining": len(remaining_products)
-                }
-            else:
-                task["status"] = "completed"
-                task["completed_at"] = get_brazil_time_str()
-                
-                return {
-                    "success": True,
-                    "message": "Tarefa já estava completa",
-                    "task": task
-                }
-                
-    except Exception as e:
-        logger.error(f"❌ Erro ao retomar tarefa {task_id}: {str(e)}")
-        task["status"] = "paused"  # Reverter para pausado
-        return {
-            "success": False,
-            "message": f"Erro ao retomar tarefa: {str(e)}"
-        }
+            logger.info(f"✅ Tarefa de alt-text {task_id} retomada com {len(remaining_images)} imagens")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de alt-text retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_images)
+            }
+        else:
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
+    elif task_type == "rename_images":
+        # RETOMAR RENOMEAÇÃO DE IMAGENS
+        all_images = config.get("images", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_images = all_images[processed_count:]
+        
+        logger.info(f"📸 Retomando renomeação de imagens:")
+        logger.info(f"   Total de imagens: {len(all_images)}")
+        logger.info(f"   Já processadas: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_images)}")
+        
+        if len(remaining_images) > 0:
+            # Retomar processamento das imagens restantes
+            background_tasks.add_task(
+                process_rename_images_background,
+                task_id,
+                config.get("template", ""),
+                remaining_images,
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True
+            )
+            
+            logger.info(f"✅ Tarefa de renomeação {task_id} retomada com {len(remaining_images)} imagens")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de renomeação retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_images),
+                "progress": task.get("progress")
+            }
+        else:
+            # Se não há imagens restantes, marcar como completa
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
+    elif task_type == "image_optimization":
+        # RETOMAR OTIMIZAÇÃO DE IMAGENS
+        all_images = config.get("images", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_count = len(all_images) - processed_count
+        
+        # PEGAR targetHeight DO CONFIG!
+        target_height = config.get("targetHeight")
+        if not target_height:
+            logger.error(f"❌ targetHeight não encontrado no config da tarefa {task_id}")
+            return {
+                "success": False,
+                "message": "targetHeight não configurado na tarefa"
+            }
+        
+        logger.info(f"🖼️ Retomando otimização de imagens:")
+        logger.info(f"   Total de imagens: {len(all_images)}")
+        logger.info(f"   Já processadas: {processed_count}")
+        logger.info(f"   Restantes: {remaining_count}")
+        logger.info(f"   Altura alvo: {target_height}px")
+        
+        if remaining_count > 0:
+            # IMPORTANTE: Passar TODAS as imagens, não apenas as restantes
+            background_tasks.add_task(
+                process_image_optimization_background,
+                task_id,
+                all_images,  # Passar TODAS as imagens
+                target_height,
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True  # Flag para indicar retomada
+            )
+            
+            logger.info(f"✅ Tarefa de otimização {task_id} retomada com {remaining_count} imagens restantes")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa de otimização retomada com sucesso",
+                "task": task,
+                "remaining": remaining_count,
+                "progress": task.get("progress")
+            }
+        else:
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
+    else:
+        # RETOMAR BULK EDIT NORMAL
+        all_product_ids = config.get("productIds", [])
+        processed_count = task.get("progress", {}).get("processed", 0)
+        remaining_products = all_product_ids[processed_count:]
+        
+        logger.info(f"   Total de produtos: {len(all_product_ids)}")
+        logger.info(f"   Já processados: {processed_count}")
+        logger.info(f"   Restantes: {len(remaining_products)}")
+        
+        if len(remaining_products) > 0:
+            background_tasks.add_task(
+                process_products_background,
+                task_id,
+                remaining_products,
+                config.get("operations", []),
+                config.get("storeName", ""),
+                config.get("accessToken", ""),
+                is_resume=True
+            )
+            
+            logger.info(f"✅ Tarefa {task_id} retomada com {len(remaining_products)} produtos")
+            
+            return {
+                "success": True,
+                "message": f"Tarefa retomada com sucesso",
+                "task": task,
+                "remaining": len(remaining_products)
+            }
+        else:
+            task["status"] = "completed"
+            task["completed_at"] = get_brazil_time_str()
+            
+            return {
+                "success": True,
+                "message": "Tarefa já estava completa",
+                "task": task
+            }
 
 # ==================== CANCELAR TAREFAS ====================
 
@@ -3985,34 +3984,69 @@ async def cancel_task(task_id: str):
         "task": task
     }
 
+@app.post("/task-cancel/{task_id}")
+async def cancel_task_alt(task_id: str):
+    """Endpoint alternativo para cancelar tarefa (compatibilidade)"""
+    return await cancel_task(task_id)
+
 # ==================== LISTAR TAREFAS ====================
 
 @app.get("/tasks")
 async def list_tasks_simple():
-    """Endpoint /tasks - RETORNA APENAS TAREFAS ATIVAS (processing, running, paused)"""
+    """Endpoint simples /tasks para compatibilidade - OTIMIZADO PARA TASKSRUNNING"""
+    # RETORNAR APENAS TAREFAS ATIVAS E RECENTES!
     active_tasks = []
+    recent_completed = []
+    
+    now = datetime.now()
     
     for task_id, task in tasks_db.items():
         status = task.get("status")
         
-        # ✅ FILTRAR: Apenas tarefas REALMENTE ATIVAS
-        # NÃO incluir: completed, completed_with_errors, failed, cancelled
-        if status in ["processing", "running", "paused"]:
+        # Sempre incluir tarefas ativas
+        if status in ["processing", "running", "paused", "scheduled"]:
             active_tasks.append(task)
-        else:
-            # Log para debug
-            logger.debug(f"⏭️ Ignorando tarefa {task_id} com status: {status}")
+        # Incluir tarefas completadas das últimas 2 horas apenas
+        elif status in ["completed", "completed_with_errors", "failed", "cancelled"]:
+            completed_at = task.get("completed_at") or task.get("updated_at")
+            if completed_at:
+                try:
+                    completed_time = datetime.fromisoformat(completed_at.replace('Z', ''))
+                    # Só incluir se foi completada nas últimas 2 horas
+                    if (now - completed_time).total_seconds() < 7200:  # 2 horas
+                        # Criar versão simplificada da tarefa completada
+                        simplified_task = {
+                            "id": task["id"],
+                            "name": task.get("name"),
+                            "status": task["status"],
+                            "task_type": task.get("task_type", "bulk_edit"),
+                            "progress": task.get("progress", {}),
+                            "started_at": task.get("started_at"),
+                            "completed_at": task.get("completed_at"),
+                            "updated_at": task.get("updated_at"),
+                            # NÃO incluir config completo ou results grandes
+                            "config": {
+                                "itemCount": task.get("config", {}).get("itemCount", 0)
+                            },
+                            # Limitar results a 5 últimos
+                            "results": task.get("results", [])[-5:] if "results" in task else []
+                        }
+                        recent_completed.append(simplified_task)
+                except:
+                    pass
     
-    # Ordenar por updated_at (mais recentes primeiro)
-    active_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    # Combinar tarefas ativas e recentes
+    tasks_list = active_tasks + recent_completed
     
-    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas (processing, running, paused)")
-    logger.info(f"📊 Total de tarefas no banco: {len(tasks_db)}")
+    # Ordenar por updated_at
+    tasks_list.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    
+    logger.info(f"📋 Retornando {len(active_tasks)} tarefas ativas e {len(recent_completed)} recentes")
     
     return {
         "success": True,
-        "tasks": active_tasks,
-        "total": len(active_tasks)
+        "tasks": tasks_list,
+        "total": len(tasks_list)
     }
 
 @app.get("/api/tasks/all")
@@ -4222,9 +4256,19 @@ async def get_task_status(task_id: str):
     """Verificar status detalhado da tarefa"""
     
     if task_id not in tasks_db:
-        logger.info(f"📊 Tarefa {task_id} não encontrada (já foi limpa ou não existe)")
-        # ✅ RETORNAR 404 AO INVÉS DE 200 COM "not_found"
-        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+        logger.warning(f"⚠️ Tarefa {task_id} não encontrada")
+        return {
+            "id": task_id,
+            "status": "not_found",
+            "message": "Tarefa não encontrada",
+            "progress": {
+                "processed": 0,
+                "total": 0,
+                "successful": 0,
+                "failed": 0,
+                "percentage": 0
+            }
+        }
     
     task = tasks_db[task_id]
     logger.info(f"📊 Status: {task['status']} - {task['progress']['percentage']}%")
@@ -4423,7 +4467,7 @@ async def process_products_background(
     access_token: str,
     is_resume: bool = False
 ):
-    """PROCESSAR PRODUTOS EM BACKGROUND - VERSÃO COM ATUALIZAÇÃO EM TEMPO REAL"""
+    """PROCESSAR PRODUTOS EM BACKGROUND - VERSÃO MELHORADA"""
     if not is_resume:
         logger.info(f"🚀 INICIANDO PROCESSAMENTO: {task_id}")
     else:
@@ -4489,7 +4533,7 @@ async def process_products_background(
                 # PEGAR O TÍTULO DO PRODUTO
                 product_title = current_product.get("title", "Sem título")
                 
-                # ✅ ATUALIZAR PROGRESSO COM TÍTULO ANTES DE PROCESSAR
+                # ATUALIZAR PROGRESSO COM TÍTULO ANTES DE PROCESSAR
                 if task_id in tasks_db:
                     tasks_db[task_id]["progress"]["current_product"] = product_title
                     tasks_db[task_id]["updated_at"] = get_brazil_time_str()
@@ -4588,7 +4632,7 @@ async def process_products_background(
                 }
                 logger.error(f"❌ Exceção: {str(e)}")
             
-            # ✅ ATUALIZAR PROGRESSO **IMEDIATAMENTE** APÓS CADA PRODUTO
+            # Atualizar progresso
             results.append(result)
             processed += 1
             percentage = round((processed / total) * 100)
@@ -4612,8 +4656,8 @@ async def process_products_background(
                     logger.info(f"🛑 Parando após processar {product_id}")
                     return
             
-            # ✅ RATE LIMITING MÍNIMO - APENAS 50ms (0.05s)
-            await asyncio.sleep(0.05)
+            # Rate limiting
+            await asyncio.sleep(0.3)
     
     # Finalizar
     final_status = "completed" if failed == 0 else "completed_with_errors"
@@ -4762,8 +4806,6 @@ async def startup_event():
     logger.info("🧹 Sistema de limpeza automática de memória iniciado")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🚀 Railway Shopify Processor v3.0 iniciado na porta {port}")
-    logger.info(f"✅ Sistema completo de gerenciamento de tarefas ativo!")
-    logger.info(f"📋 Funcionalidades: Agendar, Processar, Pausar, Retomar, Cancelar")
+    port = int(os.environ.get("PORT", 10000))  # Mudei para 10000 como padrão
+    logger.info(f"🚀 Iniciando na porta {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
