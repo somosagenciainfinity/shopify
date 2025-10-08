@@ -75,7 +75,7 @@ CACHE_TTL = 300  # 5 minutos
 
 # ==================== PROXY INTELIGENTE COM CACHE E CARREGAMENTO COMPLETO ====================
 
-@app.all("/proxy")
+@app.api_route("/proxy", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_endpoint(
     request: Request,
     url: str = Query(None, description="Target URL")
