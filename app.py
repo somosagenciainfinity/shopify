@@ -69,14 +69,11 @@ manager = ConnectionManager()
 # Armazenar tarefas em memória
 tasks_db = {}
 
-# ADICIONAR AQUI - Variável global para progresso de carregamento
-loading_progress = {}
-
 # Cache em memória para requisições
 request_cache = {}
 CACHE_TTL = 300  # 5 minutos
 
-# ==================== PROXY INTELIGENTE COM CACHE E CARREGAMENTO COMPLETO ====================
+# ==================== PROXY INTELIGENTE COM CACHE ====================
 
 @app.api_route("/proxy", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_endpoint(
@@ -91,7 +88,6 @@ async def proxy_endpoint(
     logger.info(f"[PROXY] {request.method} {url}")
     
     try:
-        # Headers para bypass Cloudflare
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
@@ -99,24 +95,16 @@ async def proxy_endpoint(
             'Accept-Encoding': 'gzip, deflate, br',
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
-            'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"Windows"',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Origin': 'https://admin.shopify.com',
             'Referer': 'https://admin.shopify.com/'
         }
         
-        # Adicionar token se existir
         token = request.headers.get('x-shopify-access-token')
         if token:
             headers['X-Shopify-Access-Token'] = token
             logger.info('[PROXY] Token detected')
         
-        # Pegar body se existir
         body = None
         if request.method in ['POST', 'PUT', 'PATCH']:
             try:
@@ -135,7 +123,6 @@ async def proxy_endpoint(
             
             logger.info(f"[PROXY] Response status: {response.status_code}")
             
-            # Retornar resposta preservando headers importantes
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -149,12 +136,13 @@ async def proxy_endpoint(
         logger.error(f"[PROXY ERROR] {str(e)}")
         raise HTTPException(status_code=500, detail=f"Proxy failed: {str(e)}")
 
-# ==================== CARREGAMENTO COMPLETO E OTIMIZADO DE PRODUTOS E COLEÇÕES ====================
+# ==================== CARREGAMENTO COM STREAMING (ÚNICO E SEGURO) ====================
 
 @app.post("/api/shopify/load-all-data")
-async def load_all_shopify_data(data: Dict[str, Any]):
+async def load_all_shopify_data_stream(data: Dict[str, Any]):
     """
-    Carrega TODOS os produtos e coleções com progresso REAL
+    Carrega produtos em STREAMING sem explodir a memória
+    Envia dados em chunks conforme carrega - SEGURO para plano FREE
     """
     
     store_name = data.get("store_name", "")
@@ -165,519 +153,278 @@ async def load_all_shopify_data(data: Dict[str, Any]):
     
     clean_store = store_name.replace('.myshopify.com', '').strip()
     
-    # Criar ID único para esta sessão
-    session_id = f"{clean_store}_{int(time.time())}"
-    
-    # Inicializar progresso
-    loading_progress[session_id] = {
-        "status": "starting",
-        "message": "Iniciando carregamento...",
-        "products_loaded": 0,
-        "collections_loaded": 0,
-        "current_phase": "initialization"
-    }
-    
-    logger.info(f"🚀 Iniciando carregamento para {clean_store} - Session: {session_id}")
-    
-    start_time = time.time()
-    
-    try:
-        async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
-            headers = {
-                'X-Shopify-Access-Token': access_token,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            
-            # ============ FASE 1: Carregar Coleções ============
-            loading_progress[session_id].update({
-                "current_phase": "collections",
-                "message": "📦 Carregando coleções..."
-            })
-            
-            all_collections = await load_all_collections_optimized(client, clean_store, headers, session_id)
-            loading_progress[session_id]["collections_loaded"] = len(all_collections)
-            
-            # ============ FASE 2: Carregar Produtos ============
-            loading_progress[session_id].update({
-                "current_phase": "products", 
-                "message": "🛍️ Carregando produtos..."
-            })
-            
-            all_products = await load_all_products_optimized(client, clean_store, headers, session_id)
-            loading_progress[session_id]["products_loaded"] = len(all_products)
-            
-            # ============ FASE 3: Processar relacionamentos ============
-            loading_progress[session_id].update({
-                "current_phase": "processing",
-                "message": "🔗 Processando relacionamentos..."
-            })
-            
-            collection_product_counts = {}
-            product_collection_map = {}
-            
-            for product in all_products:
-                if product.get('collection_ids'):
-                    product_collection_map[product['id']] = product['collection_ids']
-                    for collection_id in product['collection_ids']:
-                        collection_product_counts[collection_id] = collection_product_counts.get(collection_id, 0) + 1
-            
-            for collection in all_collections:
-                collection['products_count'] = collection_product_counts.get(collection['id'], 0)
-            
-            elapsed_time = time.time() - start_time
-            
-            # Atualizar status final
-            loading_progress[session_id].update({
-                "status": "completed",
-                "current_phase": "completed",
-                "message": f"✅ Carregamento completo!"
-            })
-            
-            # Limpar progresso após 30 segundos
-            asyncio.create_task(clear_progress_after_delay(session_id, 30))
-            
-            logger.info(f"🏁 Carregamento completo em {elapsed_time:.2f} segundos")
-            
-            # RETORNAR DADOS COMPLETOS
-            return {
-                "success": True,
-                "session_id": session_id,
-                "products": all_products,
-                "collections": all_collections,
-                "product_collection_map": product_collection_map,
-                "stats": {
-                    "total_products": len(all_products),
-                    "total_collections": len(all_collections),
-                    "load_time": f"{elapsed_time:.2f}s"
+    async def generate():
+        """Generator que produz dados em chunks para não usar memória"""
+        
+        try:
+            async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
+                headers = {
+                    'X-Shopify-Access-Token': access_token,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
                 }
-            }
-            
-    except Exception as e:
-        logger.error(f"❌ Erro no carregamento: {str(e)}")
-        loading_progress[session_id].update({
-            "status": "error",
-            "message": f"❌ Erro: {str(e)}"
-        })
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, headers: dict, session_id: str = None):
-    """Carrega todas as coleções usando GraphQL de forma otimizada"""
-    
-    all_collections = []
-    cursor = None
-    batch_count = 0
-    
-    while True:
-        batch_count += 1
-        
-        query = """
-        query($cursor: String) {
-          collections(first: 250, after: $cursor) {
-            edges {
-              node {
-                id
-                title
-                handle
-                description
-                productsCount {
-                  count
-                }
-                image {
-                  url
-                  altText
-                }
-                sortOrder
-              }
-            }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-          }
-        }
-        """
-        
-        graphql_url = f"https://{store}.myshopify.com/admin/api/2024-10/graphql.json"
-        
-        response = await client.post(
-            graphql_url,
-            headers=headers,
-            json={"query": query, "variables": {"cursor": cursor}}
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Erro GraphQL: {response.status_code}")
-            break
-        
-        result = response.json()
-        
-        if 'errors' in result:
-            logger.error(f"Erros GraphQL: {result['errors']}")
-            break
-        
-        collections_data = result.get('data', {}).get('collections')
-        if not collections_data:
-            break
-        
-        for edge in collections_data['edges']:
-            node = edge['node']
-            collection = {
-                'id': int(node['id'].split('/')[-1]),
-                'title': node['title'],
-                'handle': node['handle'],
-                'description': node['description'] or '',
-                'products_count': node.get('productsCount', {}).get('count', 0),
-                'image': {
-                    'url': node['image']['url'],
-                    'alt': node['image']['altText']
-                } if node.get('image') else None,
-                'sort_order': node.get('sortOrder')
-            }
-            all_collections.append(collection)
-        
-        # ATUALIZAR PROGRESSO REAL
-        if session_id and session_id in loading_progress:
-            loading_progress[session_id].update({
-                "collections_loaded": len(all_collections),
-                "message": f"📦 {len(all_collections)} coleções carregadas..."
-            })
-        
-        if not collections_data['pageInfo']['hasNextPage']:
-            break
-        
-        cursor = collections_data['pageInfo']['endCursor']
-        
-        # Rate limiting suave
-        await asyncio.sleep(0.1)
-    
-    return all_collections
-
-async def load_all_products_optimized(client: httpx.AsyncClient, store: str, headers: dict, session_id: str = None):
-    """Carrega todos os produtos usando GraphQL com paralelização inteligente"""
-    
-    all_products = []
-    cursor = None
-    batch_count = 0
-    max_retries = 3
-    
-    while True:
-        batch_count += 1
-        retry_count = 0
-        
-        # AUMENTAR O BATCH SIZE E ADICIONAR RETRY
-        query = """
-        query($cursor: String) {
-          products(first: 250, after: $cursor) {
-            edges {
-              node {
-                id
-                title
-                handle
-                status
-                createdAt
-                updatedAt
-                productType
-                vendor
-                tags
-                description
-                descriptionHtml
-                publishedAt
-                seo {
-                  title
-                  description
-                }
-                featuredImage {
-                  id
-                  url
-                  altText
-                  width
-                  height
-                }
-                images(first: 20) {
-                  edges {
-                    node {
-                      id
-                      url
-                      altText
-                      width
-                      height
-                    }
-                  }
-                }
-                collections(first: 50) {
-                  edges {
-                    node {
-                      id
-                      title
-                      handle
-                    }
-                  }
-                }
-                options {
-                  id
-                  name
-                  position
-                  values
-                }
-                variants(first: 100) {
-                  edges {
-                    node {
-                      id
-                      title
-                      price
-                      compareAtPrice
-                      inventoryQuantity
-                      inventoryItem {
-                        tracked
-                      }
-                      sku
-                      barcode
-                      taxable
-                      selectedOptions {
-                        name
-                        value
-                      }
-                      image {
-                        id
-                        url
-                        altText
-                      }
-                    }
-                  }
-                }
-                totalInventory
-                tracksInventory
-                totalVariants
-              }
-            }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-          }
-        }
-        """
-        
-        graphql_url = f"https://{store}.myshopify.com/admin/api/2024-10/graphql.json"
-        
-        while retry_count < max_retries:
-            try:
-                response = await client.post(
-                    graphql_url,
-                    headers=headers,
-                    json={"query": query, "variables": {"cursor": cursor}}
-                )
                 
-                if response.status_code == 200:
-                    break
-                elif response.status_code == 429:  # Rate limit
-                    retry_count += 1
-                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
-                    continue
-                else:
-                    logger.error(f"Erro GraphQL: {response.status_code}")
-                    break
-            except Exception as e:
-                logger.error(f"Erro na requisição: {e}")
-                retry_count += 1
-                if retry_count >= max_retries:
-                    break
-                await asyncio.sleep(2 ** retry_count)
-        
-        if response.status_code != 200:
-            logger.error(f"Falha após {max_retries} tentativas")
-            break
-        
-        result = response.json()
-        
-        if 'errors' in result:
-            logger.error(f"Erros GraphQL: {result['errors']}")
-            # NÃO PARAR AQUI - tentar continuar se possível
-            if 'data' not in result:
-                break
-        
-        products_data = result.get('data', {}).get('products')
-        if not products_data:
-            logger.warning(f"Sem dados de produtos no batch {batch_count}")
-            break
-        
-        # Processar produtos em batch
-        batch_products = []
-        for edge in products_data.get('edges', []):
-            if edge and 'node' in edge:
-                try:
-                    product = process_product_node(edge['node'])
-                    batch_products.append(product)
-                except Exception as e:
-                    logger.error(f"Erro ao processar produto: {e}")
-                    continue
-        
-        if batch_products:
-            all_products.extend(batch_products)
-            
-            # ATUALIZAR PROGRESSO REAL DE PRODUTOS
-            if session_id and session_id in loading_progress:
-                loading_progress[session_id].update({
-                    "products_loaded": len(all_products),
-                    "message": f"🛍️ {len(all_products)} produtos carregados..."
-                })
-            
-            logger.info(f"📦 Batch {batch_count}: {len(batch_products)} produtos (Total: {len(all_products)})")
-        
-        # IMPORTANTE: Verificar pageInfo corretamente
-        page_info = products_data.get('pageInfo', {})
-        has_next = page_info.get('hasNextPage', False)
-        next_cursor = page_info.get('endCursor')
-        
-        logger.info(f"   PageInfo: hasNextPage={has_next}, cursor={next_cursor[:20] if next_cursor else 'None'}...")
-        
-        if not has_next or not next_cursor:
-            logger.info(f"🏁 Fim da paginação. Total de produtos: {len(all_products)}")
-            break
-        
-        cursor = next_cursor
-        
-        # Rate limiting dinâmico - mais conservador
-        delay = 0.5  # Delay fixo de 500ms entre batches
-        await asyncio.sleep(delay)
+                # Enviar início
+                yield json.dumps({"type": "start", "message": "Iniciando carregamento"}) + "\n"
+                
+                # ============ CARREGAR COLEÇÕES ============
+                all_collections = []
+                cursor = None
+                
+                while True:
+                    query = """
+                    query($cursor: String) {
+                      collections(first: 50, after: $cursor) {
+                        edges {
+                          node {
+                            id
+                            title
+                            handle
+                            description
+                            productsCount {
+                              count
+                            }
+                            image {
+                              url
+                              altText
+                            }
+                          }
+                        }
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                      }
+                    }
+                    """
+                    
+                    graphql_url = f"https://{clean_store}.myshopify.com/admin/api/2024-10/graphql.json"
+                    response = await client.post(
+                        graphql_url,
+                        headers=headers,
+                        json={"query": query, "variables": {"cursor": cursor}}
+                    )
+                    
+                    if response.status_code != 200:
+                        break
+                    
+                    result = response.json()
+                    collections_data = result.get('data', {}).get('collections')
+                    
+                    if not collections_data:
+                        break
+                    
+                    for edge in collections_data['edges']:
+                        node = edge['node']
+                        collection = {
+                            'id': int(node['id'].split('/')[-1]),
+                            'title': node['title'],
+                            'handle': node['handle'],
+                            'description': node.get('description', ''),
+                            'products_count': node.get('productsCount', {}).get('count', 0),
+                            'image': {
+                                'url': node['image']['url'],
+                                'alt': node['image']['altText']
+                            } if node.get('image') else None
+                        }
+                        all_collections.append(collection)
+                    
+                    if not collections_data['pageInfo']['hasNextPage']:
+                        break
+                    
+                    cursor = collections_data['pageInfo']['endCursor']
+                    await asyncio.sleep(0.1)
+                
+                # Enviar coleções
+                yield json.dumps({
+                    "type": "collections",
+                    "data": all_collections,
+                    "count": len(all_collections)
+                }) + "\n"
+                
+                logger.info(f"✅ {len(all_collections)} coleções carregadas")
+                
+                # ============ CARREGAR PRODUTOS EM CHUNKS ============
+                cursor = None
+                batch_num = 0
+                total_products = 0
+                product_collection_map = {}
+                
+                while True:
+                    batch_num += 1
+                    
+                    # Query SIMPLIFICADA para economizar memória
+                    query = """
+                    query($cursor: String) {
+                      products(first: 50, after: $cursor) {
+                        edges {
+                          node {
+                            id
+                            title
+                            handle
+                            status
+                            productType
+                            vendor
+                            tags
+                            description
+                            featuredImage {
+                              url
+                              altText
+                            }
+                            collections(first: 10) {
+                              edges {
+                                node {
+                                  id
+                                }
+                              }
+                            }
+                            variants(first: 20) {
+                              edges {
+                                node {
+                                  id
+                                  title
+                                  price
+                                  compareAtPrice
+                                  inventoryQuantity
+                                  sku
+                                  barcode
+                                }
+                              }
+                            }
+                            images(first: 10) {
+                              edges {
+                                node {
+                                  url
+                                  altText
+                                }
+                              }
+                            }
+                          }
+                        }
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                      }
+                    }
+                    """
+                    
+                    response = await client.post(
+                        graphql_url,
+                        headers=headers,
+                        json={"query": query, "variables": {"cursor": cursor}}
+                    )
+                    
+                    if response.status_code != 200:
+                        logger.error(f"Erro GraphQL: {response.status_code}")
+                        break
+                    
+                    result = response.json()
+                    products_data = result.get('data', {}).get('products')
+                    
+                    if not products_data:
+                        break
+                    
+                    # Processar produtos do batch
+                    batch_products = []
+                    for edge in products_data['edges']:
+                        node = edge['node']
+                        
+                        # Coleções do produto
+                        collection_ids = []
+                        for coll_edge in node.get('collections', {}).get('edges', []):
+                            coll_id = int(coll_edge['node']['id'].split('/')[-1])
+                            collection_ids.append(coll_id)
+                        
+                        # Produto SIMPLIFICADO
+                        product = {
+                            'id': int(node['id'].split('/')[-1]),
+                            'title': node['title'],
+                            'handle': node['handle'],
+                            'status': node.get('status', ''),
+                            'product_type': node.get('productType', ''),
+                            'vendor': node.get('vendor', ''),
+                            'tags': ', '.join(node.get('tags', [])) if isinstance(node.get('tags'), list) else node.get('tags', ''),
+                            'description': node.get('description', ''),
+                            'collection_ids': collection_ids,
+                            'featured_image': {
+                                'url': reconstruct_original_url(node.get('featuredImage', {}).get('url')) if node.get('featuredImage') else None,
+                                'alt': node.get('featuredImage', {}).get('altText', '') if node.get('featuredImage') else ''
+                            } if node.get('featuredImage') else None,
+                            'images': [],
+                            'variants': []
+                        }
+                        
+                        # Adicionar imagens
+                        for img_edge in node.get('images', {}).get('edges', []):
+                            img = img_edge['node']
+                            product['images'].append({
+                                'url': reconstruct_original_url(img['url']),
+                                'src': reconstruct_original_url(img['url']),
+                                'alt': img.get('altText', '')
+                            })
+                        
+                        # Adicionar variantes
+                        for var_edge in node.get('variants', {}).get('edges', []):
+                            var = var_edge['node']
+                            product['variants'].append({
+                                'id': int(var['id'].split('/')[-1]),
+                                'title': var['title'],
+                                'price': var['price'],
+                                'compare_at_price': var.get('compareAtPrice'),
+                                'inventory_quantity': var.get('inventoryQuantity', 0),
+                                'sku': var.get('sku', ''),
+                                'barcode': var.get('barcode', '')
+                            })
+                        
+                        batch_products.append(product)
+                        
+                        # Mapa de produtos-coleções
+                        if collection_ids:
+                            product_collection_map[product['id']] = collection_ids
+                    
+                    total_products += len(batch_products)
+                    
+                    # ENVIAR CHUNK DE PRODUTOS
+                    yield json.dumps({
+                        "type": "products_chunk",
+                        "batch": batch_num,
+                        "data": batch_products,
+                        "total_so_far": total_products
+                    }) + "\n"
+                    
+                    logger.info(f"📦 Chunk {batch_num}: {len(batch_products)} produtos (Total: {total_products})")
+                    
+                    if not products_data['pageInfo']['hasNextPage']:
+                        break
+                    
+                    cursor = products_data['pageInfo']['endCursor']
+                    
+                    # Pequena pausa para não sobrecarregar
+                    await asyncio.sleep(0.2)
+                
+                # Enviar mapa de coleções
+                yield json.dumps({
+                    "type": "collection_map",
+                    "data": product_collection_map
+                }) + "\n"
+                
+                # Enviar conclusão
+                yield json.dumps({
+                    "type": "complete",
+                    "total_products": total_products,
+                    "total_collections": len(all_collections)
+                }) + "\n"
+                
+                logger.info(f"✅ Streaming completo: {total_products} produtos")
+                
+        except Exception as e:
+            logger.error(f"❌ Erro no streaming: {str(e)}")
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
     
-    logger.info(f"✅ Total final de produtos carregados: {len(all_products)}")
-    return all_products
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
-# ADICIONAR ESTAS DUAS NOVAS FUNÇÕES APÓS load_all_products_optimized:
-
-async def clear_progress_after_delay(session_id: str, delay: int):
-    """Limpar progresso da memória após delay"""
-    await asyncio.sleep(delay)
-    if session_id in loading_progress:
-        del loading_progress[session_id]
-        logger.info(f"🧹 Progresso da sessão {session_id} removido da memória")
-
-@app.get("/api/shopify/loading-progress/{session_id}")
-async def get_loading_progress(session_id: str):
-    """Endpoint para consultar progresso do carregamento"""
-    if session_id not in loading_progress:
-        return {"status": "not_found", "message": "Sessão não encontrada"}
-    
-    return loading_progress[session_id]
-
-def process_product_node(node):
-    """Processa um nó de produto do GraphQL para o formato esperado"""
-    
-    # Processar imagens e reconstruir URLs originais
-    images = []
-    for img_edge in node.get('images', {}).get('edges', []):
-        img = img_edge['node']
-        original_url = reconstruct_original_url(img['url'])
-        images.append({
-            'id': int(img['id'].split('/')[-1]),
-            'url': original_url,
-            'src': original_url,
-            'alt': img.get('altText', ''),
-            'width': img.get('width', 0),
-            'height': img.get('height', 0)
-        })
-    
-    # Processar imagem principal
-    featured_image = None
-    if node.get('featuredImage'):
-        feat = node['featuredImage']
-        featured_image = {
-            'id': int(feat['id'].split('/')[-1]) if feat.get('id') else None,
-            'url': reconstruct_original_url(feat['url']),
-            'src': reconstruct_original_url(feat['url']),
-            'alt': feat.get('altText', ''),
-            'width': feat.get('width', 0),
-            'height': feat.get('height', 0)
-        }
-    
-    # Processar coleções
-    collection_ids = []
-    for coll_edge in node.get('collections', {}).get('edges', []):
-        coll_id = int(coll_edge['node']['id'].split('/')[-1])
-        collection_ids.append(coll_id)
-    
-    # Processar opções
-    options = []
-    for opt in node.get('options', []):
-        options.append({
-            'id': int(opt['id'].split('/')[-1]),
-            'name': opt['name'],
-            'position': opt.get('position', 1),
-            'values': opt.get('values', [])
-        })
-    
-    # Processar variantes
-    variants = []
-    for var_edge in node.get('variants', {}).get('edges', []):
-        var = var_edge['node']
-        
-        # Extrair opções selecionadas
-        option1, option2, option3 = None, None, None
-        for i, sel_opt in enumerate(var.get('selectedOptions', [])):
-            if i == 0:
-                option1 = sel_opt['value']
-            elif i == 1:
-                option2 = sel_opt['value']
-            elif i == 2:
-                option3 = sel_opt['value']
-        
-        variants.append({
-            'id': int(var['id'].split('/')[-1]),
-            'title': var['title'],
-            'price': var['price'],
-            'compare_at_price': var.get('compareAtPrice'),
-            'inventory_quantity': var.get('inventoryQuantity', 0),
-            'inventory_management': 'shopify' if var.get('inventoryItem', {}).get('tracked') else None,
-            'inventory_policy': 'deny',
-            'sku': var.get('sku', ''),
-            'barcode': var.get('barcode', ''),
-            'weight': 0,
-            'weight_unit': 'kg',
-            'requires_shipping': True,
-            'taxable': var.get('taxable', True),
-            'option1': option1,
-            'option2': option2,
-            'option3': option3,
-            'grams': 0,
-            'image_id': int(var['image']['id'].split('/')[-1]) if var.get('image') and var['image'].get('id') else None,
-            'cost': None,
-            'fulfillment_service': 'manual'
-        })
-    
-    # Traduzir status
-    status_map = {
-        'ACTIVE': 'ATIVO',
-        'DRAFT': 'RASCUNHO',
-        'ARCHIVED': 'ARQUIVADO'
-    }
-    
-    return {
-        'id': int(node['id'].split('/')[-1]),
-        'title': node['title'],
-        'handle': node['handle'],
-        'status': status_map.get(node.get('status', '').upper(), node.get('status', '')),
-        'status_original': node.get('status', ''),
-        'created_at': node.get('createdAt'),
-        'updated_at': node.get('updatedAt'),
-        'published_at': node.get('publishedAt'),
-        'product_type': node.get('productType', ''),
-        'vendor': node.get('vendor', ''),
-        'tags': ', '.join(node.get('tags', [])) if isinstance(node.get('tags'), list) else node.get('tags', ''),
-        'body_html': node.get('descriptionHtml', ''),
-        'description': node.get('description', ''),
-        'seo_title': node.get('seo', {}).get('title', ''),
-        'seo_description': node.get('seo', {}).get('description', ''),
-        'collection_ids': collection_ids,
-        'featured_image': featured_image,
-        'images': images,
-        'options': options,
-        'variants': variants,
-        'total_inventory': node.get('totalInventory', 0),
-        'tracks_inventory': node.get('tracksInventory', False),
-        'total_variants': node.get('totalVariants', len(variants))
-    }
+# ==================== FUNÇÃO AUXILIAR ====================
 
 def reconstruct_original_url(url):
     """Reconstrói a URL original da imagem removendo modificadores do Shopify"""
