@@ -69,6 +69,9 @@ manager = ConnectionManager()
 # Armazenar tarefas em memória
 tasks_db = {}
 
+# ADICIONAR AQUI - Variável global para progresso de carregamento
+loading_progress = {}
+
 # Cache em memória para requisições
 request_cache = {}
 CACHE_TTL = 300  # 5 minutos
@@ -151,8 +154,7 @@ async def proxy_endpoint(
 @app.post("/api/shopify/load-all-data")
 async def load_all_shopify_data(data: Dict[str, Any]):
     """
-    Carrega TODOS os produtos e coleções de forma otimizada
-    Mais rápido que o frontend pois usa paralelização no servidor
+    Carrega TODOS os produtos e coleções com progresso REAL
     """
     
     store_name = data.get("store_name", "")
@@ -163,12 +165,26 @@ async def load_all_shopify_data(data: Dict[str, Any]):
     
     clean_store = store_name.replace('.myshopify.com', '').strip()
     
+    # Criar ID único para esta sessão de carregamento
+    session_id = f"{clean_store}_{int(time.time())}"
+    
+    # Inicializar progresso
+    loading_progress[session_id] = {
+        "status": "starting",
+        "message": "Iniciando carregamento...",
+        "products_loaded": 0,
+        "collections_loaded": 0,
+        "total_products": 0,
+        "total_collections": 0,
+        "current_phase": "initialization"
+    }
+    
     logger.info(f"🚀 Iniciando carregamento completo para {clean_store}")
     
     start_time = time.time()
     
     try:
-        # Carregar coleções e produtos em paralelo
+        # Carregar coleções e produtos
         async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
             # Headers padrão
             headers = {
@@ -178,16 +194,35 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             }
             
             # ============ FASE 1: Carregar Coleções ============
+            loading_progress[session_id].update({
+                "current_phase": "collections",
+                "message": "📦 Carregando coleções..."
+            })
+            
             logger.info("📦 Fase 1: Carregando coleções...")
-            all_collections = await load_all_collections_optimized(client, clean_store, headers)
+            all_collections = await load_all_collections_optimized(client, clean_store, headers, session_id)
             logger.info(f"✅ {len(all_collections)} coleções carregadas")
             
+            loading_progress[session_id]["total_collections"] = len(all_collections)
+            
             # ============ FASE 2: Carregar Produtos com GraphQL ============
+            loading_progress[session_id].update({
+                "current_phase": "products",
+                "message": "🛍️ Carregando produtos..."
+            })
+            
             logger.info("📦 Fase 2: Carregando produtos...")
-            all_products = await load_all_products_optimized(client, clean_store, headers)
+            all_products = await load_all_products_optimized(client, clean_store, headers, session_id)
             logger.info(f"✅ {len(all_products)} produtos carregados")
             
+            loading_progress[session_id]["total_products"] = len(all_products)
+            
             # ============ FASE 3: Processar relacionamentos ============
+            loading_progress[session_id].update({
+                "current_phase": "processing",
+                "message": "🔗 Processando relacionamentos..."
+            })
+            
             logger.info("🔗 Fase 3: Processando relacionamentos...")
             
             # Contar produtos por coleção
@@ -206,10 +241,21 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             
             elapsed_time = time.time() - start_time
             
+            # PROGRESSO FINAL
+            loading_progress[session_id].update({
+                "status": "completed",
+                "current_phase": "completed",
+                "message": f"✅ Carregamento completo em {elapsed_time:.2f}s"
+            })
+            
+            # Limpar progresso após 5 segundos
+            asyncio.create_task(clear_progress_after_delay(session_id, 5))
+            
             logger.info(f"🏁 Carregamento completo em {elapsed_time:.2f} segundos")
             
             return {
                 "success": True,
+                "session_id": session_id,
                 "products": all_products,
                 "collections": all_collections,
                 "product_collection_map": product_collection_map,
@@ -224,9 +270,13 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             
     except Exception as e:
         logger.error(f"❌ Erro no carregamento: {str(e)}")
+        loading_progress[session_id].update({
+            "status": "error",
+            "message": f"❌ Erro: {str(e)}"
+        })
         raise HTTPException(status_code=500, detail=str(e))
 
-async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, headers: dict):
+async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, headers: dict, session_id: str = None):
     """Carrega todas as coleções usando GraphQL de forma otimizada"""
     
     all_collections = []
@@ -301,6 +351,13 @@ async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, 
             }
             all_collections.append(collection)
         
+        # ATUALIZAR PROGRESSO REAL
+        if session_id and session_id in loading_progress:
+            loading_progress[session_id].update({
+                "collections_loaded": len(all_collections),
+                "message": f"📦 {len(all_collections)} coleções carregadas..."
+            })
+        
         if not collections_data['pageInfo']['hasNextPage']:
             break
         
@@ -311,7 +368,7 @@ async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, 
     
     return all_collections
 
-async def load_all_products_optimized(client: httpx.AsyncClient, store: str, headers: dict):
+async def load_all_products_optimized(client: httpx.AsyncClient, store: str, headers: dict, session_id: str = None):
     """Carrega todos os produtos usando GraphQL com paralelização inteligente"""
     
     all_products = []
@@ -323,7 +380,7 @@ async def load_all_products_optimized(client: httpx.AsyncClient, store: str, hea
         
         query = """
         query($cursor: String) {
-          products(first: 100, after: $cursor) {
+          products(first: 50, after: $cursor) {
             edges {
               node {
                 id
@@ -444,6 +501,13 @@ async def load_all_products_optimized(client: httpx.AsyncClient, store: str, hea
         
         all_products.extend(batch_products)
         
+        # ATUALIZAR PROGRESSO REAL DE PRODUTOS
+        if session_id and session_id in loading_progress:
+            loading_progress[session_id].update({
+                "products_loaded": len(all_products),
+                "message": f"🛍️ {len(all_products)} produtos carregados..."
+            })
+        
         logger.info(f"📦 Batch {batch_count}: {len(batch_products)} produtos (Total: {len(all_products)})")
         
         if not products_data['pageInfo']['hasNextPage']:
@@ -451,11 +515,27 @@ async def load_all_products_optimized(client: httpx.AsyncClient, store: str, hea
         
         cursor = products_data['pageInfo']['endCursor']
         
-        # Rate limiting dinâmico
+        # Rate limiting dinâmico - REDUZIDO PARA 50 produtos por batch
         delay = min(0.1 + (batch_count * 0.05), 0.5)
         await asyncio.sleep(delay)
     
     return all_products
+
+# ADICIONAR ESTAS DUAS NOVAS FUNÇÕES APÓS load_all_products_optimized:
+
+async def clear_progress_after_delay(session_id: str, delay: int):
+    """Limpar progresso da memória após delay"""
+    await asyncio.sleep(delay)
+    if session_id in loading_progress:
+        del loading_progress[session_id]
+
+@app.get("/api/shopify/loading-progress/{session_id}")
+async def get_loading_progress(session_id: str):
+    """Endpoint para consultar progresso do carregamento"""
+    if session_id not in loading_progress:
+        return {"status": "not_found", "message": "Sessão não encontrada"}
+    
+    return loading_progress[session_id]
 
 def process_product_node(node):
     """Processa um nó de produto do GraphQL para o formato esperado"""
