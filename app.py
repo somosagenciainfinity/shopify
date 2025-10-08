@@ -154,7 +154,7 @@ async def proxy_endpoint(
 @app.post("/api/shopify/load-all-data")
 async def load_all_shopify_data(data: Dict[str, Any]):
     """
-    Carrega TODOS os produtos e coleções com progresso REAL
+    Carrega TODOS os produtos e coleções SEM ARMAZENAR NA MEMÓRIA DO SERVIDOR
     """
     
     store_name = data.get("store_name", "")
@@ -168,18 +168,16 @@ async def load_all_shopify_data(data: Dict[str, Any]):
     # Criar ID único para esta sessão de carregamento
     session_id = f"{clean_store}_{int(time.time())}"
     
-    # Inicializar progresso
+    # APENAS CONTADORES, NÃO DADOS!
     loading_progress[session_id] = {
         "status": "starting",
         "message": "Iniciando carregamento...",
         "products_loaded": 0,
         "collections_loaded": 0,
-        "total_products": 0,
-        "total_collections": 0,
         "current_phase": "initialization"
     }
     
-    logger.info(f"🚀 Iniciando carregamento completo para {clean_store} - Session: {session_id}")
+    logger.info(f"🚀 Iniciando carregamento completo para {clean_store}")
     
     start_time = time.time()
     
@@ -197,11 +195,10 @@ async def load_all_shopify_data(data: Dict[str, Any]):
                 "message": "📦 Carregando coleções..."
             })
             
-            logger.info("📦 Fase 1: Carregando coleções...")
             all_collections = await load_all_collections_optimized(client, clean_store, headers, session_id)
-            logger.info(f"✅ {len(all_collections)} coleções carregadas")
             
-            loading_progress[session_id]["total_collections"] = len(all_collections)
+            # NÃO ARMAZENAR, apenas contar
+            loading_progress[session_id]["collections_loaded"] = len(all_collections)
             
             # ============ FASE 2: Carregar Produtos ============
             loading_progress[session_id].update({
@@ -209,19 +206,16 @@ async def load_all_shopify_data(data: Dict[str, Any]):
                 "message": "🛍️ Carregando produtos..."
             })
             
-            logger.info("📦 Fase 2: Carregando produtos...")
             all_products = await load_all_products_optimized(client, clean_store, headers, session_id)
-            logger.info(f"✅ {len(all_products)} produtos carregados")
             
-            loading_progress[session_id]["total_products"] = len(all_products)
+            # NÃO ARMAZENAR, apenas contar
+            loading_progress[session_id]["products_loaded"] = len(all_products)
             
             # ============ FASE 3: Processar relacionamentos ============
             loading_progress[session_id].update({
                 "current_phase": "processing",
                 "message": "🔗 Processando relacionamentos..."
             })
-            
-            logger.info("🔗 Fase 3: Processando relacionamentos...")
             
             collection_product_counts = {}
             product_collection_map = {}
@@ -237,19 +231,19 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             
             elapsed_time = time.time() - start_time
             
-            # PROGRESSO FINAL
+            # Atualizar status final
             loading_progress[session_id].update({
                 "status": "completed",
                 "current_phase": "completed",
                 "message": f"✅ Carregamento completo em {elapsed_time:.2f}s"
             })
             
-            # Limpar progresso após 30 segundos (NÃO antes de retornar!)
-            asyncio.create_task(clear_progress_after_delay(session_id, 30))
+            # Limpar progresso após 5 segundos
+            asyncio.create_task(clear_progress_after_delay(session_id, 5))
             
             logger.info(f"🏁 Carregamento completo em {elapsed_time:.2f} segundos")
             
-            # IMPORTANTE: RETORNAR OS DADOS COMPLETOS!
+            # RETORNAR DADOS DIRETAMENTE (sem armazenar no servidor)
             return {
                 "success": True,
                 "session_id": session_id,
@@ -271,6 +265,8 @@ async def load_all_shopify_data(data: Dict[str, Any]):
             "status": "error",
             "message": f"❌ Erro: {str(e)}"
         })
+        # Limpar imediatamente em caso de erro
+        asyncio.create_task(clear_progress_after_delay(session_id, 1))
         raise HTTPException(status_code=500, detail=str(e))
 
 async def load_all_collections_optimized(client: httpx.AsyncClient, store: str, headers: dict, session_id: str = None):
@@ -564,6 +560,7 @@ async def clear_progress_after_delay(session_id: str, delay: int):
     await asyncio.sleep(delay)
     if session_id in loading_progress:
         del loading_progress[session_id]
+        logger.info(f"🧹 Progresso da sessão {session_id} removido da memória")
 
 @app.get("/api/shopify/loading-progress/{session_id}")
 async def get_loading_progress(session_id: str):
@@ -4880,7 +4877,7 @@ async def cleanup_old_tasks():
     """Limpar tarefas antigas da memória para evitar acúmulo"""
     while True:
         try:
-            await asyncio.sleep(300)  # Aguardar 5 minutos
+            await asyncio.sleep(60)  # A cada 1 minuto (mais agressivo)
             
             now = datetime.now()
             tasks_to_remove = []
@@ -4889,27 +4886,39 @@ async def cleanup_old_tasks():
             for task_id, task in tasks_db.items():
                 status = task.get("status")
                 
-                # Remover tarefas completadas há mais de 24 horas
+                # Remover tarefas completadas há mais de 30 minutos
                 if status in ["completed", "failed", "cancelled", "completed_with_errors"]:
                     completed_at = task.get("completed_at") or task.get("updated_at")
                     if completed_at:
                         try:
                             completed_time = datetime.fromisoformat(completed_at.replace('Z', ''))
-                            hours_passed = (now - completed_time).total_seconds() / 3600
+                            minutes_passed = (now - completed_time).total_seconds() / 60
                             
-                            if hours_passed > 24:  # Mais de 24 horas
+                            if minutes_passed > 30:  # 30 minutos
                                 tasks_to_remove.append(task_id)
-                            elif hours_passed > 2:  # Entre 2 e 24 horas - simplificar
+                            elif minutes_passed > 5:  # Entre 5 e 30 minutos - simplificar
                                 tasks_to_simplify.append(task_id)
                         except:
                             pass
+                
+                # Também remover tarefas agendadas muito antigas (mais de 24 horas)
+                elif status == "scheduled":
+                    created_at = task.get("created_at") or task.get("updated_at")
+                    if created_at:
+                        try:
+                            created_time = datetime.fromisoformat(created_at.replace('Z', ''))
+                            hours_passed = (now - created_time).total_seconds() / 3600
+                            
+                            if hours_passed > 24:  # Agendadas há mais de 24 horas
+                                tasks_to_remove.append(task_id)
+                        except:
+                            pass
             
-            # Remover tarefas muito antigas
+            # Remover tarefas antigas
             for task_id in tasks_to_remove:
                 del tasks_db[task_id]
-                logger.info(f"🗑️ Tarefa antiga removida da memória: {task_id}")
             
-            # Simplificar tarefas completadas recentes (liberar memória mas manter registro)
+            # Simplificar tarefas recentes (remover dados pesados mas manter registro)
             for task_id in tasks_to_simplify:
                 if task_id in tasks_db:
                     task = tasks_db[task_id]
@@ -4919,19 +4928,55 @@ async def cleanup_old_tasks():
                         "name": task.get("name"),
                         "status": task["status"],
                         "task_type": task.get("task_type"),
-                        "progress": task.get("progress"),
+                        "progress": {
+                            "processed": task.get("progress", {}).get("processed", 0),
+                            "total": task.get("progress", {}).get("total", 0),
+                            "successful": task.get("progress", {}).get("successful", 0),
+                            "failed": task.get("progress", {}).get("failed", 0),
+                            "percentage": task.get("progress", {}).get("percentage", 0)
+                        },
                         "started_at": task.get("started_at"),
                         "completed_at": task.get("completed_at"),
                         "updated_at": task.get("updated_at"),
+                        # Config mínimo - SEM dados pesados
                         "config": {
                             "itemCount": task.get("config", {}).get("itemCount", 0)
                         },
-                        "results": []  # Limpar results
+                        # SEM results, SEM arrays grandes
+                        "results": []
                     }
             
-            if tasks_to_remove or tasks_to_simplify:
-                logger.info(f"🧹 Limpeza: {len(tasks_to_remove)} removidas, {len(tasks_to_simplify)} simplificadas")
-                logger.info(f"📊 Total de tarefas na memória: {len(tasks_db)}")
+            # Limpar também o loading_progress de sessões antigas
+            sessions_to_remove = []
+            for session_id in list(loading_progress.keys()):
+                # Remover sessões de progresso com mais de 5 minutos
+                # (baseado no timestamp do session_id)
+                try:
+                    # Extrair timestamp do session_id (formato: "store_timestamp")
+                    parts = session_id.split('_')
+                    if len(parts) > 1 and parts[-1].isdigit():
+                        session_time = int(parts[-1])
+                        current_time = int(time.time())
+                        if current_time - session_time > 300:  # 5 minutos
+                            sessions_to_remove.append(session_id)
+                except:
+                    pass
+            
+            # Remover sessões antigas
+            for session_id in sessions_to_remove:
+                del loading_progress[session_id]
+            
+            # Log apenas se houve limpeza
+            if tasks_to_remove or tasks_to_simplify or sessions_to_remove:
+                logger.info(f"🧹 Limpeza de memória:")
+                if tasks_to_remove:
+                    logger.info(f"   🗑️ {len(tasks_to_remove)} tarefas removidas")
+                if tasks_to_simplify:
+                    logger.info(f"   📦 {len(tasks_to_simplify)} tarefas simplificadas")
+                if sessions_to_remove:
+                    logger.info(f"   🔄 {len(sessions_to_remove)} sessões de progresso removidas")
+                logger.info(f"   📊 Tarefas na memória: {len(tasks_db)}")
+                logger.info(f"   📊 Sessões de progresso: {len(loading_progress)}")
             
         except Exception as e:
             logger.error(f"❌ Erro na limpeza automática: {e}")
