@@ -4619,7 +4619,7 @@ async def cleanup_old_tasks():
     """Limpar tarefas antigas da memória para evitar acúmulo"""
     while True:
         try:
-            await asyncio.sleep(60)  # A cada 1 minuto (mais agressivo)
+            await asyncio.sleep(60)  # A cada 1 minuto
             
             now = datetime.now()
             tasks_to_remove = []
@@ -4636,14 +4636,14 @@ async def cleanup_old_tasks():
                             completed_time = datetime.fromisoformat(completed_at.replace('Z', ''))
                             minutes_passed = (now - completed_time).total_seconds() / 60
                             
-                            if minutes_passed > 30:  # 30 minutos
+                            if minutes_passed > 30:
                                 tasks_to_remove.append(task_id)
-                            elif minutes_passed > 5:  # Entre 5 e 30 minutos - simplificar
+                            elif minutes_passed > 5:
                                 tasks_to_simplify.append(task_id)
                         except:
                             pass
                 
-                # Também remover tarefas agendadas muito antigas (mais de 24 horas)
+                # Remover tarefas agendadas antigas
                 elif status == "scheduled":
                     created_at = task.get("created_at") or task.get("updated_at")
                     if created_at:
@@ -4651,7 +4651,7 @@ async def cleanup_old_tasks():
                             created_time = datetime.fromisoformat(created_at.replace('Z', ''))
                             hours_passed = (now - created_time).total_seconds() / 3600
                             
-                            if hours_passed > 24:  # Agendadas há mais de 24 horas
+                            if hours_passed > 24:
                                 tasks_to_remove.append(task_id)
                         except:
                             pass
@@ -4660,11 +4660,10 @@ async def cleanup_old_tasks():
             for task_id in tasks_to_remove:
                 del tasks_db[task_id]
             
-            # Simplificar tarefas recentes (remover dados pesados mas manter registro)
+            # Simplificar tarefas recentes
             for task_id in tasks_to_simplify:
                 if task_id in tasks_db:
                     task = tasks_db[task_id]
-                    # Manter apenas informações essenciais
                     tasks_db[task_id] = {
                         "id": task["id"],
                         "name": task.get("name"),
@@ -4680,45 +4679,40 @@ async def cleanup_old_tasks():
                         "started_at": task.get("started_at"),
                         "completed_at": task.get("completed_at"),
                         "updated_at": task.get("updated_at"),
-                        # Config mínimo - SEM dados pesados
                         "config": {
                             "itemCount": task.get("config", {}).get("itemCount", 0)
                         },
-                        # SEM results, SEM arrays grandes
                         "results": []
                     }
             
-            # Limpar também o loading_progress de sessões antigas
-            sessions_to_remove = []
-            for session_id in list(loading_progress.keys()):
-                # Remover sessões de progresso com mais de 5 minutos
-                # (baseado no timestamp do session_id)
-                try:
-                    # Extrair timestamp do session_id (formato: "store_timestamp")
-                    parts = session_id.split('_')
-                    if len(parts) > 1 and parts[-1].isdigit():
-                        session_time = int(parts[-1])
-                        current_time = int(time.time())
-                        if current_time - session_time > 300:  # 5 minutos
-                            sessions_to_remove.append(session_id)
-                except:
-                    pass
-            
-            # Remover sessões antigas
-            for session_id in sessions_to_remove:
-                del loading_progress[session_id]
+            # 🔥 CORREÇÃO: VERIFICAR SE loading_progress EXISTE
+            if 'loading_progress' in globals():
+                sessions_to_remove = []
+                for session_id in list(loading_progress.keys()):
+                    try:
+                        parts = session_id.split('_')
+                        if len(parts) > 1 and parts[-1].isdigit():
+                            session_time = int(parts[-1])
+                            current_time = int(time.time())
+                            if current_time - session_time > 300:
+                                sessions_to_remove.append(session_id)
+                    except:
+                        pass
+                
+                for session_id in sessions_to_remove:
+                    del loading_progress[session_id]
+                
+                if sessions_to_remove:
+                    logger.info(f"   🔄 {len(sessions_to_remove)} sessões removidas")
             
             # Log apenas se houve limpeza
-            if tasks_to_remove or tasks_to_simplify or sessions_to_remove:
+            if tasks_to_remove or tasks_to_simplify:
                 logger.info(f"🧹 Limpeza de memória:")
                 if tasks_to_remove:
                     logger.info(f"   🗑️ {len(tasks_to_remove)} tarefas removidas")
                 if tasks_to_simplify:
                     logger.info(f"   📦 {len(tasks_to_simplify)} tarefas simplificadas")
-                if sessions_to_remove:
-                    logger.info(f"   🔄 {len(sessions_to_remove)} sessões de progresso removidas")
                 logger.info(f"   📊 Tarefas na memória: {len(tasks_db)}")
-                logger.info(f"   📊 Sessões de progresso: {len(loading_progress)}")
             
         except Exception as e:
             logger.error(f"❌ Erro na limpeza automática: {e}")
