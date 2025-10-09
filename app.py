@@ -69,6 +69,9 @@ manager = ConnectionManager()
 # Armazenar tarefas em memória
 tasks_db = {}
 
+# Dicionário para armazenar progresso de carregamento
+loading_progress = {}
+
 # Cache em memória para requisições
 request_cache = {}
 CACHE_TTL = 300  # 5 minutos
